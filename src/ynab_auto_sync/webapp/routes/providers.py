@@ -19,6 +19,7 @@ router = APIRouter()
 
 @router.get("/api/providers")
 async def list_providers(
+    force_refresh: bool = False,
     providers: dict[str, TransactionProvider] = Depends(get_providers),
     db: StateDB = Depends(get_db),
 ) -> list[dict[str, Any]]:
@@ -30,6 +31,13 @@ async def list_providers(
     reason, must not take down this whole response - the UI still needs to
     render every OTHER provider's accounts, and needs to tell the user
     specifically which provider is broken and how.
+
+    force_refresh is passed straight through to provider.list_accounts() -
+    a provider that caches internally (e.g. SpareBank1Provider's TTL cache)
+    uses it to bypass that cache; a provider that never caches just ignores
+    it. Wired from the GUI's explicit "Refresh" button so that one action
+    still always gets live data, even though the normal per-tab-visit fetch
+    now serves from cache.
     """
     mapped_keys = {(m["provider"], m["provider_account_id"]) for m in db.list_mappings()}
 
@@ -49,7 +57,7 @@ async def list_providers(
             "accounts": [],
         }
         try:
-            accounts = await provider.list_accounts()
+            accounts = await provider.list_accounts(force_refresh=force_refresh)
         except ProviderAuthRequiredError:
             entry["auth_required"] = True
             result.append(entry)

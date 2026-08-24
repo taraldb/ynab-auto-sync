@@ -66,7 +66,12 @@ class ProviderAccount:
 
     provider_account_id: str
     display_name: str
-    account_type: str  # e.g. "checking", "credit_card"
+    # Provider-defined, no fixed vocabulary across providers - e.g.
+    # SpareBank1 confirmed live to send "USER"/"SAVING"/"CREDITCARD", not
+    # "checking"/"credit_card" as an earlier, unverified version of this
+    # comment guessed. Display-only; nothing in this codebase branches on
+    # a specific value.
+    account_type: str
     currency: str
 
 
@@ -171,7 +176,16 @@ class TransactionProvider(ABC):
         ...
 
     @abstractmethod
-    async def list_accounts(self) -> list[ProviderAccount]: ...
+    async def list_accounts(self, force_refresh: bool = False) -> list[ProviderAccount]:
+        """List this provider's accounts, for the Mappings tab's drop
+        targets. force_refresh, when True, bypasses any caching a provider
+        chooses to do internally (e.g. SpareBank1Provider's TTL cache,
+        added so a Mappings-tab visit doesn't re-hit a live API every time)
+        - wired from the GUI's explicit "Refresh" button. Default False and
+        purely additive: a provider that ignores it (never caches at all)
+        is still fully conformant.
+        """
+        ...
 
     @abstractmethod
     async def fetch(

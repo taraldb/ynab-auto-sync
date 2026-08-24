@@ -591,3 +591,142 @@ async def test_list_accounts_maps_fields(tmp_path: Path):
             currency="NOK",
         )
     ]
+
+
+@respx.mock
+async def test_list_accounts_replaces_masked_credit_card_name_with_description(
+    tmp_path: Path,
+):
+    # Confirmed live (GET /personal/banking/accounts): a credit card's own
+    # `name` is a masked card number while `description` holds the real
+    # product name - exactly this shape.
+    respx.get(sb1_client.ACCOUNTS_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "accounts": [
+                    {
+                        "accountKey": "4526895",
+                        "name": "**** **** **** 3431",
+                        "description": "Mastercard Ung",
+                        "type": "CREDITCARD",
+                        "currencyCode": "NOK",
+                    }
+                ]
+            },
+        )
+    )
+    async with httpx.AsyncClient() as http_client:
+        provider = make_provider(tmp_path, http_client)
+        accounts = await provider.list_accounts()
+
+    assert accounts[0].display_name == "Mastercard Ung •3431"
+
+
+@respx.mock
+async def test_list_accounts_falls_back_to_type_label_when_no_description(
+    tmp_path: Path,
+):
+    respx.get(sb1_client.ACCOUNTS_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "accounts": [
+                    {
+                        "accountKey": "4526895",
+                        "name": "**** **** **** 3431",
+                        "type": "CREDITCARD",
+                        "currencyCode": "NOK",
+                    }
+                ]
+            },
+        )
+    )
+    async with httpx.AsyncClient() as http_client:
+        provider = make_provider(tmp_path, http_client)
+        accounts = await provider.list_accounts()
+
+    assert accounts[0].display_name == "Credit Card •3431"
+
+
+@respx.mock
+async def test_list_accounts_leaves_already_friendly_name_untouched(tmp_path: Path):
+    respx.get(sb1_client.ACCOUNTS_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "accounts": [
+                    {
+                        "accountKey": "acct-1",
+                        "name": "Spandable Stian",
+                        "description": "BRUKSKONTO",
+                        "type": "USER",
+                        "currencyCode": "NOK",
+                    }
+                ]
+            },
+        )
+    )
+    async with httpx.AsyncClient() as http_client:
+        provider = make_provider(tmp_path, http_client)
+        accounts = await provider.list_accounts()
+
+    assert accounts[0].display_name == "Spandable Stian"
+
+
+@respx.mock
+async def test_list_accounts_caches_within_ttl(tmp_path: Path):
+    route = respx.get(sb1_client.ACCOUNTS_URL).mock(
+        return_value=httpx.Response(
+            200, json={"accounts": [{"accountKey": "acct-1", "name": "Brukskonto"}]}
+        )
+    )
+    async with httpx.AsyncClient() as http_client:
+        provider = make_provider(tmp_path, http_client)
+        await provider.list_accounts()
+        await provider.list_accounts()
+
+    assert route.call_count == 1
+
+
+@respx.mock
+async def test_list_accounts_force_refresh_bypasses_cache(tmp_path: Path):
+    route = respx.get(sb1_client.ACCOUNTS_URL).mock(
+        return_value=httpx.Response(
+            200, json={"accounts": [{"accountKey": "acct-1", "name": "Brukskonto"}]}
+        )
+    )
+    async with httpx.AsyncClient() as http_client:
+        provider = make_provider(tmp_path, http_client)
+        await provider.list_accounts()
+        await provider.list_accounts(force_refresh=True)
+
+    assert route.call_count == 2
+
+
+@respx.mock
+async def test_list_accounts_refetches_once_ttl_expires(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    route = respx.get(sb1_client.ACCOUNTS_URL).mock(
+        return_value=httpx.Response(
+            200, json={"accounts": [{"accountKey": "acct-1", "name": "Brukskonto"}]}
+        )
+    )
+    async with httpx.AsyncClient() as http_client:
+        provider = make_provider(tmp_path, http_client)
+        await provider.list_accounts()
+
+        from ynab_auto_sync.providers.sparebank1 import provider as provider_module
+
+        real_datetime = provider_module.datetime
+
+        class FrozenFuture(real_datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return real_datetime.now(tz) + timedelta(minutes=10)
+
+        monkeypatch.setattr(provider_module, "datetime", FrozenFuture)
+        await provider.list_accounts()
+
+    assert route.call_count == 2

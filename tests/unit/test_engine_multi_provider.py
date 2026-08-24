@@ -38,7 +38,7 @@ class FakeProvider(TransactionProvider):
     def type_name(self) -> str:  # type: ignore[override]
         return self._name
 
-    async def list_accounts(self) -> list[ProviderAccount]:
+    async def list_accounts(self, force_refresh: bool = False) -> list[ProviderAccount]:
         return []
 
     async def fetch(self, since_by_account, on_skip=None):

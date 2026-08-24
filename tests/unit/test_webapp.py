@@ -39,12 +39,14 @@ class FakeProvider(TransactionProvider):
         self._accounts = accounts or []
         self._auth_required = auth_required
         self._error = error
+        self.list_accounts_calls: list[bool] = []
 
     @staticmethod
     def type_name() -> str:
         return "fake"
 
-    async def list_accounts(self):
+    async def list_accounts(self, force_refresh: bool = False):
+        self.list_accounts_calls.append(force_refresh)
         if self._auth_required:
             raise ProviderAuthRequiredError("re-authentication required")
         if self._error is not None:
@@ -694,6 +696,16 @@ def test_list_providers_reports_accounts_with_mapped_flag(tmp_path: Path):
     accounts_by_id = {a["provider_account_id"]: a for a in entry["accounts"]}
     assert accounts_by_id["acct-1"]["mapped"] is True
     assert accounts_by_id["acct-unmapped"]["mapped"] is False
+
+
+def test_list_providers_passes_force_refresh_through(tmp_path: Path):
+    fake = FakeProvider(accounts=[])
+    client, _db = make_client(tmp_path, providers_map={"sparebank1": fake})
+
+    client.get("/api/providers")
+    client.get("/api/providers?force_refresh=true")
+
+    assert fake.list_accounts_calls == [False, True]
 
 
 def test_list_providers_reports_auth_required_without_failing_response(tmp_path: Path):

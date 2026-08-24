@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import logging
+import re
 from collections import defaultdict
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import httpx
@@ -53,6 +54,58 @@ def _extract_memo(sb1_tx: dict[str, Any]) -> str | None:
     return clean_bank_text(str(description)) if description is not None else None
 
 
+# Confirmed live (GET /personal/banking/accounts, includeCreditCardAccounts=
+# true): every regular checking/savings account's own `name` is already a
+# real, human-chosen nickname (e.g. "Spandable Stian") - never masked, never
+# touched by the logic below. A credit card account is the one exception:
+# its `name` is a masked card number, e.g. "**** **** **** 3431", while its
+# `description` field holds the real product name (e.g. "Mastercard Ung") -
+# a genuinely nicer name than anything derivable from the mask itself.
+# Matches a name that's entirely mask characters (asterisks/bullets/
+# whitespace) plus a short trailing digit run - deliberately NOT anchored to
+# one exact masking character, since that specific choice isn't documented
+# by SpareBank1 and could plausibly differ by card product.
+_MASKED_ACCOUNT_NAME_RE = re.compile(r"^[*•\s]*(\d{2,6})$")
+
+# Real `type` values confirmed live: "USER" (regular checking-style
+# accounts), "SAVING", "CREDITCARD" - notably NOT "checking"/"credit_card"
+# as providers/base.py's ProviderAccount.account_type docstring used to
+# guess before this was confirmed. Only used as a last-resort label when a
+# masked name has no usable `description` either.
+_ACCOUNT_TYPE_LABELS = {
+    "CREDITCARD": "Credit Card",
+    "SAVING": "Savings",
+    "USER": "Account",
+}
+
+
+def _friendly_account_name(name: str, account_type: str, description: str) -> str:
+    """Replace a masked-looking account name (confirmed live to occur only
+    for credit cards) with something a human would actually want to see in
+    the Mappings tab. Deliberately conservative: a name that doesn't match
+    the masked pattern is returned completely untouched - this must never
+    make an already-fine name (the common case) worse.
+    """
+    match = _MASKED_ACCOUNT_NAME_RE.match(name.strip()) if name else None
+    if match is None:
+        return name
+    last_digits = match.group(1)[-4:]
+    label = description.strip() if description and description.strip() else None
+    label = label or _ACCOUNT_TYPE_LABELS.get(account_type, "Account")
+    return f"{label} •{last_digits}"
+
+
+# How long a fetched account list is trusted before list_accounts() hits the
+# API again - accounts are added/renamed rarely, and this is a long-lived
+# per-process singleton (see __main__.py's _build_providers), so a simple
+# instance-level cache with no lock (single event loop, same reasoning
+# StateDB's own concurrency notes already document elsewhere in this
+# codebase) is enough to stop every Mappings-tab visit from re-hitting
+# SpareBank1's live /accounts endpoint. force_refresh=True (wired from the
+# GUI's explicit "Refresh" button) always bypasses it.
+_ACCOUNTS_CACHE_TTL = timedelta(minutes=5)
+
+
 @register
 class SpareBank1Provider(TransactionProvider):
     """Wraps providers/sparebank1/client.py + transform.py behind the
@@ -72,26 +125,41 @@ class SpareBank1Provider(TransactionProvider):
     def __init__(self, http_client: httpx.AsyncClient, token_store: TokenStore):
         self._http_client = http_client
         self._token_store = token_store
+        self._accounts_cache: list[ProviderAccount] | None = None
+        self._accounts_cached_at: datetime | None = None
 
     @staticmethod
     def type_name() -> str:
         return "sparebank1"
 
-    async def list_accounts(self) -> list[ProviderAccount]:
+    async def list_accounts(self, force_refresh: bool = False) -> list[ProviderAccount]:
+        if (
+            not force_refresh
+            and self._accounts_cache is not None
+            and self._accounts_cached_at is not None
+            and datetime.now(UTC) - self._accounts_cached_at < _ACCOUNTS_CACHE_TTL
+        ):
+            return list(self._accounts_cache)
+
         access_token = await self._token_store.ensure_valid_access_token(self._http_client)
         raw_accounts = await sb1_client.get_accounts(self._http_client, access_token)
 
         accounts = []
         for raw in raw_accounts:
+            account_type = str(raw.get("type") or raw.get("accountType") or "")
+            raw_name = str(raw.get("name") or raw.get("accountName") or "")
+            description = str(raw.get("description") or "")
             accounts.append(
                 ProviderAccount(
                     provider_account_id=str(raw.get("accountKey") or raw.get("key") or ""),
-                    display_name=str(raw.get("name") or raw.get("accountName") or ""),
-                    account_type=str(raw.get("type") or raw.get("accountType") or ""),
+                    display_name=_friendly_account_name(raw_name, account_type, description),
+                    account_type=account_type,
                     currency=str(raw.get("currencyCode") or raw.get("currency") or ""),
                 )
             )
-        return accounts
+        self._accounts_cache = accounts
+        self._accounts_cached_at = datetime.now(UTC)
+        return list(accounts)
 
     async def fetch(
         self,

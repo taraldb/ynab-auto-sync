@@ -43,18 +43,24 @@ export default function Mappings() {
   const [pendingConfirm, setPendingConfirm] = useState<PendingConfirm | null>(
     null,
   );
+  const [renamingId, setRenamingId] = useState<number | null>(null);
+  const [renameValue, setRenameValue] = useState("");
 
   useEffect(() => {
     void loadAll();
   }, []);
 
-  async function loadAll() {
-    await Promise.all([loadProviders(), loadBudgets(), loadMappings()]);
+  async function loadAll(forceRefreshProviders?: boolean) {
+    await Promise.all([
+      loadProviders(forceRefreshProviders),
+      loadBudgets(),
+      loadMappings(),
+    ]);
   }
 
-  async function loadProviders() {
+  async function loadProviders(forceRefresh?: boolean) {
     try {
-      const data = await listProviders();
+      const data = await listProviders(forceRefresh);
       setProviders(data);
       setProvidersError(null);
     } catch (e) {
@@ -201,6 +207,42 @@ export default function Mappings() {
     }
   }
 
+  function startRename(mapping: Mapping) {
+    setRenamingId(mapping.id);
+    setRenameValue(mapping.display_name);
+  }
+
+  function cancelRename() {
+    setRenamingId(null);
+    setRenameValue("");
+  }
+
+  async function doRename(mapping: Mapping) {
+    const trimmed = renameValue.trim();
+    if (!trimmed || trimmed === mapping.display_name) {
+      cancelRename();
+      return;
+    }
+    const key = paKey(mapping.provider, mapping.provider_account_id);
+    setBusyKey(key);
+    setActionError(null);
+    try {
+      await updateMapping(mapping.id, { display_name: trimmed });
+      await loadMappings();
+      cancelRename();
+    } catch (e) {
+      setActionError(
+        e instanceof ApiError
+          ? e.detail
+          : e instanceof Error
+            ? e.message
+            : "Failed to rename mapping",
+      );
+    } finally {
+      setBusyKey(null);
+    }
+  }
+
   async function doToggleEnabled(mapping: Mapping) {
     const key = paKey(mapping.provider, mapping.provider_account_id);
     setBusyKey(key);
@@ -332,7 +374,7 @@ export default function Mappings() {
           </p>
         </div>
         <button
-          onClick={() => void loadAll()}
+          onClick={() => void loadAll(true)}
           className="rounded-lg border border-slate-700 bg-slate-800/60 px-3 py-1.5 text-sm font-medium text-slate-200 hover:bg-slate-700/60"
         >
           Refresh
@@ -608,12 +650,47 @@ export default function Mappings() {
                         ?.find((b) => b.budget_id === m.ynab_budget_id)
                         ?.accounts.find((a) => a.id === m.ynab_account_id)
                         ?.name ?? m.ynab_account_id;
+                    const isRenaming = renamingId === m.id;
                     return (
                       <tr key={m.id}>
                         <td className="px-4 py-3">
-                          <p className="font-medium text-slate-200">
-                            {m.display_name}
-                          </p>
+                          {isRenaming ? (
+                            <div className="flex items-center gap-1.5">
+                              <input
+                                type="text"
+                                value={renameValue}
+                                autoFocus
+                                onChange={(e) => setRenameValue(e.target.value)}
+                                onKeyDown={(e) => {
+                                  if (e.key === "Enter") void doRename(m);
+                                  if (e.key === "Escape") cancelRename();
+                                }}
+                                className="w-full rounded-lg border border-slate-700 bg-slate-900/60 px-2 py-1 text-sm text-slate-200 focus:border-emerald-500 focus:outline-none focus:ring-1 focus:ring-emerald-500"
+                              />
+                              <button
+                                onClick={() => void doRename(m)}
+                                disabled={isBusy}
+                                className="shrink-0 rounded-lg bg-emerald-500/15 px-2 py-1 text-xs font-semibold text-emerald-300 ring-1 ring-inset ring-emerald-500/30 hover:bg-emerald-500/25 disabled:cursor-not-allowed disabled:opacity-50"
+                              >
+                                Save
+                              </button>
+                              <button
+                                onClick={cancelRename}
+                                disabled={isBusy}
+                                className="shrink-0 rounded-lg border border-slate-700 bg-slate-800/60 px-2 py-1 text-xs font-medium text-slate-300 hover:bg-slate-700/60 disabled:cursor-not-allowed disabled:opacity-50"
+                              >
+                                Cancel
+                              </button>
+                            </div>
+                          ) : (
+                            <button
+                              onClick={() => startRename(m)}
+                              className="truncate text-left font-medium text-slate-200 hover:underline"
+                              title="Click to rename"
+                            >
+                              {m.display_name}
+                            </button>
+                          )}
                           <p className="font-mono text-xs text-slate-500">
                             {m.provider} · {m.provider_account_id}
                           </p>

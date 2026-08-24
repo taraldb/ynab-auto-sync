@@ -270,8 +270,11 @@ export async function clearAllMappings(): Promise<ClearAllMappingsResponse> {
   return handleJson<ClearAllMappingsResponse>(res);
 }
 
-export async function listProviders(): Promise<ProviderInfo[]> {
-  const res = await fetch("/api/providers");
+export async function listProviders(
+  forceRefresh?: boolean,
+): Promise<ProviderInfo[]> {
+  const url = forceRefresh ? "/api/providers?force_refresh=true" : "/api/providers";
+  const res = await fetch(url);
   return handleJson<ProviderInfo[]>(res);
 }
 

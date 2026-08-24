@@ -68,6 +68,12 @@ _TRANSFER_SECONDARY_IMPORT_ID_PREFIX = "LOCAL:XFER:"
 # field optional.
 FILE_SOURCE_TYPE = "file"
 
+# How often SyncEngine.reconcile_payee_mappings() runs its full sweep - see
+# that method's docstring for why this needed a rate limit at all (one GET
+# per DISTINCT cached payee_id, unlike the cheap one-GET-per-budget design
+# it replaced).
+PAYEE_RECONCILE_MIN_INTERVAL_DAYS = 1
+
 
 @dataclass
 class CycleResult:
@@ -1136,23 +1142,79 @@ class SyncEngine:
     async def reconcile_payee_mappings(self) -> int:
         """Maintenance pass closing invariant 12's known gap: a cached
         payee_mappings row's ynab_payee_id can go stale if the user later
-        deletes or merges that payee in YNAB. Re-fetches every configured
-        budget's payee list and deletes any payee_mappings row anchored to
-        an id YNAB now reports `deleted: true` (see
-        StateDB.delete_payee_mappings_for_ids for why only explicit
-        `deleted: true` counts, never mere absence from the fetch).
+        deletes or merges that payee in YNAB (or, observed live, simply
+        reassigns its one referencing transaction elsewhere, leaving it
+        orphaned - YNAB appears to clean those up too, not just
+        explicitly-deleted payees).
 
-        Called non-fatally once per cycle from scheduler.py - a fetch
-        failure for one budget is isolated (logged, that budget skipped)
-        so it can never prevent reconciling any other configured budget,
-        mirroring routes/providers.py's "one broken provider can't break
-        the rest" stance, applied here to budgets instead of providers.
+        HYBRID two-phase design, arrived at after two earlier attempts:
+
+        1. **Bulk-list first pass** (cheap): one ynab_client.get_payees()
+           call per budget. A payee_id that comes back in this list is
+           trusted as still active - confirmed live, repeatedly
+           (scripts/verify_ynab_payee_deletion.py, run three times against
+           real deletions/merges/orphaning), that YNAB never lists a gone
+           payee here at all, deleted or not - so PRESENCE is a strong,
+           direct signal. ABSENCE is not: a transient or incomplete
+           response could just as easily explain a momentary absence, so
+           an id merely missing from this list is only ever promoted to
+           "candidate," never healed on that basis alone.
+        2. **Per-id confirmation, candidates only** (targeted, more
+           expensive per call but rare in aggregate): each budget's
+           cached payee_ids (StateDB.list_payee_ids) that DIDN'T appear in
+           step 1's list get a direct ynab_client.get_payee() lookup -
+           confirmed live (scripts/verify_ynab_payee_get_by_id.py) to
+           reliably 404 for a genuinely gone payee. Only a 404 or an
+           explicit `deleted: true` here actually heals the row
+           (StateDB.delete_payee_mappings_for_ids) - a candidate that
+           turns out to still be active (200, deleted: false) is left
+           alone, which is exactly the safety net step 1's ambiguous
+           absence needed.
+
+        FIRST ATTEMPT (bulk-only, `deleted: true` in the list) shipped on
+        an assumption borrowed from sibling project ../ynab-auto-bank and
+        from this project's own GET .../accounts (which DOES keep closed
+        accounts listed) - live-verified wrong: a real deleted payee was
+        OMITTED from the bulk list, never flagged, making that design
+        permanently inert against real deletions. SECOND ATTEMPT (per-id
+        only, checking every cached payee_id individually every sweep)
+        fixed the safety problem but reintroduced a cost problem: one API
+        call per DISTINCT cached payee_id regardless of whether anything
+        had actually changed, which could be dozens to hundreds for a
+        long-lived budget. This hybrid restores the first attempt's cheap
+        common-case cost (one bulk GET per budget when nothing's actually
+        gone, which is the overwhelmingly common case) while keeping the
+        second attempt's safety property (never heal without a targeted,
+        unambiguous per-id confirmation).
+
+        Rate-limited via StateDB.is_payee_reconcile_due() regardless - not
+        because the common case is expensive anymore, but as cheap
+        insurance against a burst (many payees deleted/merged/orphaned at
+        once producing a large one-cycle candidate set). Marks the
+        reconcile as done (StateDB.mark_payee_reconcile_done) once the
+        sweep completes, regardless of whether anything was actually
+        stale - the rate limit governs how often the CHECK runs, not how
+        often it finds something to heal.
+
+        Called non-fatally once per cycle from scheduler.py - a bulk-fetch
+        failure skips that budget's whole sweep this cycle, and a per-id
+        lookup failure for one candidate is isolated to that candidate
+        only, mirroring routes/providers.py's "one broken provider can't
+        break the rest" stance, applied here at both the per-budget and
+        per-payee level.
 
         Returns the total number of payee_mappings rows healed across all
         budgets, for the caller to log.
         """
+        if not self._db.is_payee_reconcile_due(PAYEE_RECONCILE_MIN_INTERVAL_DAYS):
+            return 0
+
         total_healed = 0
         for budget_id in self._config.ynab.budgets.values():
+            cached_ids = set(self._db.list_payee_ids(budget_id))
+            if not cached_ids:
+                continue
+
             try:
                 payees = await ynab_client.get_payees(
                     self._http_client, self._config.ynab.personal_access_token, budget_id
@@ -1164,10 +1226,33 @@ class SyncEngine:
                     budget_id,
                 )
                 continue
-            deleted_ids = {p["id"] for p in payees if p.get("deleted")}
-            if not deleted_ids:
+
+            active_ids = {p["id"] for p in payees}
+            candidates = cached_ids - active_ids
+
+            stale_ids: set[str] = set()
+            for payee_id in candidates:
+                try:
+                    payee = await ynab_client.get_payee(
+                        self._http_client,
+                        self._config.ynab.personal_access_token,
+                        budget_id,
+                        payee_id,
+                    )
+                except Exception:
+                    logger.exception(
+                        "Failed to look up payee %s in budget %s during payee-mapping "
+                        "reconcile (non-fatal, skipping this payee this cycle)",
+                        payee_id,
+                        budget_id,
+                    )
+                    continue
+                if payee is None or payee.get("deleted"):
+                    stale_ids.add(payee_id)
+
+            if not stale_ids:
                 continue
-            healed = await self._db.delete_payee_mappings_for_ids(budget_id, deleted_ids)
+            healed = await self._db.delete_payee_mappings_for_ids(budget_id, stale_ids)
             if healed:
                 logger.info(
                     "Healed %d stale payee_mappings row(s) for budget %s "
@@ -1176,6 +1261,8 @@ class SyncEngine:
                     budget_id,
                 )
             total_healed += healed
+
+        await self._db.mark_payee_reconcile_done()
         return total_healed
 
     async def _backfill_duplicates(

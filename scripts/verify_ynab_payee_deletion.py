@@ -1,31 +1,42 @@
 #!/usr/bin/env python3
-"""Live verification for the assumption src/ynab_auto_sync/sync/engine.py's
-reconcile_payee_mappings() depends on: that a payee deleted or merged away
-in YNAB keeps appearing in GET {RESOURCE_PATH}/{budget_id}/payees with
-`deleted: true`, rather than disappearing from the list entirely.
+"""Live verification for how YNAB's BULK payee list (GET
+{RESOURCE_PATH}/{budget_id}/payees) behaves for a deleted payee.
 
-This matters because reconcile_payee_mappings() only ever heals a cached
-payee_mappings row when its ynab_payee_id shows up with `deleted: true` -
-never when the id is merely absent from a fetch (a transient or incomplete
-response must never be mistaken for "every payee not in this list is
-gone" - see StateDB.delete_payee_mappings_for_ids's own docstring). If this
-script finds that a deleted/merged payee instead vanishes from the list,
-that safety assumption is wrong and reconcile_payee_mappings() needs to be
-redesigned before it's trusted in the real sync path.
+**Already run once and CONFIRMED**: a real, human-deleted payee is OMITTED
+from this bulk list entirely, rather than kept present with `deleted: true`
+as originally assumed (that assumption was borrowed from this project's own
+GET .../accounts, which DOES keep closed/deleted accounts in its response,
+and from sibling project ../ynab-auto-bank's identical stance for payees -
+both turned out not to generalize here). Independently reconfirmed via
+scripts/verify_ynab_payee_get_by_id.py, which showed the same deleted
+payee_id reliably 404s on a direct GET .../payees/{payee_id} lookup - a
+completely different mechanism (no bulk-list scanning, no name-matching)
+that corroborates the same conclusion.
+
+Because of this, SyncEngine.reconcile_payee_mappings() does NOT use this
+bulk list for detection at all - it checks each of its own cached
+payee_ids individually via ynab_client.get_payee() instead (see that
+engine method's docstring, StateDB.delete_payee_mappings_for_ids's
+docstring, and CLAUDE.md's "Payee-mapping reconcile pass" section for the
+full history). This script is kept only in case YNAB's bulk-list behavior
+is ever worth re-checking (e.g. after a YNAB API change) - it is NOT a
+gating check the reconcile design currently depends on.
 
 Two phases:
 
   1. Automatic: fetches the target budget's real payee list and reports how
      many already carry `deleted: true` vs `false`, printing one full raw
-     example of each kind found (or "none found" for deleted, which is the
-     common case on a first run).
-  2. Manual: creates one throwaway transaction under a unique, obviously-
-     test payee name, prints that payee's id, then asks you to go delete or
-     merge that payee by hand in the YNAB web/mobile app (YNAB has no
-     payee-deletion/merge endpoint reachable from this app - it can only be
-     triggered by a human, never scripted). Press Enter once done, and the
-     script re-fetches the payee list to confirm that exact id now reports
-     `deleted: true`.
+     example of each kind found (or "none found" for deleted, which is
+     expected given the confirmed behavior above).
+  2. Manual: creates one throwaway transaction under a unique, timestamped
+     test payee name (a fixed name previously caused several same-named
+     payees to pile up across repeated runs, making them hard to tell
+     apart in the YNAB UI - fixed), prints that payee's id, then asks you
+     to go delete or merge that payee by hand in the YNAB web/mobile app
+     (YNAB has no payee-deletion/merge endpoint reachable from this app -
+     it can only be triggered by a human, never scripted). Press Enter
+     once done, and the script re-fetches the bulk list to check whether
+     that exact id is present/absent/flagged.
 
 Usage:
     python scripts/verify_ynab_payee_deletion.py --account-id <ynab_account_id>
@@ -46,7 +57,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 from ynab_auto_sync.config import load_config
 from ynab_auto_sync.ynab import client as ynab_client
 
-TEST_PAYEE_NAME = "ynab-auto-sync payee-deletion-verification"
+TEST_PAYEE_NAME_PREFIX = "ynab-auto-sync payee-deletion-verification"
 TEST_IMPORT_ID_PREFIX = "SB1:verify-payee-del-"
 
 
@@ -78,12 +89,23 @@ async def verify(account_id: str, config_path: str, budget_alias: str | None) ->
             print(f"Example active payee: {active[0]!r}")
 
         print("\n--- Phase 2: create a throwaway transaction under a unique test payee ---")
-        test_import_id = f"{TEST_IMPORT_ID_PREFIX}{datetime.now(UTC).strftime('%Y%m%d%H%M%S')}"
+        run_suffix = datetime.now(UTC).strftime("%Y%m%d%H%M%S")
+        test_import_id = f"{TEST_IMPORT_ID_PREFIX}{run_suffix}"
+        # A timestamp suffix, not a fixed name: re-running this script
+        # previously created a fresh payee under the exact same name every
+        # time (YNAB's exact-string payee matching only reuses an existing
+        # payee for an unchanged name, but a PRIOR run's payee may already
+        # be deleted by the time this one runs, so a repeat name doesn't
+        # reliably collide with a still-active one anyway) - several
+        # same-named payees piling up in the real payee list made it
+        # genuinely hard to tell which one in the YNAB UI corresponded to
+        # which run. A unique name per run removes that ambiguity entirely.
+        test_payee_name = f"{TEST_PAYEE_NAME_PREFIX} {run_suffix}"
         tx = {
             "account_id": account_id,
             "date": datetime.now(UTC).date().isoformat(),
             "amount": -1000,
-            "payee_name": TEST_PAYEE_NAME,
+            "payee_name": test_payee_name,
             "memo": "Safe to delete - created by scripts/verify_ynab_payee_deletion.py",
             "cleared": "uncleared",
             "approved": False,
@@ -109,39 +131,43 @@ async def verify(account_id: str, config_path: str, budget_alias: str | None) ->
                 f"response: {created!r}"
             )
             return
-        print(f"OK - created test transaction, payee_id={payee_id!r}, payee_name={TEST_PAYEE_NAME!r}")
+        print(f"OK - created test transaction, payee_id={payee_id!r}, payee_name={test_payee_name!r}")
 
         print(
             "\n--- Manual step required ---\n"
             f"In the YNAB web or mobile app, delete or merge the payee "
-            f"{TEST_PAYEE_NAME!r} (payee_id={payee_id!r}) in budget alias "
+            f"{test_payee_name!r} (payee_id={payee_id!r}) in budget alias "
             f"{budget_alias!r}. Merging it into any other payee, or deleting it "
-            "outright, both count - either action removes it from the payee "
-            "picker but should leave the raw record present with `deleted: "
-            "true` when fetched again."
+            "outright, both count."
         )
         input("Press Enter once you've done this... ")
 
-        print("\n--- Phase 3: re-fetching payees to confirm `deleted: true` ---")
+        print("\n--- Phase 3: re-fetching payees to check the bulk list ---")
         payees_after = await ynab_client.get_payees(http_client, pat, budget_id)
         match = next((p for p in payees_after if p.get("id") == payee_id), None)
         if match is None:
             print(
-                f"FAIL: payee_id={payee_id!r} is no longer present in the payee list at all - "
-                "the 'absence never means deletion' assumption reconcile_payee_mappings() "
-                "relies on is WRONG. Do not trust deleted-only detection without redesigning "
-                "that method first."
+                f"CONFIRMED (again): payee_id={payee_id!r} is absent from the bulk payee "
+                "list entirely, rather than present with deleted=true. This matches the "
+                "already-confirmed real behavior (see scripts/verify_ynab_payee_get_by_id.py, "
+                "which independently confirmed the same id 404s on a direct per-payee GET) - "
+                "reconcile_payee_mappings() no longer scans this bulk list at all, precisely "
+                "because it can't reliably distinguish 'deleted' from 'any other reason it's "
+                "momentarily absent'. It instead checks each cached payee_id directly via "
+                "ynab_client.get_payee()."
             )
             return
         if match.get("deleted"):
             print(
-                f"PASS: payee_id={payee_id!r} is still present with deleted=true "
-                f"({match!r}). reconcile_payee_mappings()'s explicit-deleted-only "
-                "detection is safe to trust."
+                f"UNEXPECTED: payee_id={payee_id!r} is present in the bulk list WITH "
+                f"deleted=true ({match!r}) - this contradicts the previously-confirmed "
+                "behavior (deleted payees were fully absent, not flagged). If reproduced "
+                "consistently, YNAB's behavior may have changed - worth re-examining "
+                "whether the bulk list can be trusted again."
             )
         else:
             print(
-                f"FAIL: payee_id={payee_id!r} is still present but NOT marked deleted "
+                f"payee_id={payee_id!r} is still present and NOT marked deleted "
                 f"({match!r}) - did the manual step above actually take effect yet? "
                 "YNAB may need a moment, or the merge/delete didn't go through."
             )

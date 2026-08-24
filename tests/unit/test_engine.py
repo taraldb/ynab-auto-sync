@@ -1323,20 +1323,61 @@ async def test_run_cycle_falls_back_to_normal_import_when_no_transfer_payee_foun
     )
 
 
-def _payees_route(budget_id: str, payees: list[dict]):
+def _bulk_payees_route(budget_id: str, present_ids: list[str]):
+    # Minimal representation - reconcile_payee_mappings() only checks
+    # PRESENCE at this phase (never absence-as-proof, never the deleted
+    # flag here - see the method's own docstring for why).
     return respx.get(f"{ynab_client.BASE_URL}/{ynab_client.RESOURCE_PATH}/{budget_id}/payees").mock(
-        return_value=httpx.Response(200, json={"data": {"payees": payees}})
+        return_value=httpx.Response(
+            200, json={"data": {"payees": [{"id": pid, "deleted": False} for pid in present_ids]}}
+        )
+    )
+
+
+def _payee_route(budget_id: str, payee_id: str, *, not_found: bool = False, deleted: bool = False):
+    url = f"{ynab_client.BASE_URL}/{ynab_client.RESOURCE_PATH}/{budget_id}/payees/{payee_id}"
+    if not_found:
+        return respx.get(url).mock(
+            return_value=httpx.Response(
+                404, json={"error": {"id": "404.2", "name": "resource_not_found"}}
+            )
+        )
+    return respx.get(url).mock(
+        return_value=httpx.Response(200, json={"data": {"payee": {"id": payee_id, "deleted": deleted}}})
     )
 
 
 @respx.mock
-async def test_reconcile_payee_mappings_deletes_stale_rows_marked_deleted(tmp_path: Path):
+async def test_reconcile_payee_mappings_present_in_bulk_list_skips_per_id_lookup(tmp_path: Path):
+    # The key efficiency property of the hybrid design: a payee PRESENT in
+    # the cheap bulk list is trusted directly - no per-id GET at all.
     config = make_config()
     token_store = make_token_store(tmp_path)
     db = make_db(tmp_path)
     await db.upsert_payee_mapping("budget-1", "MERCHANT A", "payee-a")
-    _payees_route("budget-1", [{"id": "payee-a", "deleted": True}])
-    _payees_route("budget-2", [])
+    _bulk_payees_route("budget-1", ["payee-a"])
+    per_id_route = _payee_route("budget-1", "payee-a", not_found=True)  # must never be called
+
+    async with httpx.AsyncClient() as http_client:
+        engine = make_engine(config, http_client, token_store, db)
+        healed = await engine.reconcile_payee_mappings()
+
+    assert healed == 0
+    assert db.get_payee_id("budget-1", "MERCHANT A") == "payee-a"
+    assert per_id_route.call_count == 0
+
+
+@respx.mock
+async def test_reconcile_payee_mappings_absent_from_bulk_list_confirmed_404_heals(tmp_path: Path):
+    # Primary real-world case, confirmed live (scripts/verify_ynab_payee_deletion.py,
+    # scripts/verify_ynab_payee_get_by_id.py): a genuinely gone payee is
+    # absent from the bulk list AND 404s on a direct per-id GET.
+    config = make_config()
+    token_store = make_token_store(tmp_path)
+    db = make_db(tmp_path)
+    await db.upsert_payee_mapping("budget-1", "MERCHANT A", "payee-a")
+    _bulk_payees_route("budget-1", [])
+    _payee_route("budget-1", "payee-a", not_found=True)
 
     async with httpx.AsyncClient() as http_client:
         engine = make_engine(config, http_client, token_store, db)
@@ -1347,17 +1388,20 @@ async def test_reconcile_payee_mappings_deletes_stale_rows_marked_deleted(tmp_pa
 
 
 @respx.mock
-async def test_reconcile_payee_mappings_does_not_delete_when_id_merely_absent(tmp_path: Path):
-    # The single most important test here: an id simply missing from the
-    # fetch (a transient/incomplete response, or just a payee that still
-    # exists but wasn't returned for some other reason) must NEVER be
-    # treated as evidence of deletion - only an explicit deleted: true does.
+async def test_reconcile_payee_mappings_absent_from_bulk_list_but_still_active_is_not_healed(
+    tmp_path: Path,
+):
+    # THE single most important test in this file: absence from the bulk
+    # list alone (a transient/incomplete response, or any other reason)
+    # must never be trusted - only a per-id-confirmed 404/deleted:true
+    # actually heals anything. This is the safety net the hybrid design
+    # hinges on.
     config = make_config()
     token_store = make_token_store(tmp_path)
     db = make_db(tmp_path)
     await db.upsert_payee_mapping("budget-1", "MERCHANT A", "payee-a")
-    _payees_route("budget-1", [{"id": "payee-other", "deleted": False}])
-    _payees_route("budget-2", [])
+    _bulk_payees_route("budget-1", [])  # absent from the bulk list...
+    _payee_route("budget-1", "payee-a", deleted=False)  # ...but confirmed still active
 
     async with httpx.AsyncClient() as http_client:
         engine = make_engine(config, http_client, token_store, db)
@@ -1368,25 +1412,20 @@ async def test_reconcile_payee_mappings_does_not_delete_when_id_merely_absent(tm
 
 
 @respx.mock
-async def test_reconcile_payee_mappings_leaves_non_deleted_rows_alone(tmp_path: Path):
+async def test_reconcile_payee_mappings_deletes_rows_confirmed_deleted_flag(tmp_path: Path):
     config = make_config()
     token_store = make_token_store(tmp_path)
     db = make_db(tmp_path)
     await db.upsert_payee_mapping("budget-1", "MERCHANT A", "payee-a")
-    await db.upsert_payee_mapping("budget-1", "MERCHANT B", "payee-b")
-    _payees_route(
-        "budget-1",
-        [{"id": "payee-a", "deleted": False}, {"id": "payee-b", "deleted": True}],
-    )
-    _payees_route("budget-2", [])
+    _bulk_payees_route("budget-1", [])
+    _payee_route("budget-1", "payee-a", deleted=True)
 
     async with httpx.AsyncClient() as http_client:
         engine = make_engine(config, http_client, token_store, db)
         healed = await engine.reconcile_payee_mappings()
 
     assert healed == 1
-    assert db.get_payee_id("budget-1", "MERCHANT A") == "payee-a"
-    assert db.get_payee_id("budget-1", "MERCHANT B") is None
+    assert db.get_payee_id("budget-1", "MERCHANT A") is None
 
 
 @respx.mock
@@ -1396,8 +1435,9 @@ async def test_reconcile_payee_mappings_is_per_budget_scoped(tmp_path: Path):
     db = make_db(tmp_path)
     await db.upsert_payee_mapping("budget-1", "MERCHANT A", "payee-a")
     await db.upsert_payee_mapping("budget-2", "MERCHANT A", "payee-a")
-    _payees_route("budget-1", [{"id": "payee-a", "deleted": True}])
-    budget_2_route = _payees_route("budget-2", [{"id": "payee-a", "deleted": False}])
+    _bulk_payees_route("budget-1", [])
+    _payee_route("budget-1", "payee-a", not_found=True)
+    budget_2_bulk_route = _bulk_payees_route("budget-2", ["payee-a"])  # present -> no per-id call
 
     async with httpx.AsyncClient() as http_client:
         engine = make_engine(config, http_client, token_store, db)
@@ -1406,11 +1446,33 @@ async def test_reconcile_payee_mappings_is_per_budget_scoped(tmp_path: Path):
     assert healed == 1
     assert db.get_payee_id("budget-1", "MERCHANT A") is None
     assert db.get_payee_id("budget-2", "MERCHANT A") == "payee-a"
-    assert budget_2_route.called
+    assert budget_2_bulk_route.called
 
 
 @respx.mock
-async def test_reconcile_payee_mappings_skips_budget_on_fetch_failure(tmp_path: Path):
+async def test_reconcile_payee_mappings_skips_payee_on_lookup_failure(tmp_path: Path):
+    config = make_config()
+    token_store = make_token_store(tmp_path)
+    db = make_db(tmp_path)
+    await db.upsert_payee_mapping("budget-1", "MERCHANT A", "payee-a")
+    await db.upsert_payee_mapping("budget-1", "MERCHANT B", "payee-b")
+    _bulk_payees_route("budget-1", [])
+    respx.get(
+        f"{ynab_client.BASE_URL}/{ynab_client.RESOURCE_PATH}/budget-1/payees/payee-a"
+    ).mock(return_value=httpx.Response(500))
+    _payee_route("budget-1", "payee-b", not_found=True)
+
+    async with httpx.AsyncClient() as http_client:
+        engine = make_engine(config, http_client, token_store, db)
+        healed = await engine.reconcile_payee_mappings()  # must not raise
+
+    assert healed == 1
+    assert db.get_payee_id("budget-1", "MERCHANT A") == "payee-a"  # untouched - lookup failed
+    assert db.get_payee_id("budget-1", "MERCHANT B") is None
+
+
+@respx.mock
+async def test_reconcile_payee_mappings_skips_budget_on_bulk_fetch_failure(tmp_path: Path):
     config = make_config()
     token_store = make_token_store(tmp_path)
     db = make_db(tmp_path)
@@ -1419,30 +1481,49 @@ async def test_reconcile_payee_mappings_skips_budget_on_fetch_failure(tmp_path: 
     respx.get(f"{ynab_client.BASE_URL}/{ynab_client.RESOURCE_PATH}/budget-1/payees").mock(
         return_value=httpx.Response(500)
     )
-    _payees_route("budget-2", [{"id": "payee-a", "deleted": True}])
+    _bulk_payees_route("budget-2", [])
+    _payee_route("budget-2", "payee-a", not_found=True)
 
     async with httpx.AsyncClient() as http_client:
         engine = make_engine(config, http_client, token_store, db)
         healed = await engine.reconcile_payee_mappings()  # must not raise
 
     assert healed == 1
-    assert db.get_payee_id("budget-1", "MERCHANT A") == "payee-a"  # untouched - budget-1 fetch failed
+    assert db.get_payee_id("budget-1", "MERCHANT A") == "payee-a"  # untouched - bulk fetch failed
     assert db.get_payee_id("budget-2", "MERCHANT A") is None
 
 
 @respx.mock
-async def test_reconcile_payee_mappings_is_noop_when_nothing_stale(tmp_path: Path):
+async def test_reconcile_payee_mappings_is_noop_when_nothing_cached(tmp_path: Path):
     config = make_config()
     token_store = make_token_store(tmp_path)
     db = make_db(tmp_path)
-    _payees_route("budget-1", [])
-    _payees_route("budget-2", [])
 
     async with httpx.AsyncClient() as http_client:
         engine = make_engine(config, http_client, token_store, db)
-        healed = await engine.reconcile_payee_mappings()
+        healed = await engine.reconcile_payee_mappings()  # no cached payee_ids -> no HTTP calls at all
 
     assert healed == 0
+
+
+@respx.mock
+async def test_reconcile_payee_mappings_is_rate_limited_within_the_same_run(tmp_path: Path):
+    config = make_config()
+    token_store = make_token_store(tmp_path)
+    db = make_db(tmp_path)
+    await db.upsert_payee_mapping("budget-1", "MERCHANT A", "payee-a")
+    bulk_route = _bulk_payees_route("budget-1", [])
+    per_id_route = _payee_route("budget-1", "payee-a", not_found=True)
+
+    async with httpx.AsyncClient() as http_client:
+        engine = make_engine(config, http_client, token_store, db)
+        first = await engine.reconcile_payee_mappings()
+        second = await engine.reconcile_payee_mappings()
+
+    assert first == 1
+    assert second == 0  # rate-limited - mark_payee_reconcile_done() just ran
+    assert bulk_route.call_count == 1  # no second HTTP call at all
+    assert per_id_route.call_count == 1
 
 
 @respx.mock

@@ -126,11 +126,15 @@ _TRACKED_TRANSACTIONS_MIGRATED_COLUMNS = (
 # NOT seeded from config at startup the way account_mappings seeds from
 # accounts: - unlike that one-time migration, config.logging.level should
 # keep taking effect on every fresh process start until a human explicitly
-# overrides it via the GUI, not just once.
+# overrides it via the GUI, not just once. last_payee_reconcile_at mirrors
+# last_vacuum_at's own rate-limiting role, for is_payee_reconcile_due() -
+# see that method's docstring and the "Payee-mapping reconcile pass"
+# section in CLAUDE.md for why this needed a rate limit at all.
 _RUN_METADATA_MIGRATED_COLUMNS = (
     ("last_vacuum_at", "TEXT"),
     ("fetched_last_run", "INTEGER NOT NULL DEFAULT 0"),
     ("log_level", "TEXT"),
+    ("last_payee_reconcile_at", "TEXT"),
 )
 
 
@@ -810,6 +814,46 @@ class StateDB:
         ).fetchone()
         return row["ynab_payee_id"] if row is not None else None
 
+    def list_payee_ids(self, ynab_budget_id: str) -> list[str]:
+        """Every DISTINCT ynab_payee_id currently cached for this budget -
+        the bounded candidate set SyncEngine.reconcile_payee_mappings()
+        checks individually via ynab_client.get_payee() (a targeted
+        single-payee GET). DISTINCT because several raw_payee_name rows can
+        legitimately share one payee_id (the same real merchant reached
+        under two different raw bank-text spellings)."""
+        rows = self._conn.execute(
+            "SELECT DISTINCT ynab_payee_id FROM payee_mappings WHERE ynab_budget_id = ?",
+            (ynab_budget_id,),
+        ).fetchall()
+        return [row["ynab_payee_id"] for row in rows]
+
+    def is_payee_reconcile_due(self, min_interval_days: int) -> bool:
+        """Rate-limit gate for SyncEngine.reconcile_payee_mappings(),
+        mirroring maybe_vacuum's own last_vacuum_at pattern. Needed because
+        that method costs one YNAB API call per DISTINCT cached payee_id
+        (see list_payee_ids) rather than one call per budget - a
+        long-lived budget can accumulate dozens to hundreds of distinct
+        payees, and running the full sweep every cycle (up to 6x/day) risks
+        bursting a large fraction of YNAB's hourly rate limit in one go.
+        Read-only: does not itself mark anything as done - see
+        mark_payee_reconcile_done()."""
+        row = self._conn.execute(
+            "SELECT last_payee_reconcile_at FROM run_metadata WHERE id = 1"
+        ).fetchone()
+        last = row["last_payee_reconcile_at"]
+        if last is None:
+            return True
+        elapsed = datetime.now(UTC) - datetime.fromisoformat(last)
+        return elapsed >= timedelta(days=min_interval_days)
+
+    async def mark_payee_reconcile_done(self) -> None:
+        async with self._lock:
+            self._conn.execute(
+                "UPDATE run_metadata SET last_payee_reconcile_at = ? WHERE id = 1",
+                (datetime.now(UTC).isoformat(),),
+            )
+            self._conn.commit()
+
     async def upsert_payee_mapping(
         self, ynab_budget_id: str, raw_payee_name: str, ynab_payee_id: str
     ) -> None:
@@ -829,15 +873,27 @@ class StateDB:
         self, ynab_budget_id: str, ynab_payee_ids: set[str]
     ) -> int:
         """Heals invariant 12's known gap: a cached ynab_payee_id whose real
-        YNAB payee has since been deleted/merged away. The caller
-        (SyncEngine.reconcile_payee_mappings) passes only ids YNAB itself
-        reports `deleted: true` for - never ids merely absent from a fetch,
-        since YNAB confirmed keeps deleted/merged payees present in the
-        payee list with the flag set rather than removing them (see
-        scripts/verify_ynab_payee_deletion.py). Treating "absent from this
-        fetch" as evidence of deletion would be unsafe: a transient or
-        incomplete response could otherwise mass-invalidate a whole
-        budget's cache.
+        YNAB payee has since been deleted/merged away.
+
+        The caller (SyncEngine.reconcile_payee_mappings) passes only ids
+        it confirmed individually via a targeted GET .../payees/{payee_id}
+        (ynab_client.get_payee) - either a 404, or a 200 with
+        `deleted: true`. An EARLIER version of this design instead scanned
+        the bulk GET .../payees list and looked for `deleted: true` there,
+        on the assumption (borrowed from sibling project
+        ../ynab-auto-bank's identical stance, and from this project's own
+        GET .../accounts, which DOES keep closed/deleted accounts in its
+        response) that YNAB does the same for payees. Live verification
+        (scripts/verify_ynab_payee_deletion.py) proved that assumption
+        wrong for a real, human-deleted payee: it was OMITTED from the
+        bulk list entirely, not flagged - which made "absent from a bulk
+        fetch" fundamentally unsafe to treat as deletion (a transient or
+        incomplete response could just as easily explain an absence, and
+        would have mass-invalidated a whole budget's cache). The targeted
+        per-id GET this design uses instead was then confirmed
+        (scripts/verify_ynab_payee_get_by_id.py) to reliably 404 for a
+        genuinely deleted payee, which is what makes per-id confirmation
+        safe where bulk-list absence was not.
 
         Deliberately does not attempt to guess what a deleted payee was
         merged into (YNAB's payee list gives no such linkage) - the next
@@ -845,8 +901,8 @@ class StateDB:
         through the normal _classify()/_record_created() path.
 
         Returns the number of rows actually deleted; a no-op (no query run)
-        for an empty ynab_payee_ids, which is the overwhelmingly common
-        case every cycle.
+        for an empty ynab_payee_ids, which is the common case most times
+        this runs.
         """
         if not ynab_payee_ids:
             return 0

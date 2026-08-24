@@ -60,6 +60,39 @@ async def get_payees(
 
 
 @retry_get
+async def get_payee(
+    http_client: httpx.AsyncClient, personal_access_token: str, budget_id: str, payee_id: str
+) -> dict[str, Any] | None:
+    """Look up one payee directly, rather than scanning get_payees()'s bulk
+    list - used by SyncEngine.reconcile_payee_mappings() to confirm
+    whether a specific cached payee_id has genuinely been deleted.
+
+    A bulk GET .../payees scan was tried first and found unsafe: live
+    verification (scripts/verify_ynab_payee_deletion.py) proved a real,
+    human-deleted payee is OMITTED from that list entirely rather than
+    included with `deleted: true`, so "absent from the bulk list" could
+    never be safely distinguished from a transient/incomplete response.
+    This targeted per-id endpoint was then confirmed
+    (scripts/verify_ynab_payee_get_by_id.py) to reliably 404 for a
+    genuinely deleted payee instead - which IS a safe, unambiguous signal,
+    since it's asking about one specific id we ourselves cached rather
+    than trying to infer meaning from what a bulk list omits.
+
+    Returns None for a 404 (confirmed-deleted) rather than raising -
+    every other error status still raises via raise_for_status(), same as
+    every other function here.
+    """
+    response = await http_client.get(
+        f"{BASE_URL}/{RESOURCE_PATH}/{budget_id}/payees/{payee_id}",
+        headers=_headers(personal_access_token),
+    )
+    if response.status_code == 404:
+        return None
+    response.raise_for_status()
+    return response.json()["data"]["payee"]
+
+
+@retry_get
 async def get_accounts(
     http_client: httpx.AsyncClient, personal_access_token: str, budget_id: str
 ) -> list[dict[str, Any]]:

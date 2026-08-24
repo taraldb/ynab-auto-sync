@@ -911,6 +911,30 @@ async def test_delete_payee_mappings_for_ids_is_scoped_per_budget(tmp_path: Path
     assert db.get_payee_id("budget-2", "MERCHANT A") == "payee-a"
 
 
+async def test_list_payee_ids_returns_distinct_ids_for_budget(tmp_path: Path):
+    db = StateDB(tmp_path / "state.db")
+    await db.upsert_payee_mapping("budget-1", "MERCHANT A", "payee-a")
+    # Two different raw texts legitimately sharing one real payee_id.
+    await db.upsert_payee_mapping("budget-1", "MERCHANT A ALT SPELLING", "payee-a")
+    await db.upsert_payee_mapping("budget-1", "MERCHANT B", "payee-b")
+    await db.upsert_payee_mapping("budget-2", "MERCHANT C", "payee-c")
+
+    assert sorted(db.list_payee_ids("budget-1")) == ["payee-a", "payee-b"]
+    assert db.list_payee_ids("budget-2") == ["payee-c"]
+
+
+async def test_list_payee_ids_empty_when_nothing_cached(tmp_path: Path):
+    db = StateDB(tmp_path / "state.db")
+    assert db.list_payee_ids("budget-1") == []
+
+
+async def test_is_payee_reconcile_due_runs_first_time_and_respects_min_interval(tmp_path: Path):
+    db = StateDB(tmp_path / "state.db")
+    assert db.is_payee_reconcile_due(min_interval_days=1) is True
+    await db.mark_payee_reconcile_done()
+    assert db.is_payee_reconcile_due(min_interval_days=1) is False
+
+
 # -- audit_events -----------------------------------------------------
 
 

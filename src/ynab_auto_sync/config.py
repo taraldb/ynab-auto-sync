@@ -72,6 +72,23 @@ class SyncConfig(BaseModel):
     # sync/transfers.py). Tunable without a code change if real-world
     # matching turns out to need more or less slack than this default.
     transfer_match_window_days: int = 4
+    # Shared by transfer_match_window_days above AND manual_match_window_days
+    # below - both windows exist for the same reason (a transaction can
+    # settle a few days late because of weekends/holidays), so one toggle
+    # rather than two. "working_days" counts business days (Mon-Fri,
+    # excluding Norwegian public holidays, via the workalendar library) -
+    # see sync/date_window.py. Default "calendar_days" preserves today's
+    # exact transfer-matching behavior for every existing install.
+    match_window_unit: Literal["calendar_days", "working_days"] = "calendar_days"
+    # Opt-in (0 = disabled, the default): how many days of slack, in
+    # match_window_unit's terms, to look for a pre-existing, manually-typed
+    # YNAB transaction (no import_id) with the exact same amount as an
+    # incoming bank transaction on the same account, before creating a new
+    # transaction. See sync/engine.py's _classify() "matched_manual" branch
+    # and CLAUDE.md's "Manual-transaction matching" section for the full
+    # design and its known false-positive risk (no account-number
+    # cross-check exists for this case, unlike transfer-matching).
+    manual_match_window_days: int = 0
     # A failed cycle (provider fetch error, or a YNAB create/update call
     # failing) is retried with exponential backoff: base * 2**attempt,
     # capped at retry_backoff_max_seconds. scheduler.py stops scheduling

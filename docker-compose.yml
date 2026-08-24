@@ -1,0 +1,24 @@
+# Local development only - runs the service against a local mosquitto
+# broker so you can exercise MQTT discovery/commands without touching
+# a real Home Assistant instance. Not used for production deployment;
+# see README.md for deploying the ghcr.io image on your docker host.
+services:
+  mosquitto:
+    image: eclipse-mosquitto:2
+    ports:
+      - "1883:1883"
+    volumes:
+      - ./dev/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+
+  ynab-auto-sync:
+    build: .
+    depends_on:
+      - mosquitto
+    environment:
+      - PYTHONUNBUFFERED=1
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./config:/app/config
+      - ./state:/app/state
+    restart: unless-stopped

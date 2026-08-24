@@ -1,0 +1,224 @@
+from __future__ import annotations
+
+import logging
+from typing import Any
+
+import httpx
+
+from ynab_auto_sync.http_retry import retry_get
+
+logger = logging.getLogger(__name__)
+
+BASE_URL = "https://api.ynab.com/v1"
+
+# YNAB's long-established, widely-documented convention is `/budgets/{budget_id}/...`.
+# One AI-summarized fetch of their OpenAPI spec surfaced `/plans/{plan_id}/...`
+# instead, which could be a genuine rename or a bad summarization - this constant
+# exists so that, if confirmed via scripts/verify_ynab.py to be wrong, fixing it
+# is a one-line change rather than a search-and-replace across the codebase.
+RESOURCE_PATH = "budgets"
+
+
+def _headers(personal_access_token: str) -> dict[str, str]:
+    return {
+        "Authorization": f"Bearer {personal_access_token}",
+        "Content-Type": "application/json",
+    }
+
+
+@retry_get
+async def get_budgets(
+    http_client: httpx.AsyncClient, personal_access_token: str
+) -> list[dict[str, Any]]:
+    response = await http_client.get(
+        f"{BASE_URL}/{RESOURCE_PATH}", headers=_headers(personal_access_token)
+    )
+    response.raise_for_status()
+    data = response.json()["data"]
+    # YNAB wraps the list under a key matching RESOURCE_PATH ("budgets" or "plans").
+    return data.get(RESOURCE_PATH, data.get("budgets", data.get("plans", [])))
+
+
+@retry_get
+async def get_payees(
+    http_client: httpx.AsyncClient, personal_access_token: str, budget_id: str
+) -> list[dict[str, Any]]:
+    """List all payees in a budget, including YNAB's auto-generated
+    transfer payees (one per account, named "Transfer : <account name>",
+    each carrying a `transfer_account_id` field). Confirmed live via
+    scripts/verify_ynab_transfer.py: creating a transaction with `payee_id`
+    set to one of these (instead of `payee_name`) is what creates a real,
+    linked transfer - YNAB auto-creates the paired transaction on the
+    target account itself; the caller must not create both sides.
+    """
+    response = await http_client.get(
+        f"{BASE_URL}/{RESOURCE_PATH}/{budget_id}/payees", headers=_headers(personal_access_token)
+    )
+    response.raise_for_status()
+    return response.json()["data"]["payees"]
+
+
+@retry_get
+async def get_accounts(
+    http_client: httpx.AsyncClient, personal_access_token: str, budget_id: str
+) -> list[dict[str, Any]]:
+    """List a budget's accounts - the drop targets the GUI's mapping tab
+    offers when an account from a provider is dragged onto YNAB.
+
+    Only the on-budget/off-budget accounts a user actually sees are useful
+    here, so `closed` and `deleted` accounts are filtered out: mapping a
+    provider account onto a closed YNAB account would import transactions
+    the user can no longer see.
+
+    Confirmed live via scripts/verify_ynab_accounts.py before being trusted
+    in the mapping UI, per this project's standing rule - a guessed YNAB
+    endpoint has returned a real 404 here before (see get_budgets's comment
+    on /budgets vs /plans).
+    """
+    response = await http_client.get(
+        f"{BASE_URL}/{RESOURCE_PATH}/{budget_id}/accounts",
+        headers=_headers(personal_access_token),
+    )
+    response.raise_for_status()
+    accounts = response.json()["data"]["accounts"]
+    return [a for a in accounts if not a.get("closed") and not a.get("deleted")]
+
+
+def find_transfer_payee_id(payees: list[dict[str, Any]], target_account_id: str) -> str | None:
+    """Find the transfer payee (from get_payees's result) targeting a given
+    account, or None if the budget has no such payee for that account (e.g.
+    it isn't a real account in this budget)."""
+    for payee in payees:
+        if payee.get("transfer_account_id") == target_account_id:
+            return payee["id"]
+    return None
+
+
+async def create_transactions(
+    http_client: httpx.AsyncClient,
+    personal_access_token: str,
+    budget_id: str,
+    transactions: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Bulk-create transactions. Each transaction dict must include a
+    deterministic import_id (see sync/transform.py) - YNAB reports repeats
+    of an existing import_id back as duplicates rather than erroring or
+    creating a second transaction, which is this project's primary
+    no-duplicates guarantee.
+
+    Returns the raw `data` object, e.g.:
+        {"transaction_ids": [...], "transactions": [...],
+         "duplicate_import_ids": [...], "server_knowledge": ...}
+    """
+    if not transactions:
+        return {"transaction_ids": [], "transactions": [], "duplicate_import_ids": []}
+
+    response = await http_client.post(
+        f"{BASE_URL}/{RESOURCE_PATH}/{budget_id}/transactions",
+        headers=_headers(personal_access_token),
+        json={"transactions": transactions},
+    )
+    response.raise_for_status()
+    return response.json()["data"]
+
+
+async def update_transactions(
+    http_client: httpx.AsyncClient,
+    personal_access_token: str,
+    budget_id: str,
+    updates: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Bulk-update existing transactions. Each dict in `updates` must include
+    "id" (the YNAB transaction id) plus whichever fields are being changed,
+    e.g. {"id": "...", "cleared": "cleared", "amount": -12340}.
+
+    This PATCHes the same collection endpoint used for creation, per YNAB's
+    documented pattern for bulk transaction updates - that pattern is a
+    best-effort implementation, unverified against the live API (see
+    RESOURCE_PATH above for the precedent on flagging this kind of
+    assumption). scripts/verify_ynab_update.py exists to confirm it.
+
+    Returns the raw `data` object, e.g.:
+        {"transaction_ids": [...], "transactions": [...], "server_knowledge": ...}
+    """
+    if not updates:
+        return {"transaction_ids": [], "transactions": []}
+
+    response = await http_client.patch(
+        f"{BASE_URL}/{RESOURCE_PATH}/{budget_id}/transactions",
+        headers=_headers(personal_access_token),
+        json={"transactions": updates},
+    )
+    response.raise_for_status()
+    return response.json()["data"]
+
+
+@retry_get
+async def find_transaction_by_import_id(
+    http_client: httpx.AsyncClient,
+    personal_access_token: str,
+    budget_id: str,
+    account_id: str,
+    import_id: str,
+) -> dict[str, Any] | None:
+    """Look up a transaction by its import_id within one account.
+
+    NOTE: an earlier version of this function tried a dedicated
+    `GET .../transactions/import_id/{import_id}` endpoint - live testing via
+    scripts/verify_ynab_update.py confirmed that endpoint doesn't actually
+    exist in the YNAB API (404, not a wrapper-key mismatch). This version
+    instead lists the account's transactions (a well-established, long
+    documented endpoint) and searches client-side for a matching import_id,
+    since every transaction YNAB returns echoes back its own import_id.
+    Used for the resilience path where local tracking state was lost and
+    the code needs to recover an existing YNAB transaction's id - a rare
+    path, so the extra list-and-scan cost here is fine.
+
+    Returns None if no transaction with that import_id is found.
+    """
+    response = await http_client.get(
+        f"{BASE_URL}/{RESOURCE_PATH}/{budget_id}/accounts/{account_id}/transactions",
+        headers=_headers(personal_access_token),
+    )
+    response.raise_for_status()
+    for transaction in response.json()["data"]["transactions"]:
+        if transaction.get("import_id") == import_id:
+            return transaction
+    return None
+
+
+@retry_get
+async def find_transaction_including_deleted(
+    http_client: httpx.AsyncClient,
+    personal_access_token: str,
+    budget_id: str,
+    import_id: str,
+) -> dict[str, Any] | None:
+    """Search the full budget transaction history - including deleted
+    transactions - for one with the given import_id.
+
+    Confirmed live: YNAB permanently reserves an import_id once used, even
+    after the transaction using it is deleted, and will report any later
+    create attempt with that import_id as a duplicate forever - but
+    find_transaction_by_import_id's plain (non-delta) listing silently
+    excludes deleted transactions, so it can never find the reason why.
+    Passing last_knowledge_of_server=0 to the budget-wide transactions
+    endpoint returns the full history including deleted ones (each with a
+    `deleted` boolean field), which is the only way to distinguish "really
+    lost local state, transaction is still active" from "this import_id's
+    transaction was intentionally deleted, stop retrying it."
+
+    Budget-wide rather than account-scoped, and heavier than
+    find_transaction_by_import_id - only call this as a second-line check
+    after that cheaper lookup fails, not routinely.
+    """
+    response = await http_client.get(
+        f"{BASE_URL}/{RESOURCE_PATH}/{budget_id}/transactions",
+        headers=_headers(personal_access_token),
+        params={"last_knowledge_of_server": 0},
+    )
+    response.raise_for_status()
+    for transaction in response.json()["data"]["transactions"]:
+        if transaction.get("import_id") == import_id:
+            return transaction
+    return None

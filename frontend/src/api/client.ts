@@ -1,0 +1,306 @@
+// Thin fetch wrappers around the FastAPI backend's JSON API.
+// All calls are relative paths: in production the built static files are
+// served by the same FastAPI app that exposes /api/*.
+
+export interface Account {
+  key: string;
+  display_name: string;
+  ynab_budget: string;
+}
+
+export interface RunMetadata {
+  last_run_at: string | null;
+  last_success_at: string | null;
+  last_error: string | null;
+  auth_required: boolean;
+  paused: boolean;
+  imported_total: number;
+  fetched_last_run: number;
+  imported_last_run: number;
+  updated_last_run: number;
+  duplicates_last_run: number;
+  resolved_deleted_last_run: number;
+}
+
+export interface StatusResponse {
+  run_metadata: RunMetadata;
+  accounts: Account[];
+  cron_expression: string;
+  next_fire_at: string;
+}
+
+export interface DeletedTransaction {
+  sb1_transaction_id: string;
+  import_id: string;
+  ynab_transaction_id: string;
+  ynab_budget_id: string;
+  account_key: string;
+  booking_status: "DELETED";
+  amount_milliunits: number;
+  first_seen_at: string;
+  last_checked_at: string;
+  payee_name: string | null;
+  memo: string | null;
+  transaction_date: string | null;
+  ynab_account_id: string | null;
+  cleared: string | null;
+  readd_count: number;
+}
+
+export interface ReaddResponse {
+  new_ynab_transaction_id: string;
+}
+
+export type ImportRowStatus = "new" | "duplicate" | "error";
+
+export interface ImportRow {
+  row_index: number;
+  date: string;
+  amount_milliunits: number;
+  payee_name: string;
+  memo: string | null;
+  status: ImportRowStatus;
+}
+
+export interface ImportSummary {
+  new: number;
+  duplicate: number;
+  errors: number;
+}
+
+export interface ImportAccount {
+  key: string;
+  display_name: string;
+  ynab_account_id: string;
+  ynab_budget: string;
+}
+
+export interface ImportResponse {
+  transformer: string;
+  account: ImportAccount;
+  rows: ImportRow[];
+  summary: ImportSummary;
+  committed: boolean;
+}
+
+export class ApiError extends Error {
+  status: number;
+  detail: string;
+
+  constructor(status: number, detail: string) {
+    super(detail);
+    this.status = status;
+    this.detail = detail;
+  }
+}
+
+async function extractDetail(res: Response): Promise<string> {
+  try {
+    const body = await res.json();
+    if (body && typeof body.detail === "string") {
+      return body.detail;
+    }
+    return JSON.stringify(body);
+  } catch {
+    return res.statusText || `Request failed with status ${res.status}`;
+  }
+}
+
+async function handleJson<T>(res: Response): Promise<T> {
+  if (!res.ok) {
+    throw new ApiError(res.status, await extractDetail(res));
+  }
+  return (await res.json()) as T;
+}
+
+export async function getStatus(): Promise<StatusResponse> {
+  const res = await fetch("/api/status");
+  return handleJson<StatusResponse>(res);
+}
+
+export async function listDeleted(): Promise<DeletedTransaction[]> {
+  const res = await fetch("/api/deleted-transactions");
+  return handleJson<DeletedTransaction[]>(res);
+}
+
+export async function readd(trackingKey: string): Promise<ReaddResponse> {
+  const res = await fetch(
+    `/api/deleted-transactions/${encodeURIComponent(trackingKey)}/readd`,
+    { method: "POST" },
+  );
+  return handleJson<ReaddResponse>(res);
+}
+
+export async function importFile(
+  file: File,
+  dryRun: boolean,
+  accountKey?: string,
+): Promise<ImportResponse> {
+  const form = new FormData();
+  form.append("file", file);
+  form.append("dry_run", dryRun ? "true" : "false");
+  if (accountKey) {
+    form.append("account_key", accountKey);
+  }
+  const res = await fetch("/api/import", {
+    method: "POST",
+    body: form,
+  });
+  return handleJson<ImportResponse>(res);
+}
+
+export interface Mapping {
+  id: number;
+  provider: string;
+  provider_account_id: string;
+  ynab_budget_id: string;
+  ynab_account_id: string;
+  display_name: string;
+  import_source_name: string;
+  enabled: boolean;
+  tracked_count: number;
+}
+
+export interface MappingCreate {
+  provider: string;
+  provider_account_id: string;
+  ynab_budget_id: string;
+  ynab_account_id: string;
+  display_name?: string;
+  import_source_name?: string;
+  enabled?: boolean;
+}
+
+export type MappingUpdate = Partial<MappingCreate>;
+
+export interface ProviderAccount {
+  provider_account_id: string;
+  display_name: string;
+  account_type: string;
+  currency: string;
+  mapped: boolean;
+}
+
+export interface ProviderInfo {
+  // The provider's config-key name - this is what account_mappings.provider
+  // stores and what must be sent back as `provider` when creating a mapping.
+  name: string;
+  // Implementation type, for display only. Two connections of the same type
+  // are legitimate, so this is NOT a usable identifier.
+  type: string;
+  auth_required: boolean;
+  error: string | null;
+  accounts: ProviderAccount[];
+}
+
+export interface YnabAccount {
+  id: string;
+  name: string;
+  type: string;
+  on_budget: boolean;
+}
+
+export interface YnabBudget {
+  budget_id: string;
+  alias: string;
+  accounts: YnabAccount[];
+}
+
+export interface SyncNowResponse {
+  status: string;
+}
+
+// Push messages over /api/ws (see contexts/SyncStatusContext.tsx). Mirrors
+// the envelope shape notifications/websocket_sink.py broadcasts:
+// {"type": "...", "data": {...}}. Not every type the backend can send is
+// modeled here (e.g. "availability"/"state_value" are MQTT/Home Assistant
+// concerns the dashboard doesn't consume) - the trailing member keeps
+// those, and any future addition, from being a type error.
+export interface ProgressState {
+  phase: string;
+  [key: string]: unknown;
+}
+
+export type WsMessage =
+  | { type: "status_snapshot"; data: StatusResponse }
+  | { type: "status"; data: { run_metadata: RunMetadata } }
+  | { type: "sync_state"; data: { value: string } }
+  | { type: "cycle_progress"; data: ProgressState }
+  | { type: string; data: unknown };
+
+export async function listMappings(): Promise<Mapping[]> {
+  const res = await fetch("/api/mappings");
+  return handleJson<Mapping[]>(res);
+}
+
+export async function createMapping(body: MappingCreate): Promise<Mapping> {
+  const res = await fetch("/api/mappings", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  return handleJson<Mapping>(res);
+}
+
+export async function updateMapping(
+  id: number,
+  body: MappingUpdate,
+): Promise<Mapping> {
+  const res = await fetch(`/api/mappings/${id}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  return handleJson<Mapping>(res);
+}
+
+export async function deleteMapping(id: number): Promise<void> {
+  const res = await fetch(`/api/mappings/${id}`, { method: "DELETE" });
+  if (!res.ok) {
+    throw new ApiError(res.status, await extractDetail(res));
+  }
+}
+
+export interface ClearAllMappingsResponse {
+  deleted: number;
+}
+
+export async function clearAllMappings(): Promise<ClearAllMappingsResponse> {
+  const res = await fetch("/api/mappings", { method: "DELETE" });
+  return handleJson<ClearAllMappingsResponse>(res);
+}
+
+export async function listProviders(): Promise<ProviderInfo[]> {
+  const res = await fetch("/api/providers");
+  return handleJson<ProviderInfo[]>(res);
+}
+
+export async function listYnabAccounts(): Promise<YnabBudget[]> {
+  const res = await fetch("/api/ynab/accounts");
+  return handleJson<YnabBudget[]>(res);
+}
+
+export async function syncNow(): Promise<SyncNowResponse> {
+  const res = await fetch("/api/sync-now", { method: "POST" });
+  return handleJson<SyncNowResponse>(res);
+}
+
+export type LogLevel = "DEBUG" | "INFO" | "WARNING" | "ERROR" | "CRITICAL";
+
+export interface Settings {
+  log_level: LogLevel;
+}
+
+export async function getSettings(): Promise<Settings> {
+  const res = await fetch("/api/settings");
+  return handleJson<Settings>(res);
+}
+
+export async function updateSettings(body: Partial<Settings>): Promise<Settings> {
+  const res = await fetch("/api/settings", {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  return handleJson<Settings>(res);
+}

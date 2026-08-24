@@ -1,0 +1,47 @@
+[project]
+name = "ynab-auto-sync"
+version = "0.1.0"
+description = "Polls SpareBank1 transactions and imports them into YNAB, with MQTT/Home Assistant state and control."
+requires-python = ">=3.12"
+dependencies = [
+    "httpx>=0.27",
+    "pydantic>=2.7",
+    "pyyaml>=6.0",
+    "aiomqtt>=2.3",
+    "tenacity>=8.4",
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+    "python-multipart>=0.0.9",
+    "openpyxl>=3.1",
+    "croniter>=2.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.2",
+    "pytest-asyncio>=0.23",
+    "respx>=0.21",
+    "ruff>=0.5",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/ynab_auto_sync"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+# B008 flags function calls in argument defaults - but FastAPI's dependency
+# injection (Depends()/File()/Form() as a parameter default) is the
+# framework's own idiomatic, documented pattern, not a bug. Ignoring it
+# project-wide rather than sprinkling `# noqa` on every route handler.
+ignore = ["B008"]

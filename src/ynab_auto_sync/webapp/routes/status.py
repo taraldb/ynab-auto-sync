@@ -1,0 +1,59 @@
+from __future__ import annotations
+
+from datetime import UTC, datetime
+from typing import Any
+
+from croniter import croniter
+from fastapi import APIRouter, Depends
+
+from ynab_auto_sync.config import AppConfig
+from ynab_auto_sync.sync.state_db import StateDB
+from ynab_auto_sync.webapp.deps import get_config, get_db
+
+router = APIRouter()
+
+
+def build_status_payload(config: AppConfig, db: StateDB) -> dict[str, Any]:
+    """The full GET /api/status shape - factored out so webapp/routes/ws.py
+    can send the exact same payload as one `status_snapshot` message right
+    after a websocket connects, without duplicating this assembly logic."""
+    now = datetime.now(UTC)
+    next_fire_at = croniter(config.sync.cron_expression, now).get_next(datetime)
+
+    # Mappings store the RESOLVED budget id, but this field is rendered
+    # straight into the dashboard's accounts table, where a raw UUID is
+    # useless to a human. Map it back to the config alias it came from,
+    # falling back to the id itself if the alias has since been renamed or
+    # removed from config.yaml (better a UUID than a blank cell).
+    alias_by_budget_id = {
+        budget_id: alias for alias, budget_id in config.ynab.budgets.items()
+    }
+
+    return {
+        "run_metadata": db.read_run_metadata(),
+        # Sourced from the account_mappings table now that mappings are
+        # runtime-editable, not config.accounts - but the response key/shape
+        # (accounts / key / display_name) is unchanged so
+        # frontend/src/pages/Dashboard.tsx keeps working without a rewrite.
+        "accounts": [
+            {
+                "key": mapping["provider_account_id"],
+                "display_name": mapping["display_name"] or mapping["provider_account_id"],
+                "ynab_budget": alias_by_budget_id.get(
+                    mapping["ynab_budget_id"], mapping["ynab_budget_id"]
+                ),
+                "provider": mapping["provider"],
+                "enabled": mapping["enabled"],
+            }
+            for mapping in db.list_mappings()
+        ],
+        "cron_expression": config.sync.cron_expression,
+        "next_fire_at": next_fire_at.isoformat(),
+    }
+
+
+@router.get("/api/status")
+async def get_status(
+    config: AppConfig = Depends(get_config), db: StateDB = Depends(get_db)
+) -> dict[str, Any]:
+    return build_status_payload(config, db)

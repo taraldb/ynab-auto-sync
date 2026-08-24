@@ -1,0 +1,82 @@
+# Copy this file to config.yaml (gitignored) and fill in real values.
+# config.yaml must never be committed.
+
+# One entry per bank connection. The KEY (here "sparebank1") is a name you
+# choose - it is what each account mapping records as its provider, and its
+# OAuth tokens are stored at state/tokens/<key>.json. Renaming a key orphans
+# that provider's existing mappings until you re-point them in the GUI, so
+# pick a name you're happy to keep.
+#
+# Several entries of the same `type` are allowed - the SpareBank1 alliance
+# is many separate banks, so two sets of credentials is a realistic setup.
+providers:
+  sparebank1:
+    type: sparebank1
+    enabled: true
+    client_id: ""
+    client_secret: ""
+    # Must match exactly the redirect URI registered for this client at developer.sparebank1.no
+    redirect_uri: "http://localhost:8765/callback"
+    # Optional: your bank's finInst identifier. Leave blank to get a bank picker during auth.
+    fin_inst: ""
+
+ynab:
+  personal_access_token: ""
+  # Human-readable aliases for the YNAB budgets you sync into.
+  budgets:
+    personal: ""
+    shared: ""
+
+sync:
+  # Single cron expression - no need to fetch overnight. Default fires at
+  # 06:00/08:00/10:00/12:00/16:00/20:00 daily.
+  cron_expression: "0 6,8,10,12,16,20 * * *"
+  # How far back every cycle re-fetches, as a safety margin against late-settling
+  # transactions and clock drift. YNAB's import_id dedup makes re-fetching safe.
+  lookback_overlap_hours: 72
+  # Only used the first time an account has no last_synced_at cursor yet.
+  initial_backfill_days: 30
+  # How long a booked, tracked transaction is kept in local state before
+  # it's eligible for pruning. Must stay past initial_backfill_days +
+  # lookback_overlap_hours (enforced at config-load time).
+  retention_days: 270
+
+gui:
+  enabled: true
+  host: "0.0.0.0"
+  port: 8080
+  static_dir: "frontend/dist"
+
+# Optional - omit this whole section, or set enabled: false, to run with
+# no MQTT/Home Assistant integration at all.
+mqtt:
+  enabled: true
+  host: "mqtt.local"
+  port: 1883
+  username: ""
+  password: ""
+  tls: false
+  base_topic: "ynab_auto_sync"
+  discovery_prefix: "homeassistant"
+
+# Optional - omit this whole section, or its `ntfy:` subsection, to run
+# with no discrete event-notification pushes at all. This is separate from
+# mqtt/gui above: those two push continuous STATE (sync_state, run
+# metadata) to a dashboard or Home Assistant; this pushes discrete EVENTS
+# (one message per finished cycle) to something like a phone.
+notifications:
+  ntfy:
+    enabled: true
+    server: "https://ntfy.sh"
+    # Pick a hard-to-guess topic name - anyone who knows it can read your
+    # sync notifications (ntfy.sh topics are public by default) or subscribe
+    # to a private one on a self-hosted server instead.
+    topic: ""
+    # Only needed for a private/protected topic on a self-hosted server.
+    access_token: ""
+    notify_on_success: false
+    notify_on_success_with_changes: true
+    notify_on_error: true
+
+logging:
+  level: "INFO"

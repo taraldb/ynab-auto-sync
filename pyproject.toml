@@ -1,6 +1,6 @@
 [project]
 name = "ynab-auto-sync"
-version = "0.1.0"
+version = "0.1.1"
 description = "Polls SpareBank1 transactions and imports them into YNAB, with MQTT/Home Assistant state and control."
 requires-python = ">=3.12"
 dependencies = [

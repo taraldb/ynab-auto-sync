@@ -21,22 +21,28 @@ RUN if [ -f package-lock.json ]; then npm ci; else npm install; fi \
 
 FROM python:3.12-slim AS runtime
 
-RUN useradd --create-home --uid 1000 appuser
-
+# Unraid runs Docker containers as nobody:users (uid 99, gid 100) by default
+# - confirmed against Unraid's own docs/forums, not assumed. Used numerically
+# rather than via useradd/groupadd: python:3.12-slim's base Debian image
+# already reserves gid 100 for its own "users" group, so creating a NEW
+# named account at that gid would collide. Docker's USER/--chown accept raw
+# uid:gid with no /etc/passwd entry required, and this app never needs one
+# (no home-directory-dependent behavior) - so this sidesteps the collision
+# entirely rather than working around it.
 COPY --from=builder /install /usr/local
-COPY --chown=appuser:appuser src /app/src
-COPY --chown=appuser:appuser --from=frontend-builder /frontend/dist /app/frontend/dist
+COPY --chown=99:100 src /app/src
+COPY --chown=99:100 --from=frontend-builder /frontend/dist /app/frontend/dist
 
 WORKDIR /app
 ENV PYTHONUNBUFFERED=1 \
     PYTHONPATH=/app/src
 
-RUN mkdir -p /app/config /app/state && chown -R appuser:appuser /app
+RUN mkdir -p /app/config /app/state && chown -R 99:100 /app
 
 VOLUME ["/app/config", "/app/state"]
 
 EXPOSE 8080
 
-USER appuser
+USER 99:100
 
 ENTRYPOINT ["python", "-m", "ynab_auto_sync"]

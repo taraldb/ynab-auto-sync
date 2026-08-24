@@ -213,6 +213,12 @@ Losing `sync_state.db` is safe by design (see the no-duplicates guarantee
 above) but does reset the pending→booked tracking for any transaction still
 mid-flight at the time.
 
+The image runs as a fixed, non-root `99:100` (Unraid's standard `nobody:users`
+default for Docker containers) rather than root — make sure your mounted
+`config/` and `state/` directories are writable by that uid/gid on the host,
+e.g. `chown -R 99:100 /path/to/config /path/to/state`, or you'll see
+`sqlite3.OperationalError: unable to open database file` at startup.
+
 To re-authenticate on the host itself (rather than copying a file over):
 
 ```sh

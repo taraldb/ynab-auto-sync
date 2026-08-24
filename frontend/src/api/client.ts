@@ -304,3 +304,62 @@ export async function updateSettings(body: Partial<Settings>): Promise<Settings>
   });
   return handleJson<Settings>(res);
 }
+
+export type AuditEventType = "created" | "updated" | "duplicate" | "skipped";
+
+export type AuditEventSortColumn =
+  | "occurred_at"
+  | "event_type"
+  | "source"
+  | "account_key"
+  | "payee_name"
+  | "memo"
+  | "amount_milliunits"
+  | "detail";
+
+export type SortDir = "asc" | "desc";
+
+export interface AuditEvent {
+  id: number;
+  occurred_at: string;
+  event_type: AuditEventType;
+  source: string;
+  account_key: string | null;
+  tracking_key: string | null;
+  import_id: string | null;
+  ynab_transaction_id: string | null;
+  ynab_budget_id: string | null;
+  ynab_account_id: string | null;
+  payee_name: string | null;
+  memo: string | null;
+  transaction_date: string | null;
+  amount_milliunits: number | null;
+  detail: string | null;
+}
+
+export interface AuditEventsResponse {
+  events: AuditEvent[];
+  total: number;
+  counts: Record<AuditEventType, number>;
+}
+
+export async function listAuditEvents(params: {
+  eventType?: AuditEventType | null;
+  accountKey?: string | null;
+  includeSkipped?: boolean;
+  sortBy?: AuditEventSortColumn;
+  sortDir?: SortDir;
+  limit?: number;
+  offset?: number;
+}): Promise<AuditEventsResponse> {
+  const qs = new URLSearchParams();
+  if (params.eventType) qs.set("event_type", params.eventType);
+  if (params.accountKey) qs.set("account_key", params.accountKey);
+  if (params.includeSkipped) qs.set("include_skipped", "true");
+  if (params.sortBy) qs.set("sort_by", params.sortBy);
+  if (params.sortDir) qs.set("sort_dir", params.sortDir);
+  qs.set("limit", String(params.limit ?? 50));
+  qs.set("offset", String(params.offset ?? 0));
+  const res = await fetch(`/api/audit-events?${qs.toString()}`);
+  return handleJson<AuditEventsResponse>(res);
+}

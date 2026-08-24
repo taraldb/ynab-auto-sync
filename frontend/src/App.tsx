@@ -1,17 +1,19 @@
 import { useState } from "react";
 import { SyncStatusProvider } from "./contexts/SyncStatusContext";
+import AuditLog from "./pages/AuditLog";
 import Dashboard from "./pages/Dashboard";
 import DeletedTransactions from "./pages/DeletedTransactions";
 import Import from "./pages/Import";
 import Mappings from "./pages/Mappings";
 
-type Tab = "dashboard" | "mappings" | "deleted" | "import";
+type Tab = "dashboard" | "mappings" | "deleted" | "import" | "audit";
 
 const TABS: { id: Tab; label: string }[] = [
   { id: "dashboard", label: "Dashboard" },
   { id: "mappings", label: "Mappings" },
   { id: "deleted", label: "Deleted Transactions" },
   { id: "import", label: "Import" },
+  { id: "audit", label: "Audit Log" },
 ];
 
 export default function App() {
@@ -68,6 +70,7 @@ export default function App() {
           {tab === "mappings" && <Mappings />}
           {tab === "deleted" && <DeletedTransactions />}
           {tab === "import" && <Import />}
+          {tab === "audit" && <AuditLog />}
         </SyncStatusProvider>
       </main>
     </div>

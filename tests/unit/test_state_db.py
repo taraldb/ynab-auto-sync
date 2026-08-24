@@ -875,3 +875,132 @@ async def test_upsert_payee_mapping_first_write_wins(tmp_path: Path):
     await db.upsert_payee_mapping("budget-1", "SOME MERCHANT", "payee-abc")
     await db.upsert_payee_mapping("budget-1", "SOME MERCHANT", "payee-xyz")
     assert db.get_payee_id("budget-1", "SOME MERCHANT") == "payee-abc"
+
+
+# -- audit_events -----------------------------------------------------
+
+
+async def test_insert_and_list_audit_events_most_recent_first(tmp_path: Path):
+    db = StateDB(tmp_path / "state.db")
+    await db.insert_audit_event(event_type="created", source="sparebank1", detail="first")
+    await db.insert_audit_event(event_type="created", source="sparebank1", detail="second")
+    events, total = db.list_audit_events()
+    assert total == 2
+    assert [e["detail"] for e in events] == ["second", "first"]
+
+
+async def test_list_audit_events_excludes_skipped_by_default(tmp_path: Path):
+    db = StateDB(tmp_path / "state.db")
+    await db.insert_audit_event(event_type="created", source="sparebank1")
+    await db.insert_audit_event(event_type="skipped", source="sparebank1")
+    events, total = db.list_audit_events()
+    assert total == 1
+    assert events[0]["event_type"] == "created"
+
+
+async def test_list_audit_events_include_skipped_true_returns_everything(tmp_path: Path):
+    db = StateDB(tmp_path / "state.db")
+    await db.insert_audit_event(event_type="created", source="sparebank1")
+    await db.insert_audit_event(event_type="skipped", source="sparebank1")
+    _events, total = db.list_audit_events(include_skipped=True)
+    assert total == 2
+
+
+async def test_list_audit_events_explicit_type_wins_over_include_skipped(tmp_path: Path):
+    db = StateDB(tmp_path / "state.db")
+    await db.insert_audit_event(event_type="skipped", source="sparebank1")
+    events, total = db.list_audit_events(event_type="skipped", include_skipped=False)
+    assert total == 1
+    assert events[0]["event_type"] == "skipped"
+
+
+async def test_list_audit_events_filters_by_event_type(tmp_path: Path):
+    db = StateDB(tmp_path / "state.db")
+    await db.insert_audit_event(event_type="created", source="sparebank1")
+    await db.insert_audit_event(event_type="updated", source="sparebank1")
+    events, total = db.list_audit_events(event_type="updated")
+    assert total == 1
+    assert events[0]["event_type"] == "updated"
+
+
+async def test_list_audit_events_paginates(tmp_path: Path):
+    db = StateDB(tmp_path / "state.db")
+    for i in range(5):
+        await db.insert_audit_event(event_type="created", source="sparebank1", detail=str(i))
+    page1, total = db.list_audit_events(limit=2, offset=0)
+    page2, _ = db.list_audit_events(limit=2, offset=2)
+    assert total == 5
+    assert len(page1) == 2
+    assert len(page2) == 2
+    assert [e["id"] for e in page1] != [e["id"] for e in page2]
+
+
+async def test_list_audit_events_filters_by_account_key(tmp_path: Path):
+    db = StateDB(tmp_path / "state.db")
+    await db.insert_audit_event(event_type="created", source="sparebank1", account_key="acct-1")
+    await db.insert_audit_event(event_type="created", source="sparebank1", account_key="acct-2")
+    events, total = db.list_audit_events(account_key="acct-1")
+    assert total == 1
+    assert events[0]["account_key"] == "acct-1"
+
+
+async def test_list_audit_events_sorts_by_requested_column_and_direction(tmp_path: Path):
+    db = StateDB(tmp_path / "state.db")
+    await db.insert_audit_event(event_type="created", source="sparebank1", payee_name="Zebra")
+    await db.insert_audit_event(event_type="created", source="sparebank1", payee_name="Apple")
+    asc, _ = db.list_audit_events(sort_by="payee_name", sort_dir="asc")
+    desc, _ = db.list_audit_events(sort_by="payee_name", sort_dir="desc")
+    assert [e["payee_name"] for e in asc] == ["Apple", "Zebra"]
+    assert [e["payee_name"] for e in desc] == ["Zebra", "Apple"]
+
+
+async def test_list_audit_events_rejects_unsortable_column(tmp_path: Path):
+    db = StateDB(tmp_path / "state.db")
+    with pytest.raises(ValueError, match="unsortable"):
+        db.list_audit_events(sort_by="id; DROP TABLE audit_events")
+
+
+async def test_list_audit_events_rejects_invalid_sort_direction(tmp_path: Path):
+    db = StateDB(tmp_path / "state.db")
+    with pytest.raises(ValueError, match="invalid sort direction"):
+        db.list_audit_events(sort_dir="sideways")
+
+
+async def test_count_audit_events_by_type_is_zero_filled(tmp_path: Path):
+    db = StateDB(tmp_path / "state.db")
+    assert db.count_audit_events_by_type() == {
+        "created": 0,
+        "updated": 0,
+        "duplicate": 0,
+        "skipped": 0,
+    }
+
+
+async def test_count_audit_events_by_type_counts_each_category(tmp_path: Path):
+    db = StateDB(tmp_path / "state.db")
+    await db.insert_audit_event(event_type="created", source="sparebank1")
+    await db.insert_audit_event(event_type="created", source="sparebank1")
+    await db.insert_audit_event(event_type="skipped", source="sparebank1")
+    counts = db.count_audit_events_by_type()
+    assert counts["created"] == 2
+    assert counts["skipped"] == 1
+    assert counts["updated"] == 0
+
+
+async def test_prune_audit_events_deletes_rows_before_cutoff(tmp_path: Path):
+    db = StateDB(tmp_path / "state.db")
+    await db.insert_audit_event(event_type="created", source="sparebank1")
+    # Backdate the row directly - insert_audit_event always stamps "now".
+    db._conn.execute("UPDATE audit_events SET occurred_at = '2020-01-01T00:00:00+00:00'")
+    db._conn.commit()
+    deleted = await db.prune_audit_events(datetime.now(UTC).date())
+    assert deleted == 1
+    assert db.list_audit_events()[1] == 0
+
+
+async def test_prune_audit_events_never_prunes_todays_rows(tmp_path: Path):
+    db = StateDB(tmp_path / "state.db")
+    await db.insert_audit_event(event_type="created", source="sparebank1")
+    deleted = await db.prune_audit_events(datetime.now(UTC).date())
+    assert deleted == 0
+    assert db.list_audit_events()[1] == 1

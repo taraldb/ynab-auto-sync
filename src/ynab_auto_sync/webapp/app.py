@@ -12,6 +12,7 @@ from ynab_auto_sync.sync.engine import SyncEngine
 from ynab_auto_sync.sync.state_db import StateDB
 from ynab_auto_sync.webapp.connection_manager import ConnectionManager
 from ynab_auto_sync.webapp.routes import (
+    audit,
     deleted,
     file_import,
     mappings,
@@ -44,6 +45,7 @@ def create_app(
     app.state.ws_manager = ws_manager
 
     app.include_router(status.router)
+    app.include_router(audit.router)
     app.include_router(deleted.router)
     app.include_router(file_import.router)
     app.include_router(mappings.router)

@@ -1574,3 +1574,474 @@ async def test_import_file_rows_dedup_key_never_collides_with_sparebank1_domain(
     # domain entirely - so it was actually submitted to YNAB.
     assert result.rows[0].status == "new"
     assert create_route_mock.called
+
+
+# -- audit_events -------------------------------------------------------
+
+
+@respx.mock
+async def test_run_cycle_records_audit_event_for_created_transaction(tmp_path: Path):
+    config = make_config()
+    token_store = make_token_store(tmp_path)
+    db = make_db(tmp_path)
+    await seed_mappings(db, config)
+
+    respx.get(sb1_client.TRANSACTIONS_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "transactions": [
+                    {
+                        "id": "tx-booked-1",
+                        "nonUniqueId": "tx-booked-1",
+                        "accountKey": "acct-1",
+                        "date": "2026-08-20",
+                        "amount": -50,
+                        "description": "Coffee",
+                        "bookingStatus": "BOOKED",
+                    }
+                ]
+            },
+        )
+    )
+    import_id = derive_import_id("acct-1:tx-booked-1")
+    respx.post(f"{ynab_client.BASE_URL}/{ynab_client.RESOURCE_PATH}/budget-1/transactions").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "data": {
+                    "transaction_ids": ["ynab-tx-1"],
+                    "duplicate_import_ids": [],
+                    "transactions": [
+                        {"id": "ynab-tx-1", "import_id": import_id, "amount": -50000}
+                    ],
+                }
+            },
+        )
+    )
+
+    async with httpx.AsyncClient() as http_client:
+        engine = make_engine(config, http_client, token_store, db)
+        await engine.run_cycle()
+
+    events, total = db.list_audit_events()
+    assert total == 1
+    assert events[0]["event_type"] == "created"
+    assert events[0]["source"] == "sparebank1"
+    assert events[0]["account_key"] == "acct-1"
+    assert events[0]["tracking_key"] == "acct-1:tx-booked-1"
+    assert events[0]["ynab_transaction_id"] == "ynab-tx-1"
+    assert events[0]["amount_milliunits"] == -50000
+
+
+@respx.mock
+async def test_run_cycle_records_audit_event_for_updated_transaction(tmp_path: Path):
+    config = make_config()
+    token_store = make_token_store(tmp_path)
+    db = make_db(tmp_path)
+    await seed_mappings(db, config)
+    await db.upsert_tracked(
+        "acct-1:tx-transition",
+        import_id=derive_import_id("acct-1:tx-transition"),
+        ynab_transaction_id="ynab-transition",
+        ynab_budget_id="budget-1",
+        account_key="acct-1",
+        booking_status="PENDING",
+        amount_milliunits=-130000,
+    )
+
+    respx.get(sb1_client.TRANSACTIONS_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "transactions": [
+                    {
+                        "id": "tx-transition",
+                        "nonUniqueId": "tx-transition",
+                        "accountKey": "acct-1",
+                        "date": "2026-08-20",
+                        "amount": -142.5,
+                        "bookingStatus": "BOOKED",
+                    }
+                ]
+            },
+        )
+    )
+    respx.patch(
+        f"{ynab_client.BASE_URL}/{ynab_client.RESOURCE_PATH}/budget-1/transactions"
+    ).mock(return_value=httpx.Response(200, json={"data": {"transaction_ids": ["ynab-transition"]}}))
+
+    async with httpx.AsyncClient() as http_client:
+        engine = make_engine(config, http_client, token_store, db)
+        await engine.run_cycle()
+
+    events, total = db.list_audit_events()
+    assert total == 1
+    assert events[0]["event_type"] == "updated"
+    assert events[0]["source"] == "sparebank1"
+    assert events[0]["ynab_transaction_id"] == "ynab-transition"
+    assert events[0]["amount_milliunits"] == -142500
+    assert "pending" in events[0]["detail"].lower()
+
+
+@respx.mock
+async def test_run_cycle_records_audit_event_for_duplicate_recovered_via_lookup(tmp_path: Path):
+    config = make_config()
+    token_store = make_token_store(tmp_path)
+    db = make_db(tmp_path)
+    await seed_mappings(db, config)
+
+    respx.get(sb1_client.TRANSACTIONS_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "transactions": [
+                    {
+                        "id": "tx-orphaned",
+                        "nonUniqueId": "tx-orphaned",
+                        "accountKey": "acct-1",
+                        "date": "2026-08-20",
+                        "amount": -50,
+                        "bookingStatus": "BOOKED",
+                    }
+                ]
+            },
+        )
+    )
+    import_id = derive_import_id("acct-1:tx-orphaned")
+    respx.post(f"{ynab_client.BASE_URL}/{ynab_client.RESOURCE_PATH}/budget-1/transactions").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "data": {
+                    "transaction_ids": [],
+                    "duplicate_import_ids": [import_id],
+                    "transactions": [],
+                }
+            },
+        )
+    )
+    respx.get(
+        f"{ynab_client.BASE_URL}/{ynab_client.RESOURCE_PATH}/budget-1/accounts/ynab-acct-1/transactions"
+    ).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "data": {
+                    "transactions": [
+                        {"id": "ynab-recovered", "import_id": import_id, "amount": -50000}
+                    ]
+                }
+            },
+        )
+    )
+
+    async with httpx.AsyncClient() as http_client:
+        engine = make_engine(config, http_client, token_store, db)
+        await engine.run_cycle()
+
+    events, total = db.list_audit_events()
+    assert total == 1
+    assert events[0]["event_type"] == "duplicate"
+    assert events[0]["ynab_transaction_id"] == "ynab-recovered"
+    assert "recovered" in events[0]["detail"]
+
+
+@respx.mock
+async def test_run_cycle_records_audit_event_for_duplicate_resolved_as_deleted(tmp_path: Path):
+    config = make_config()
+    token_store = make_token_store(tmp_path)
+    db = make_db(tmp_path)
+    await seed_mappings(db, config)
+
+    respx.get(sb1_client.TRANSACTIONS_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "transactions": [
+                    {
+                        "id": "tx-deleted",
+                        "nonUniqueId": "tx-deleted",
+                        "accountKey": "acct-1",
+                        "date": "2026-08-20",
+                        "amount": -13,
+                        "description": "Micro Kaffi AS",
+                        "bookingStatus": "BOOKED",
+                    }
+                ]
+            },
+        )
+    )
+    import_id = derive_import_id("acct-1:tx-deleted")
+    respx.post(f"{ynab_client.BASE_URL}/{ynab_client.RESOURCE_PATH}/budget-1/transactions").mock(
+        return_value=httpx.Response(
+            200,
+            json={"data": {"transaction_ids": [], "duplicate_import_ids": [import_id], "transactions": []}},
+        )
+    )
+    respx.get(
+        f"{ynab_client.BASE_URL}/{ynab_client.RESOURCE_PATH}/budget-1/accounts/ynab-acct-1/transactions"
+    ).mock(return_value=httpx.Response(200, json={"data": {"transactions": []}}))
+    respx.get(
+        f"{ynab_client.BASE_URL}/{ynab_client.RESOURCE_PATH}/budget-1/transactions"
+    ).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "data": {
+                    "transactions": [
+                        {"id": "ynab-deleted-1", "import_id": import_id, "deleted": True}
+                    ]
+                }
+            },
+        )
+    )
+
+    async with httpx.AsyncClient() as http_client:
+        engine = make_engine(config, http_client, token_store, db)
+        await engine.run_cycle()
+
+    events, total = db.list_audit_events()
+    assert total == 1
+    assert events[0]["event_type"] == "duplicate"
+    assert "resolved as previously deleted" in events[0]["detail"]
+
+
+@respx.mock
+async def test_submit_retry_records_duplicate_audit_event_for_already_tracked_row(
+    tmp_path: Path,
+):
+    """The "already tracked (retry within same cycle)" branch of
+    _backfill_duplicates is only reachable by resubmitting the same
+    ClassifiedCycle - exactly the retry scenario scheduler.py's backoff
+    handling relies on being safe (see ClassifiedCycle's docstring)."""
+    config = make_config()
+    token_store = make_token_store(tmp_path)
+    db = make_db(tmp_path)
+    await seed_mappings(db, config)
+
+    respx.get(sb1_client.TRANSACTIONS_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "transactions": [
+                    {
+                        "id": "tx-retry",
+                        "nonUniqueId": "tx-retry",
+                        "accountKey": "acct-1",
+                        "date": "2026-08-20",
+                        "amount": -50,
+                        "bookingStatus": "BOOKED",
+                    }
+                ]
+            },
+        )
+    )
+    import_id = derive_import_id("acct-1:tx-retry")
+
+    call_count = 0
+
+    def create_side_effect(request):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            return httpx.Response(
+                200,
+                json={
+                    "data": {
+                        "transaction_ids": ["ynab-retry-1"],
+                        "duplicate_import_ids": [],
+                        "transactions": [
+                            {"id": "ynab-retry-1", "import_id": import_id, "amount": -50000}
+                        ],
+                    }
+                },
+            )
+        # Second submit() of the SAME classified cycle: YNAB now reports it
+        # as a duplicate, but it's already tracked locally from the first
+        # call above - the "already tracked" no-op branch.
+        return httpx.Response(
+            200,
+            json={"data": {"transaction_ids": [], "duplicate_import_ids": [import_id], "transactions": []}},
+        )
+
+    respx.post(
+        f"{ynab_client.BASE_URL}/{ynab_client.RESOURCE_PATH}/budget-1/transactions"
+    ).mock(side_effect=create_side_effect)
+
+    async with httpx.AsyncClient() as http_client:
+        engine = make_engine(config, http_client, token_store, db)
+        classified = await engine.fetch_and_classify()
+        await engine.submit(classified)
+        await engine.submit(classified)  # simulated retry of the same cycle
+
+    events, total = db.list_audit_events()
+    assert total == 2
+    duplicate_events = [e for e in events if e["event_type"] == "duplicate"]
+    assert len(duplicate_events) == 1
+    assert "retry within same cycle" in duplicate_events[0]["detail"]
+
+
+@respx.mock
+async def test_run_cycle_records_audit_events_for_transfer_pair(tmp_path: Path):
+    config = make_transfer_config()
+    token_store = make_token_store(tmp_path)
+    db = make_db(tmp_path)
+    await seed_mappings(db, config)
+
+    mock_sb1_transfer_fetch()
+    mock_payees_route("budget-1")
+
+    primary_import_id = derive_import_id("acct-out:tx-out-1")
+
+    respx.post(f"{ynab_client.BASE_URL}/{ynab_client.RESOURCE_PATH}/budget-1/transactions").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "data": {
+                    "transaction_ids": ["ynab-transfer-out", "ynab-transfer-out"],
+                    "duplicate_import_ids": [],
+                    "transactions": [
+                        {
+                            "id": "ynab-transfer-out",
+                            "import_id": primary_import_id,
+                            "amount": -50000,
+                            "payee_name": "Transfer : In",
+                            "transfer_account_id": "ynab-in",
+                            "transfer_transaction_id": "ynab-transfer-in",
+                        }
+                    ],
+                }
+            },
+        )
+    )
+    respx.patch(
+        f"{ynab_client.BASE_URL}/{ynab_client.RESOURCE_PATH}/budget-1/transactions"
+    ).mock(return_value=httpx.Response(200, json={"data": {}}))
+
+    async with httpx.AsyncClient() as http_client:
+        engine = make_engine(config, http_client, token_store, db)
+        await engine.run_cycle()
+
+    events, total = db.list_audit_events()
+    assert total == 2
+    created_events = [e for e in events if e["event_type"] == "created"]
+    assert len(created_events) == 2
+    primary = next(e for e in created_events if e["ynab_transaction_id"] == "ynab-transfer-out")
+    secondary = next(e for e in created_events if e["ynab_transaction_id"] == "ynab-transfer-in")
+    assert primary["detail"] == "transfer primary leg"
+    assert primary["account_key"] == "acct-out"
+    assert "transfer secondary leg" in secondary["detail"]
+    assert secondary["account_key"] == "acct-in"
+
+
+@respx.mock
+async def test_import_file_rows_records_audit_event_for_duplicate_on_commit(tmp_path: Path):
+    config = make_config()
+    token_store = make_token_store(tmp_path)
+    db = make_db(tmp_path)
+    await seed_mappings(db, config)
+    row = make_row(2, 1, -12500, "Kiwi")
+
+    from ynab_auto_sync.sync.file_import import dedup as file_dedup
+
+    dedup_key = file_dedup.compute_dedup_key(row.date, row.amount_milliunits, row.payee_name, row.memo)
+    tracking_key = get_file_tracking_key("ynab-acct-1", dedup_key)
+    await db.upsert_tracked(
+        tracking_key,
+        import_id=derive_file_import_id(tracking_key),
+        ynab_transaction_id="ynab-existing",
+        ynab_budget_id="budget-1",
+        account_key="acct-1",
+        booking_status="BOOKED",
+        amount_milliunits=-12500,
+    )
+
+    async with httpx.AsyncClient() as http_client:
+        engine = make_engine(config, http_client, token_store, db)
+        await engine.import_file_rows(
+            ynab_account_id="ynab-acct-1",
+            ynab_budget_id="budget-1",
+            account_key="acct-1",
+            rows=[row],
+            dry_run=False,
+        )
+
+    events, total = db.list_audit_events()
+    assert total == 1
+    assert events[0]["event_type"] == "duplicate"
+    assert events[0]["source"] == "file"
+    assert events[0]["tracking_key"] == tracking_key
+
+
+@respx.mock
+async def test_import_file_rows_dry_run_does_not_record_audit_events(tmp_path: Path):
+    config = make_config()
+    token_store = make_token_store(tmp_path)
+    db = make_db(tmp_path)
+    await seed_mappings(db, config)
+    row = make_row(2, 1, -12500, "Kiwi")
+
+    from ynab_auto_sync.sync.file_import import dedup as file_dedup
+
+    dedup_key = file_dedup.compute_dedup_key(row.date, row.amount_milliunits, row.payee_name, row.memo)
+    tracking_key = get_file_tracking_key("ynab-acct-1", dedup_key)
+    await db.upsert_tracked(
+        tracking_key,
+        import_id=derive_file_import_id(tracking_key),
+        ynab_transaction_id="ynab-existing",
+        ynab_budget_id="budget-1",
+        account_key="acct-1",
+        booking_status="BOOKED",
+        amount_milliunits=-12500,
+    )
+
+    async with httpx.AsyncClient() as http_client:
+        engine = make_engine(config, http_client, token_store, db)
+        with respx.mock:
+            await engine.import_file_rows(
+                ynab_account_id="ynab-acct-1",
+                ynab_budget_id="budget-1",
+                account_key="acct-1",
+                rows=[row],
+                dry_run=True,
+            )
+
+    assert db.list_audit_events(include_skipped=True)[1] == 0
+
+
+@respx.mock
+async def test_run_cycle_records_account_key_for_malformed_row_skip(tmp_path: Path):
+    """A malformed row's skip audit event carries the account_key the
+    provider still knew about (via SkipCallback's context dict), even
+    though the row itself never became a NormalizedTransaction."""
+    config = make_config()
+    token_store = make_token_store(tmp_path)
+    db = make_db(tmp_path)
+    await seed_mappings(db, config)
+
+    respx.get(sb1_client.TRANSACTIONS_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "transactions": [
+                    {
+                        "accountKey": "acct-1",
+                        "amount": -10,
+                        "bookingStatus": "BOOKED",
+                        # no date field - malformed
+                    }
+                ]
+            },
+        )
+    )
+
+    async with httpx.AsyncClient() as http_client:
+        engine = make_engine(config, http_client, token_store, db)
+        await engine.run_cycle()
+
+    events, total = db.list_audit_events(include_skipped=True)
+    assert total == 1
+    assert events[0]["event_type"] == "skipped"
+    assert events[0]["account_key"] == "acct-1"
+    assert "date field" in events[0]["detail"]

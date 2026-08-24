@@ -11,7 +11,9 @@ from ynab_auto_sync.providers.base import (
     BookingStatus,
     NormalizedTransaction,
     ProviderAccount,
+    SkipCallback,
     TransactionProvider,
+    report_skip,
 )
 from ynab_auto_sync.providers.registry import register
 from ynab_auto_sync.providers.sparebank1 import client as sb1_client
@@ -92,7 +94,9 @@ class SpareBank1Provider(TransactionProvider):
         return accounts
 
     async def fetch(
-        self, since_by_account: dict[str, datetime]
+        self,
+        since_by_account: dict[str, datetime],
+        on_skip: SkipCallback | None = None,
     ) -> list[NormalizedTransaction]:
         if not since_by_account:
             return []
@@ -126,6 +130,11 @@ class SpareBank1Provider(TransactionProvider):
                     owning_account_key,
                     sb1_tx,
                 )
+                await report_skip(
+                    on_skip,
+                    "malformed: unrecognized or missing accountKey",
+                    {"account_key": owning_account_key, "raw": sb1_tx},
+                )
                 continue
             sb1_txs_by_account[owning_account_key].append(sb1_tx)
 
@@ -140,6 +149,11 @@ class SpareBank1Provider(TransactionProvider):
                         "field: %r",
                         sb1_tx,
                     )
+                    await report_skip(
+                        on_skip,
+                        "malformed: no recognizable date field",
+                        {"account_key": account_key, "raw": sb1_tx},
+                    )
                     continue
 
                 try:
@@ -150,6 +164,11 @@ class SpareBank1Provider(TransactionProvider):
                         "field: %r",
                         sb1_tx,
                     )
+                    await report_skip(
+                        on_skip,
+                        "malformed: no recognizable id field",
+                        {"account_key": account_key, "raw": sb1_tx},
+                    )
                     continue
 
                 try:
@@ -158,6 +177,11 @@ class SpareBank1Provider(TransactionProvider):
                     logger.error(
                         "Skipping SpareBank1 transaction missing required fields: %r",
                         sb1_tx,
+                    )
+                    await report_skip(
+                        on_skip,
+                        "malformed: missing required fields",
+                        {"account_key": account_key, "raw": sb1_tx},
                     )
                     continue
 

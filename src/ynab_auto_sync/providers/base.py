@@ -1,9 +1,43 @@
 from __future__ import annotations
 
+import logging
 from abc import ABC, abstractmethod
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import date, datetime
 from enum import StrEnum
+from typing import Any
+
+logger = logging.getLogger(__name__)
+
+# Optional, purely observational hook for skip diagnostics (backs the GUI's
+# Audit Log "skipped" category) - mirrors engine.py's ProgressCallback shape
+# exactly. A provider that never calls it is still fully conformant: this
+# defaults to None everywhere, so no existing/future provider implementation
+# is required to support it. Called once per row a provider drops for being
+# structurally malformed (never for a row skipped by ordinary, expected
+# per-cycle logic like a still-PENDING transaction - see fetch()'s docstring
+# below) - reason is a short human-readable string, context is whatever the
+# provider has on hand to help diagnose it (e.g. the raw row).
+SkipCallback = Callable[[str, dict[str, Any]], Awaitable[None]]
+
+
+async def report_skip(
+    on_skip: SkipCallback | None, reason: str, context: dict[str, Any]
+) -> None:
+    """Best-effort skip notification - same contract as engine.py's
+    _report(): must never affect fetch()'s own control flow, so any
+    exception from the callback is caught and logged here, never raised.
+    A free function (not a TransactionProvider method) so any provider can
+    call it without providers/ needing to import from sync/engine.py -
+    that layering (providers sit below sync/) is deliberate, see CLAUDE.md.
+    """
+    if on_skip is None:
+        return
+    try:
+        await on_skip(reason, context)
+    except Exception:
+        logger.exception("Skip callback failed (non-fatal, fetch continues)")
 
 
 class BookingStatus(StrEnum):
@@ -141,7 +175,9 @@ class TransactionProvider(ABC):
 
     @abstractmethod
     async def fetch(
-        self, since_by_account: dict[str, datetime]
+        self,
+        since_by_account: dict[str, datetime],
+        on_skip: SkipCallback | None = None,
     ) -> list[NormalizedTransaction]:
         """Fetch transactions for the given accounts, each fetched no
         earlier than its own per-account cutoff.
@@ -169,6 +205,15 @@ class TransactionProvider(ABC):
         cycle. Likewise, a row whose account is not among the requested
         since_by_account keys must be logged as an error and skipped
         rather than returned or silently dropped without a trace.
+
+        on_skip, when given, should be called (via report_skip() above) once
+        for each row dropped for being structurally malformed - it backs the
+        GUI's Audit Log "skipped" category. Do NOT call it for a row skipped
+        by ordinary, expected per-cycle logic that isn't actually a problem
+        (e.g. SpareBank1's provider skips every still-PENDING row by design,
+        every cycle - that would flood the audit log for something that
+        isn't diagnostic information). Optional and best-effort: a provider
+        that never calls it is still fully conformant.
 
         Raise ProviderAuthRequiredError only for a genuine
         authentication failure requiring the user to re-authenticate -

@@ -457,6 +457,112 @@ async def test_fetch_does_not_drop_rows_older_than_since(tmp_path: Path):
 
 
 @respx.mock
+async def test_on_skip_called_for_each_malformed_row(tmp_path: Path):
+    mock_transactions(
+        [
+            {
+                "accountKey": "not-a-configured-account",
+                "nonUniqueId": "nu-1",
+                "date": "2026-08-20",
+                "amount": -10,
+                "bookingStatus": "BOOKED",
+            },
+            {
+                "accountKey": "acct-1",
+                "nonUniqueId": "nu-no-date",
+                "amount": -10,
+                "bookingStatus": "BOOKED",
+            },
+            {
+                "accountKey": "acct-1",
+                "date": "2026-08-20",
+                "amount": -10,
+                "bookingStatus": "BOOKED",
+            },
+            {
+                "accountKey": "acct-1",
+                "nonUniqueId": "nu-no-amount",
+                "date": "2026-08-20",
+                "bookingStatus": "BOOKED",
+            },
+        ]
+    )
+    skipped: list[tuple[str, dict]] = []
+
+    async def on_skip(reason: str, context: dict) -> None:
+        skipped.append((reason, context))
+
+    async with httpx.AsyncClient() as http_client:
+        provider = make_provider(tmp_path, http_client)
+        results = await provider.fetch(SINCE, on_skip=on_skip)
+
+    assert results == []
+    assert len(skipped) == 4
+    reasons = [reason for reason, _ in skipped]
+    assert any("accountKey" in r for r in reasons)
+    assert any("date field" in r for r in reasons)
+    assert any("id field" in r for r in reasons)
+    assert any("required fields" in r for r in reasons)
+    # Every malformed row still known to belong to acct-1 carries that
+    # account_key through in its context, so the engine can attribute the
+    # skip to an account for the Audit Log's account filter/column.
+    acct1_contexts = [ctx for reason, ctx in skipped if reason != "malformed: unrecognized or missing accountKey"]
+    assert all(ctx.get("account_key") == "acct-1" for ctx in acct1_contexts)
+
+
+@respx.mock
+async def test_on_skip_not_called_for_pending_transactions(tmp_path: Path):
+    # PENDING is routine, expected per-cycle behavior, not a diagnostic
+    # "something went wrong" - must never be reported via on_skip (that
+    # would flood the audit log every cycle for every still-pending
+    # transaction).
+    mock_transactions(
+        [
+            {
+                "accountKey": "acct-1",
+                "nonUniqueId": "nu-pending",
+                "date": "2026-08-20",
+                "amount": -999,
+                "bookingStatus": "PENDING",
+            }
+        ]
+    )
+    skipped: list[tuple[str, dict]] = []
+
+    async def on_skip(reason: str, context: dict) -> None:
+        skipped.append((reason, context))
+
+    async with httpx.AsyncClient() as http_client:
+        provider = make_provider(tmp_path, http_client)
+        results = await provider.fetch(SINCE, on_skip=on_skip)
+
+    assert results == []
+    assert skipped == []
+
+
+@respx.mock
+async def test_fetch_without_on_skip_still_works(tmp_path: Path):
+    # Backward compatibility: on_skip defaults to None, so every caller from
+    # before this parameter existed keeps working unchanged.
+    mock_transactions(
+        [
+            {
+                "accountKey": "acct-1",
+                "nonUniqueId": "nu-good",
+                "date": "2026-08-20",
+                "amount": -10,
+                "bookingStatus": "BOOKED",
+            }
+        ]
+    )
+    async with httpx.AsyncClient() as http_client:
+        provider = make_provider(tmp_path, http_client)
+        results = await provider.fetch(SINCE)
+
+    assert len(results) == 1
+
+
+@respx.mock
 async def test_list_accounts_maps_fields(tmp_path: Path):
     respx.get(sb1_client.ACCOUNTS_URL).mock(
         return_value=httpx.Response(

@@ -68,6 +68,31 @@ CREATE TABLE IF NOT EXISTS payee_mappings (
     created_at TEXT NOT NULL,
     UNIQUE(ynab_budget_id, raw_payee_name)
 );
+
+CREATE TABLE IF NOT EXISTS audit_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    occurred_at TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    source TEXT NOT NULL,
+    account_key TEXT,
+    tracking_key TEXT,
+    import_id TEXT,
+    ynab_transaction_id TEXT,
+    ynab_budget_id TEXT,
+    ynab_account_id TEXT,
+    payee_name TEXT,
+    memo TEXT,
+    transaction_date TEXT,
+    amount_milliunits INTEGER,
+    detail TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_audit_events_type_time
+    ON audit_events (event_type, occurred_at DESC);
+CREATE INDEX IF NOT EXISTS idx_audit_events_time
+    ON audit_events (occurred_at DESC);
+CREATE INDEX IF NOT EXISTS idx_audit_events_account_key
+    ON audit_events (account_key);
 """
 
 # Columns added after the original schema - kept here so _migrate() can add
@@ -799,3 +824,151 @@ class StateDB:
                 (ynab_budget_id, raw_payee_name, ynab_payee_id, datetime.now(UTC).isoformat()),
             )
             self._conn.commit()
+
+    # -- audit_events -------------------------------------------------
+    #
+    # Append-only per-transaction event log (created/updated/duplicate/
+    # skipped) - purely observational, backs the GUI's Audit Log tab.
+    # Unlike tracked_transactions (a current-state table, upserted in
+    # place), a row here is never mutated once written. See engine.py's
+    # call sites for exactly which outcome writes which event_type - this
+    # layer only stores what it's given, it makes no classification
+    # decisions of its own.
+
+    AUDIT_EVENT_TYPES = ("created", "updated", "duplicate", "skipped")
+
+    # Whitelisted sort columns for list_audit_events - never interpolate a
+    # caller-supplied column name directly into SQL, even though today's
+    # only caller (webapp/routes/audit.py) already constrains sort_by via
+    # its own Literal type. Belt and suspenders against a future caller.
+    AUDIT_EVENT_SORT_COLUMNS = (
+        "occurred_at",
+        "event_type",
+        "source",
+        "account_key",
+        "payee_name",
+        "memo",
+        "amount_milliunits",
+        "detail",
+    )
+
+    async def insert_audit_event(
+        self,
+        *,
+        event_type: str,
+        source: str,
+        account_key: str | None = None,
+        tracking_key: str | None = None,
+        import_id: str | None = None,
+        ynab_transaction_id: str | None = None,
+        ynab_budget_id: str | None = None,
+        ynab_account_id: str | None = None,
+        payee_name: str | None = None,
+        memo: str | None = None,
+        transaction_date: str | None = None,
+        amount_milliunits: int | None = None,
+        detail: str | None = None,
+    ) -> None:
+        async with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO audit_events (
+                    occurred_at, event_type, source, account_key, tracking_key,
+                    import_id, ynab_transaction_id, ynab_budget_id, ynab_account_id,
+                    payee_name, memo, transaction_date, amount_milliunits, detail
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    datetime.now(UTC).isoformat(),
+                    event_type,
+                    source,
+                    account_key,
+                    tracking_key,
+                    import_id,
+                    ynab_transaction_id,
+                    ynab_budget_id,
+                    ynab_account_id,
+                    payee_name,
+                    memo,
+                    transaction_date,
+                    amount_milliunits,
+                    detail,
+                ),
+            )
+            self._conn.commit()
+
+    def list_audit_events(
+        self,
+        *,
+        event_type: str | None = None,
+        account_key: str | None = None,
+        include_skipped: bool = False,
+        sort_by: str = "occurred_at",
+        sort_dir: str = "desc",
+        limit: int = 50,
+        offset: int = 0,
+    ) -> tuple[list[dict[str, Any]], int]:
+        """Most-recent-first (by default) page of audit events plus the
+        total count matching the same filter (for pagination). An explicit
+        event_type always wins over include_skipped - e.g. ?event_type=skipped
+        works regardless of include_skipped's value, matching the most
+        intuitive reading of "I asked for exactly this category".
+        """
+        if sort_by not in self.AUDIT_EVENT_SORT_COLUMNS:
+            raise ValueError(f"unsortable audit_events column: {sort_by!r}")
+        if sort_dir not in ("asc", "desc"):
+            raise ValueError(f"invalid sort direction: {sort_dir!r}")
+
+        where_clauses: list[str] = []
+        params: list[Any] = []
+        if event_type is not None:
+            where_clauses.append("event_type = ?")
+            params.append(event_type)
+        elif not include_skipped:
+            where_clauses.append("event_type != 'skipped'")
+        if account_key is not None:
+            where_clauses.append("account_key = ?")
+            params.append(account_key)
+        where_sql = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
+
+        total = self._conn.execute(
+            f"SELECT COUNT(*) AS n FROM audit_events {where_sql}", params
+        ).fetchone()["n"]
+        # id as a tiebreaker keeps paging stable when many rows share the
+        # same sort value (e.g. every row sorted by event_type).
+        order_sql = f"{sort_by} {sort_dir.upper()}, id {sort_dir.upper()}"
+        rows = self._conn.execute(
+            f"SELECT * FROM audit_events {where_sql} ORDER BY {order_sql} LIMIT ? OFFSET ?",
+            (*params, limit, offset),
+        ).fetchall()
+        return [dict(row) for row in rows], total
+
+    def count_audit_events_by_type(self) -> dict[str, int]:
+        """Cheap per-category totals for the GUI's summary strip - zero-
+        filled for every known event_type so the frontend never has to
+        special-case a missing key.
+        """
+        rows = self._conn.execute(
+            "SELECT event_type, COUNT(*) AS n FROM audit_events GROUP BY event_type"
+        ).fetchall()
+        counts = dict.fromkeys(self.AUDIT_EVENT_TYPES, 0)
+        counts.update({row["event_type"]: row["n"] for row in rows})
+        return counts
+
+    async def prune_audit_events(self, cutoff_date: date) -> int:
+        """Delete audit_events rows from strictly before cutoff_date, same
+        retention_days knob prune_booked_transactions already uses - this
+        table has no PENDING-style "must survive to be matched later" rows
+        (every event here already represents something that finished
+        happening), so a plain date cutoff is safe with no carve-out.
+        Compares on date(occurred_at) rather than the raw datetime string
+        so today's rows are never pruned regardless of what time "now" is.
+        """
+        async with self._lock:
+            cursor = self._conn.execute(
+                "DELETE FROM audit_events WHERE date(occurred_at) < ?",
+                (cutoff_date.isoformat(),),
+            )
+            self._conn.commit()
+            return cursor.rowcount

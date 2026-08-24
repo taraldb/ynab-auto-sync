@@ -51,7 +51,7 @@ class FakeProvider(TransactionProvider):
             raise self._error
         return self._accounts
 
-    async def fetch(self, since_by_account):
+    async def fetch(self, since_by_account, on_skip=None):
         return []
 
 
@@ -193,6 +193,107 @@ async def test_readd_deleted_transaction_success(tmp_path: Path):
 
     assert response.status_code == 200
     assert response.json() == {"new_ynab_transaction_id": "ynab-new"}
+
+
+async def test_list_audit_events_empty(tmp_path: Path):
+    client, _db = make_client(tmp_path)
+
+    response = client.get("/api/audit-events")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body == {
+        "events": [],
+        "total": 0,
+        "counts": {"created": 0, "updated": 0, "duplicate": 0, "skipped": 0},
+    }
+
+
+async def test_list_audit_events_excludes_skipped_by_default(tmp_path: Path):
+    client, db = make_client(tmp_path)
+    await db.insert_audit_event(event_type="created", source="sparebank1")
+    await db.insert_audit_event(event_type="skipped", source="sparebank1")
+
+    response = client.get("/api/audit-events")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["total"] == 1
+    assert body["events"][0]["event_type"] == "created"
+    assert body["counts"] == {"created": 1, "updated": 0, "duplicate": 0, "skipped": 1}
+
+
+async def test_list_audit_events_include_skipped_true(tmp_path: Path):
+    client, db = make_client(tmp_path)
+    await db.insert_audit_event(event_type="created", source="sparebank1")
+    await db.insert_audit_event(event_type="skipped", source="sparebank1")
+
+    response = client.get("/api/audit-events?include_skipped=true")
+
+    assert response.json()["total"] == 2
+
+
+async def test_list_audit_events_filters_by_event_type(tmp_path: Path):
+    client, db = make_client(tmp_path)
+    await db.insert_audit_event(event_type="created", source="sparebank1")
+    await db.insert_audit_event(event_type="updated", source="sparebank1")
+
+    response = client.get("/api/audit-events?event_type=updated")
+
+    body = response.json()
+    assert body["total"] == 1
+    assert body["events"][0]["event_type"] == "updated"
+
+
+async def test_list_audit_events_pagination(tmp_path: Path):
+    client, db = make_client(tmp_path)
+    for i in range(3):
+        await db.insert_audit_event(event_type="created", source="sparebank1", detail=str(i))
+
+    response = client.get("/api/audit-events?limit=2&offset=0")
+
+    body = response.json()
+    assert body["total"] == 3
+    assert len(body["events"]) == 2
+
+
+async def test_list_audit_events_filters_by_account_key(tmp_path: Path):
+    client, db = make_client(tmp_path)
+    await db.insert_audit_event(event_type="created", source="sparebank1", account_key="acct-1")
+    await db.insert_audit_event(event_type="created", source="sparebank1", account_key="acct-2")
+
+    response = client.get("/api/audit-events?account_key=acct-1")
+
+    body = response.json()
+    assert body["total"] == 1
+    assert body["events"][0]["account_key"] == "acct-1"
+
+
+async def test_list_audit_events_sorts_by_requested_column(tmp_path: Path):
+    client, db = make_client(tmp_path)
+    await db.insert_audit_event(event_type="created", source="sparebank1", payee_name="Zebra")
+    await db.insert_audit_event(event_type="created", source="sparebank1", payee_name="Apple")
+
+    response = client.get("/api/audit-events?sort_by=payee_name&sort_dir=asc")
+
+    body = response.json()
+    assert [e["payee_name"] for e in body["events"]] == ["Apple", "Zebra"]
+
+
+def test_list_audit_events_rejects_invalid_sort_by(tmp_path: Path):
+    client, _db = make_client(tmp_path)
+
+    response = client.get("/api/audit-events?sort_by=not_a_real_column")
+
+    assert response.status_code == 422
+
+
+def test_list_audit_events_rejects_invalid_event_type(tmp_path: Path):
+    client, _db = make_client(tmp_path)
+
+    response = client.get("/api/audit-events?event_type=not-a-real-type")
+
+    assert response.status_code == 422
 
 
 def test_readd_deleted_transaction_unknown_key_returns_400(tmp_path: Path):

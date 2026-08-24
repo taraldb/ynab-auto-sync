@@ -124,6 +124,14 @@ class _PendingUpdate:
     # necessarily the mapping's current budget (a mapping can be re-pointed
     # after a transaction was already imported).
     ynab_budget_id: str
+    # Which provider produced the fresh read that triggered this transition
+    # (or FILE_SOURCE_TYPE) - only used to stamp the audit_events row, same
+    # as _PendingCreate.provider_type.
+    provider_type: str
+    # The provider's own account identifier this transaction lives under -
+    # only used to stamp the audit_events row's account_key column, same as
+    # _PendingCreate.provider_account_id.
+    account_key: str
 
 
 @dataclass
@@ -316,6 +324,8 @@ class SyncEngine:
                 # Update where the transaction actually lives, which may
                 # not be the mapping's current budget.
                 ynab_budget_id=tracked["ynab_budget_id"],
+                provider_type=provider_type,
+                account_key=ntx.provider_account_id,
             )
 
         return "unchanged", None
@@ -368,7 +378,31 @@ class SyncEngine:
                 "fetching",
                 {"provider": provider_type, "accounts": len(since_by_account)},
             )
-            normalized = await provider.fetch(since_by_account)
+
+            async def _on_skip(
+                reason: str, context: dict[str, Any], *, _provider_type: str = provider_type
+            ) -> None:
+                # Keeps all StateDB access inside engine.py - the provider
+                # only ever calls an opaque callback, never touches the DB
+                # itself (see providers/base.py's SkipCallback contract).
+                # context's raw row is deliberately not parsed further here
+                # - it's whatever a provider had on hand for a row it
+                # already couldn't make sense of, so guessing at field names
+                # (e.g. a payee) would risk surfacing wrong data as if it
+                # were reliable. The reason string is the whole point.
+                # account_key, when the provider included one, is the one
+                # exception - it's a structural identifier, not a guess at
+                # unreliable row content, and it's what the account filter
+                # in the Audit Log tab needs.
+                account_key = context.get("account_key") if isinstance(context, dict) else None
+                await self._db.insert_audit_event(
+                    event_type="skipped",
+                    source=_provider_type,
+                    account_key=account_key if isinstance(account_key, str) else None,
+                    detail=reason,
+                )
+
+            normalized = await provider.fetch(since_by_account, on_skip=_on_skip)
             fetched_count += len(normalized)
 
             for ntx in normalized:
@@ -381,6 +415,18 @@ class SyncEngine:
                         ntx.provider_account_id,
                         ntx.tracking_key,
                     )
+                    await self._db.insert_audit_event(
+                        event_type="skipped",
+                        source=provider_type,
+                        account_key=ntx.provider_account_id,
+                        tracking_key=ntx.tracking_key,
+                        import_id=ntx.import_id,
+                        payee_name=ntx.payee_name,
+                        memo=ntx.memo,
+                        transaction_date=ntx.date.isoformat(),
+                        amount_milliunits=ntx.amount_milliunits,
+                        detail=f"unmapped account: {provider_type}/{ntx.provider_account_id}",
+                    )
                     continue
 
                 # Defensive client-side cutoff. Providers deliberately
@@ -388,6 +434,18 @@ class SyncEngine:
                 # applying each account's OWN since is the engine's job -
                 # see providers/base.py's fetch() contract.
                 if ntx.date < since_by_account[ntx.provider_account_id].date():
+                    await self._db.insert_audit_event(
+                        event_type="skipped",
+                        source=provider_type,
+                        account_key=ntx.provider_account_id,
+                        tracking_key=ntx.tracking_key,
+                        import_id=ntx.import_id,
+                        payee_name=ntx.payee_name,
+                        memo=ntx.memo,
+                        transaction_date=ntx.date.isoformat(),
+                        amount_milliunits=ntx.amount_milliunits,
+                        detail="stale: transaction date before this account's fetch window",
+                    )
                     continue
 
                 outcome, pending = self._classify(
@@ -488,6 +546,16 @@ class SyncEngine:
             )
             for p in pending_updates:
                 await self._db.mark_booked(p.tracking_key, p.new_amount_milliunits)
+                await self._db.insert_audit_event(
+                    event_type="updated",
+                    source=p.provider_type,
+                    account_key=p.account_key,
+                    tracking_key=p.tracking_key,
+                    ynab_transaction_id=p.ynab_transaction_id,
+                    ynab_budget_id=p.ynab_budget_id,
+                    amount_milliunits=p.new_amount_milliunits,
+                    detail="pending → booked transition",
+                )
             total_updated += len(pending_updates)
 
         # Only reached once every create/update call above has succeeded -
@@ -551,6 +619,21 @@ class SyncEngine:
                 transaction_date=p.ynab_tx["date"],
                 ynab_account_id=p.ynab_tx["account_id"],
                 cleared=p.ynab_tx["cleared"],
+            )
+            await self._db.insert_audit_event(
+                event_type="created",
+                source=p.provider_type,
+                account_key=p.provider_account_id,
+                tracking_key=p.tracking_key,
+                import_id=p.ynab_tx["import_id"],
+                ynab_transaction_id=created["id"],
+                ynab_budget_id=budget_id,
+                ynab_account_id=p.ynab_tx["account_id"],
+                payee_name=p.ynab_tx.get("payee_name") or created.get("payee_name"),
+                memo=p.ynab_tx["memo"],
+                transaction_date=p.ynab_tx["date"],
+                amount_milliunits=p.ynab_tx["amount"],
+                detail="transfer primary leg" if p.transfer_secondary is not None else None,
             )
             tracked_count += 1
             # Only anchor a NEW payee_mappings entry when this create was
@@ -621,6 +704,21 @@ class SyncEngine:
             transaction_date=secondary.ynab_tx["date"],
             ynab_account_id=secondary.ynab_tx["account_id"],
             cleared=secondary_cleared,
+        )
+        await self._db.insert_audit_event(
+            event_type="created",
+            source=secondary.provider_type,
+            account_key=secondary.provider_account_id,
+            tracking_key=secondary.tracking_key,
+            import_id=synthetic_import_id,
+            ynab_transaction_id=transfer_transaction_id,
+            ynab_budget_id=budget_id,
+            ynab_account_id=secondary.ynab_tx["account_id"],
+            payee_name=created_primary.get("payee_name"),
+            memo=secondary.ynab_tx["memo"],
+            transaction_date=secondary.ynab_tx["date"],
+            amount_milliunits=secondary.ynab_tx["amount"],
+            detail="transfer secondary leg (auto-created by YNAB)",
         )
 
         # Confirmed live: YNAB defaults the auto-created leg to uncleared
@@ -776,6 +874,19 @@ class SyncEngine:
             if p is None:
                 continue
             if self._db.get_tracked(p.tracking_key) is not None:
+                await self._db.insert_audit_event(
+                    event_type="duplicate",
+                    source=p.provider_type,
+                    account_key=p.provider_account_id,
+                    tracking_key=p.tracking_key,
+                    import_id=import_id,
+                    ynab_budget_id=budget_id,
+                    payee_name=p.ynab_tx.get("payee_name"),
+                    memo=p.ynab_tx["memo"],
+                    transaction_date=p.ynab_tx["date"],
+                    amount_milliunits=p.ynab_tx["amount"],
+                    detail="already tracked (retry within same cycle)",
+                )
                 continue  # already tracked (e.g. a retry within the same cycle)
             existing = await ynab_client.find_transaction_by_import_id(
                 self._http_client,
@@ -798,6 +909,21 @@ class SyncEngine:
                     transaction_date=p.ynab_tx["date"],
                     ynab_account_id=p.ynab_tx["account_id"],
                     cleared=p.ynab_tx["cleared"],
+                )
+                await self._db.insert_audit_event(
+                    event_type="duplicate",
+                    source=p.provider_type,
+                    account_key=p.provider_account_id,
+                    tracking_key=p.tracking_key,
+                    import_id=import_id,
+                    ynab_transaction_id=existing["id"],
+                    ynab_budget_id=budget_id,
+                    ynab_account_id=p.ynab_tx["account_id"],
+                    payee_name=p.ynab_tx.get("payee_name"),
+                    memo=p.ynab_tx["memo"],
+                    transaction_date=p.ynab_tx["date"],
+                    amount_milliunits=existing.get("amount", p.ynab_tx["amount"]),
+                    detail="recovered via find_transaction_by_import_id (local state was reset)",
                 )
                 continue
 
@@ -825,6 +951,21 @@ class SyncEngine:
                     transaction_date=p.ynab_tx["date"],
                     ynab_account_id=p.ynab_tx["account_id"],
                     cleared=p.ynab_tx["cleared"],
+                )
+                await self._db.insert_audit_event(
+                    event_type="duplicate",
+                    source=p.provider_type,
+                    account_key=p.provider_account_id,
+                    tracking_key=p.tracking_key,
+                    import_id=import_id,
+                    ynab_transaction_id=deleted_tx["id"],
+                    ynab_budget_id=budget_id,
+                    ynab_account_id=p.ynab_tx["account_id"],
+                    payee_name=p.ynab_tx.get("payee_name"),
+                    memo=p.ynab_tx["memo"],
+                    transaction_date=p.ynab_tx["date"],
+                    amount_milliunits=p.ynab_tx["amount"],
+                    detail="resolved as previously deleted in YNAB",
                 )
                 resolved_deleted += 1
                 continue
@@ -928,6 +1069,7 @@ class SyncEngine:
         """
         row_results: list[FileImportRowResult] = []
         pending_creates: list[_PendingCreate] = []
+        duplicate_ntxs: list[NormalizedTransaction] = []
 
         for row in rows:
             dedup_key = file_dedup.compute_dedup_key(
@@ -957,6 +1099,8 @@ class SyncEngine:
             # never resubmitted.
             if outcome == "new":
                 pending_creates.append(pending)
+            else:
+                duplicate_ntxs.append(ntx)
             row_results.append(
                 FileImportRowResult(
                     row_index=row.row_index,
@@ -967,6 +1111,29 @@ class SyncEngine:
                     status="new" if outcome == "new" else "duplicate",
                 )
             )
+
+        # Only a real commit (not a dry-run preview) represents something
+        # that actually "happened" - _classify's "unchanged" outcome on the
+        # live-poll path is deliberately never audit-logged (it would flood
+        # every re-poll of an already-synced transaction), but a file-import
+        # duplicate is a one-off event tied to a specific upload, not a
+        # routine per-cycle occurrence, so it IS worth recording here.
+        if not dry_run:
+            for dup_ntx in duplicate_ntxs:
+                await self._db.insert_audit_event(
+                    event_type="duplicate",
+                    source=FILE_SOURCE_TYPE,
+                    account_key=account_key,
+                    tracking_key=dup_ntx.tracking_key,
+                    import_id=dup_ntx.import_id,
+                    ynab_budget_id=ynab_budget_id,
+                    ynab_account_id=ynab_account_id,
+                    payee_name=dup_ntx.payee_name,
+                    memo=dup_ntx.memo,
+                    transaction_date=dup_ntx.date.isoformat(),
+                    amount_milliunits=dup_ntx.amount_milliunits,
+                    detail="already tracked (re-imported file row)",
+                )
 
         if dry_run or not pending_creates:
             return FileImportResult(

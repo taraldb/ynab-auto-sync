@@ -295,12 +295,18 @@ class Scheduler:
     async def _prune_tracked_transactions(self) -> None:
         # Non-fatal by design - a pruning failure must never fail (or even
         # be attributed to) the sync cycle itself, which has already been
-        # recorded as success/failure above.
+        # recorded as success/failure above. Also prunes audit_events using
+        # the same retention_days cutoff - it's an unbounded-growth table
+        # like tracked_transactions, and this is a "how long do I care about
+        # history" knob, not something that needs its own config setting.
         try:
             cutoff = datetime.now(UTC).date() - timedelta(days=self._config.sync.retention_days)
             pruned = await self._db.prune_booked_transactions(cutoff)
             if pruned:
                 logger.info("Pruned %d stale BOOKED tracked_transactions row(s)", pruned)
+            pruned_audit = await self._db.prune_audit_events(cutoff)
+            if pruned_audit:
+                logger.info("Pruned %d stale audit_events row(s)", pruned_audit)
             await self._db.maybe_vacuum(min_interval_days=VACUUM_MIN_INTERVAL_DAYS)
         except Exception:
-            logger.exception("tracked_transactions pruning failed (non-fatal)")
+            logger.exception("tracked_transactions/audit_events pruning failed (non-fatal)")

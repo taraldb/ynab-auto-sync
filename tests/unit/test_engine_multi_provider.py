@@ -41,7 +41,7 @@ class FakeProvider(TransactionProvider):
     async def list_accounts(self) -> list[ProviderAccount]:
         return []
 
-    async def fetch(self, since_by_account):
+    async def fetch(self, since_by_account, on_skip=None):
         self.received_windows = since_by_account
         return list(self._transactions)
 
@@ -257,3 +257,65 @@ async def test_engine_applies_per_account_cutoff_provider_does_not(tmp_path: Pat
     assert result.created == 1
     assert db.get_tracked("a-1:old") is None
     assert db.get_tracked("a-1:new") is not None
+
+    events, _ = db.list_audit_events(include_skipped=True)
+    skipped = [e for e in events if e["event_type"] == "skipped"]
+    assert len(skipped) == 1
+    assert "stale" in skipped[0]["detail"]
+    assert skipped[0]["source"] == "bank_a"
+    assert skipped[0]["account_key"] == "a-1"
+
+
+@respx.mock
+async def test_run_cycle_records_audit_event_for_unmapped_account(tmp_path: Path):
+    """Defensive path: a provider returning a transaction for an account not
+    among the requested since_by_account keys - never true of the real
+    SpareBank1Provider today, but engine.py guards against it anyway (see
+    providers/base.py's fetch() contract)."""
+    config = make_config()
+    db = StateDB(tmp_path / "s.db")
+    await seed(db)
+
+    a = FakeProvider("bank_a", [ntx("a-1:tx1", "not-a-mapped-account", "AAA:1111", -1000)])
+
+    async with httpx.AsyncClient() as http_client:
+        engine = SyncEngine(config, http_client, db, {"bank_a": a, "bank_b": FakeProvider("bank_b", [])})
+        result, _ = await engine.run_cycle()
+
+    assert result.created == 0
+    events, _ = db.list_audit_events(include_skipped=True)
+    skipped = [e for e in events if e["event_type"] == "skipped"]
+    assert len(skipped) == 1
+    assert "unmapped account" in skipped[0]["detail"]
+    assert skipped[0]["source"] == "bank_a"
+    assert skipped[0]["account_key"] == "not-a-mapped-account"
+
+
+@respx.mock
+async def test_run_cycle_does_not_record_audit_event_for_unchanged_transaction(tmp_path: Path):
+    """The plain "already tracked, nothing changed" outcome must never
+    produce an audit row - it would flood the log every cycle for every
+    already-synced transaction still inside the overlap window."""
+    config = make_config()
+    db = StateDB(tmp_path / "s.db")
+    await seed(db)
+    await db.upsert_tracked(
+        "a-1:tx1",
+        import_id="AAA:1111",
+        ynab_transaction_id="ynab-1",
+        ynab_budget_id="budget-1",
+        account_key="a-1",
+        booking_status="BOOKED",
+        amount_milliunits=-1000,
+    )
+
+    a = FakeProvider("bank_a", [ntx("a-1:tx1", "a-1", "AAA:1111", -1000)])
+
+    async with httpx.AsyncClient() as http_client:
+        engine = SyncEngine(config, http_client, db, {"bank_a": a, "bank_b": FakeProvider("bank_b", [])})
+        result, _ = await engine.run_cycle()
+
+    assert result.created == 0
+    assert result.updated == 0
+    _events, total = db.list_audit_events(include_skipped=True)
+    assert total == 0

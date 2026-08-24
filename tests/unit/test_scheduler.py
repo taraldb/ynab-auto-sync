@@ -195,6 +195,37 @@ async def test_do_cycle_records_success_and_prunes_without_raising(tmp_path: Pat
     assert meta["updated_last_run"] == 1
 
 
+async def test_do_cycle_prunes_stale_audit_events(tmp_path: Path):
+    config = make_config()
+    db = StateDB(tmp_path / "state.db")
+    await db.insert_audit_event(event_type="created", source="sparebank1")
+    db._conn.execute("UPDATE audit_events SET occurred_at = '2020-01-01T00:00:00+00:00'")
+    db._conn.commit()
+    engine = FakeEngine()
+    scheduler = Scheduler(config, engine, db, asyncio.Event(), NullSink(), NullNotifier())
+
+    await scheduler._do_cycle()
+
+    assert db.list_audit_events(include_skipped=True)[1] == 0
+
+
+async def test_do_cycle_prune_failure_does_not_affect_recorded_success(tmp_path: Path, monkeypatch):
+    config = make_config()
+    db = StateDB(tmp_path / "state.db")
+    engine = FakeEngine()
+    scheduler = Scheduler(config, engine, db, asyncio.Event(), NullSink(), NullNotifier())
+
+    async def boom(*args, **kwargs):
+        raise RuntimeError("prune exploded")
+
+    monkeypatch.setattr(db, "prune_audit_events", boom)
+
+    await scheduler._do_cycle()  # must not raise
+
+    meta = db.read_run_metadata()
+    assert meta["last_error"] is None
+
+
 async def test_do_cycle_publishes_progress_and_idle_state_in_order(tmp_path: Path):
     # Regression test for scheduler.py's _report_progress wiring and the
     # new "idle" sync_state emit - a GUI websocket consumer needs this

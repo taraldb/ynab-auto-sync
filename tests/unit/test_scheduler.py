@@ -1,5 +1,7 @@
 import asyncio
 import contextlib
+import os
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -8,6 +10,7 @@ from ynab_auto_sync.alerts.base import CycleStats, EventNotifier
 from ynab_auto_sync.alerts.null_notifier import NullNotifier
 from ynab_auto_sync.config import (
     AccountMapping,
+    ApiResponseLoggingConfig,
     AppConfig,
     MqttConfig,
     SpareBank1Config,
@@ -249,6 +252,53 @@ async def test_do_cycle_publishes_progress_and_idle_state_in_order(tmp_path: Pat
         value[0] for kind, value in sink.published if kind == "progress"
     }
     assert progress_phases == {"fetching", "submitting"}
+
+
+async def test_do_cycle_prunes_stale_api_response_logs_when_enabled(tmp_path: Path):
+    config = make_config().model_copy(
+        update={"api_response_logging": ApiResponseLoggingConfig(enabled=True, retention_days=7)}
+    )
+    db = StateDB(tmp_path / "state.db")
+    engine = FakeEngine()
+    log_dir = tmp_path / "state_root"
+    api_logs_dir = log_dir / "api_logs"
+    api_logs_dir.mkdir(parents=True)
+    stale_file = api_logs_dir / "stale.json"
+    fresh_file = api_logs_dir / "fresh.json"
+    stale_file.write_text("{}")
+    fresh_file.write_text("{}")
+    stale_time = time.time() - 10 * 86400
+    os.utime(stale_file, (stale_time, stale_time))
+
+    scheduler = Scheduler(
+        config, engine, db, asyncio.Event(), NullSink(), NullNotifier(), log_dir=log_dir
+    )
+
+    await scheduler._do_cycle()
+
+    assert not stale_file.exists()
+    assert fresh_file.exists()
+
+
+async def test_do_cycle_does_not_touch_api_response_logs_when_disabled(tmp_path: Path):
+    config = make_config()  # api_response_logging.enabled defaults to False
+    db = StateDB(tmp_path / "state.db")
+    engine = FakeEngine()
+    log_dir = tmp_path / "state_root"
+    api_logs_dir = log_dir / "api_logs"
+    api_logs_dir.mkdir(parents=True)
+    stale_file = api_logs_dir / "stale.json"
+    stale_file.write_text("{}")
+    stale_time = time.time() - 10 * 86400
+    os.utime(stale_file, (stale_time, stale_time))
+
+    scheduler = Scheduler(
+        config, engine, db, asyncio.Event(), NullSink(), NullNotifier(), log_dir=log_dir
+    )
+
+    await scheduler._do_cycle()
+
+    assert stale_file.exists()  # untouched - feature is off
 
 
 async def test_fetch_failure_schedules_backoff_retry(tmp_path: Path):

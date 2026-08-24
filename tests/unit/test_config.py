@@ -50,6 +50,11 @@ def test_load_config_parses_valid_yaml(tmp_path: Path):
     assert config.gui.port == 8080
     assert config.mqtt.port == 1883
     assert config.mqtt.discovery_prefix == "homeassistant"
+    # api_response_logging is omitted from VALID_YAML entirely - confirms it
+    # defaults to off with a 7-day retention, matching logging's
+    # always-present-with-default style.
+    assert config.api_response_logging.enabled is False
+    assert config.api_response_logging.retention_days == 7
 
 
 def test_load_config_missing_file_raises(tmp_path: Path):

@@ -11,6 +11,7 @@ import uvicorn
 from pydantic import ValidationError
 
 from ynab_auto_sync.alerts import CompositeNotifier, EventNotifier, NtfySink, NullNotifier
+from ynab_auto_sync.api_response_logging import build_api_response_logger
 from ynab_auto_sync.config import AppConfig, load_config
 from ynab_auto_sync.logging_setup import configure_logging
 from ynab_auto_sync.notifications import (
@@ -132,7 +133,16 @@ async def main() -> None:
     for sig in (signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(sig, stop_event.set)
 
-    async with httpx.AsyncClient(timeout=30) as http_client:
+    api_response_logger = build_api_response_logger(config.api_response_logging, STATE_DIR)
+    if api_response_logger is not None:
+        logger.warning(
+            "API response logging is enabled - raw (redacted) provider/YNAB HTTP "
+            "responses will be written to %s",
+            STATE_DIR / "api_logs",
+        )
+    event_hooks = {"response": [api_response_logger.on_response]} if api_response_logger else {}
+
+    async with httpx.AsyncClient(timeout=30, event_hooks=event_hooks) as http_client:
         providers = _build_providers(config, http_client)
 
         # One-time migration of the old static config.yaml account list into
@@ -194,7 +204,7 @@ async def main() -> None:
         ws_manager = ConnectionManager() if config.gui.enabled else None
         sink = _build_sink(config, ws_manager)
         notifier = _build_notifier(config)
-        scheduler = Scheduler(config, engine, db, stop_event, sink, notifier)
+        scheduler = Scheduler(config, engine, db, stop_event, sink, notifier, log_dir=STATE_DIR)
         logger.info(
             "Starting ynab-auto-sync: %d account mapping(s), %d provider(s), "
             "cron schedule '%s'",

@@ -80,3 +80,14 @@ notifications:
 
 logging:
   level: "INFO"
+
+# Optional debugging aid - off by default. When enabled, every raw
+# provider/YNAB HTTP response is written to a gitignored file under
+# state/api_logs/ for troubleshooting. Authorization headers and known
+# secret fields (client_secret/refresh_token/access_token/password) are
+# always redacted before anything is written. Files older than
+# retention_days are deleted automatically as part of the regular sync
+# cycle's cleanup pass.
+api_response_logging:
+  enabled: false
+  retention_days: 7

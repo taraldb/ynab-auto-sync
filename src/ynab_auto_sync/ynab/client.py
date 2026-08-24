@@ -85,6 +85,37 @@ async def get_accounts(
     return [a for a in accounts if not a.get("closed") and not a.get("deleted")]
 
 
+@retry_get
+async def list_unimported_transactions(
+    http_client: httpx.AsyncClient,
+    personal_access_token: str,
+    budget_id: str,
+    account_id: str,
+) -> list[dict[str, Any]]:
+    """List an account's transactions that were never imported by any
+    source - no import_id, not deleted. These are the "a human typed this
+    into YNAB by hand" candidates the manual-transaction-matching feature
+    (engine.py's _classify()) checks a fresh bank transaction against
+    before creating a new one (see CLAUDE.md's "Manual-transaction
+    matching" section).
+
+    Reuses the same GET .../accounts/{account_id}/transactions endpoint
+    find_transaction_by_import_id already relies on (there is no
+    import_id-filtered query param - confirmed absent from the OpenAPI spec
+    - so this is a client-side filter, same as that function's own scan).
+    """
+    response = await http_client.get(
+        f"{BASE_URL}/{RESOURCE_PATH}/{budget_id}/accounts/{account_id}/transactions",
+        headers=_headers(personal_access_token),
+    )
+    response.raise_for_status()
+    return [
+        t
+        for t in response.json()["data"]["transactions"]
+        if t.get("import_id") is None and not t.get("deleted")
+    ]
+
+
 # How long a fetched budget's account list is trusted before
 # YnabAccountsCache.get_accounts() hits the API again - accounts are
 # added/renamed rarely, mirroring providers/sparebank1/provider.py's own
@@ -165,6 +196,36 @@ async def create_transactions(
         f"{BASE_URL}/{RESOURCE_PATH}/{budget_id}/transactions",
         headers=_headers(personal_access_token),
         json={"transactions": transactions},
+    )
+    response.raise_for_status()
+    return response.json()["data"]
+
+
+async def delete_transaction(
+    http_client: httpx.AsyncClient,
+    personal_access_token: str,
+    budget_id: str,
+    transaction_id: str,
+) -> dict[str, Any]:
+    """Delete a single transaction. Used only by the manual-transaction-
+    matching feature (engine.py's _classify()/"matched_manual" path) - see
+    CLAUDE.md's "Manual-transaction matching" section for why: PATCHing
+    import_id onto an existing transaction is a silent no-op (confirmed live
+    via scripts/verify_ynab_import_id_patch.py - YNAB accepts the PATCH,
+    returns 200, and the field stays None), so there is no way to grant a
+    pre-existing transaction real import_id-dedup protection in place. The
+    only way to get that protection is to delete it and create a fresh
+    transaction with the import_id set from the start - see
+    scripts/verify_ynab_delete_recreate.py for the live confirmation this
+    endpoint behaves as expected (200, returns the deleted transaction,
+    idempotent-looking on a second delete attempt was NOT assumed and is
+    checked there too).
+
+    Returns the raw `data` object: {"transaction": {...,"deleted": true}}.
+    """
+    response = await http_client.delete(
+        f"{BASE_URL}/{RESOURCE_PATH}/{budget_id}/transactions/{transaction_id}",
+        headers=_headers(personal_access_token),
     )
     response.raise_for_status()
     return response.json()["data"]

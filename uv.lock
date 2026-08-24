@@ -76,6 +76,18 @@ wheels = [
 ]
 
 [[package]]
+name = "convertdate"
+version = "2.4.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "pymeeus" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/3a/8d/540bf9cdbcd59352ecf7a1925197881465a6c24fd6171765dc11bbeed19e/convertdate-2.4.1.tar.gz", hash = "sha256:ace904a9d0230742732471748160b99d6ae881c2d0dc9a2463c7a37340c56c91", size = 52505, upload-time = "2026-02-08T00:37:53.812Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/fe/53/63d707d9de41aab3c51faa4f0e9234c36ee8c63f56c90c3ae23a01976e81/convertdate-2.4.1-py3-none-any.whl", hash = "sha256:0622acf8bc600956b937e8dd7cee36ba035669b62d2db224bf130af1fc84f754", size = 48440, upload-time = "2026-02-08T00:37:52.405Z" },
+]
+
+[[package]]
 name = "croniter"
 version = "6.2.4"
 source = { registry = "https://pypi.org/simple" }
@@ -201,6 +213,15 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/72/34/14ca021ce8e5dfedc35312d08ba8bf51fdd999c576889fc2c24cb97f4f10/iniconfig-2.3.0.tar.gz", hash = "sha256:c76315c77db068650d49c5b56314774a7804df16fee4402c1f19d6d15d8c4730", size = 20503, upload-time = "2025-10-18T21:55:43.219Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/cb/b1/3846dd7f199d53cb17f49cba7e651e9ce294d8497c8c150530ed11865bb8/iniconfig-2.3.0-py3-none-any.whl", hash = "sha256:f631c04d2c48c52b84d0d0549c99ff3859c98df65b3101406327ecc7d53fbf12", size = 7484, upload-time = "2025-10-18T21:55:41.639Z" },
+]
+
+[[package]]
+name = "lunardate"
+version = "0.3.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/4a/70/6d4d14313b5d9eab05e37c761164dd572d95386bd6238354b04b989e0eae/lunardate-0.3.0.tar.gz", hash = "sha256:ae1daa9140bb1078b2c8e2a5b1623e6f25cf0443eca9ef2d6df27a4644f25fef", size = 18571, upload-time = "2026-07-07T05:05:39.019Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/13/65/b0f833b26f932c865efd25790960bb83481098d66ed8b4ceac8a91859433/lunardate-0.3.0-py3-none-any.whl", hash = "sha256:68c1beaf7704c55c8a2c929d14be3ca98da55992d0ec3c0dd57eae2a5d4079fb", size = 18784, upload-time = "2026-07-07T05:05:38.029Z" },
 ]
 
 [[package]]
@@ -340,6 +361,21 @@ sdist = { url = "https://files.pythonhosted.org/packages/49/2e/ced460408999b33da
 wheels = [
     { url = "https://files.pythonhosted.org/packages/71/46/17f022dd3e953bf20a04a028a21ec746d942f8d2af30fa0f124fa0e6a684/pygments-2.21.0-py3-none-any.whl", hash = "sha256:2363c69b61c4a97c838da3b130dcd6468f4848992b21a82f2a63ec34377137d9", size = 1250147, upload-time = "2026-08-17T08:02:44.912Z" },
 ]
+
+[[package]]
+name = "pyluach"
+version = "2.3.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/11/11/42568c1568a75f8803c59f26d29af01a0890352b7a8e03d41ecda8bfb5dd/pyluach-2.3.0.tar.gz", hash = "sha256:ec6e30669d1df50c9ca160486da44a8195bb4c7a5d3d533990d0c5b03accd281", size = 26910, upload-time = "2025-09-09T20:24:39.651Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/8a/c8/f96208ade3ca4c23b372497d0788bcf0f2e0ff4310e5ee693366bc33fdf0/pyluach-2.3.0-py3-none-any.whl", hash = "sha256:4497b731aef59508b079dbf5f00bc5bf4329ac45090a6cd37b5a83756f0e69ab", size = 25914, upload-time = "2025-09-09T20:24:37.831Z" },
+]
+
+[[package]]
+name = "pymeeus"
+version = "0.5.12"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/81/76/599896b37e60f43078afd8354b3802eb7ca257a7e7f6253cc21c4c672877/PyMeeus-0.5.12.tar.gz", hash = "sha256:548f7186bd8b96cbc069cf649a8e8e377dce49ac74486709849fe63a99cad684", size = 5752712, upload-time = "2022-12-11T11:37:48.504Z" }
 
 [[package]]
 name = "pytest"
@@ -533,6 +569,15 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/a3/26/b09b8010994eccc3c09092e6b34058f36a460eea2d4c3e8b910c695975a0/typing_inspection-0.4.4.tar.gz", hash = "sha256:547274fa6b0a561ccf549cc9524b999a578e737d015d8709d021f9d0d13bea47", size = 76928, upload-time = "2026-08-12T12:37:25.997Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/67/81/4add07e5172b7ac40d8ed5ff580409a7801a4fe26d529bdd915401dabfbe/typing_inspection-0.4.4-py3-none-any.whl", hash = "sha256:65b8397ba37ccbce054456aaccddfc91e6e3083c92824df348d96ca832f3f147", size = 14750, upload-time = "2026-08-12T12:37:24.648Z" },
+]
+
+[[package]]
+name = "tzdata"
+version = "2026.3"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/92/ff/5a28bdfd8c3ebec42564ac7d0e54ca3db65044a9314a97f9564fa7a1e926/tzdata-2026.3.tar.gz", hash = "sha256:4a1518b8993086a7982523e071643f3c0e5f213e75b21318e78bcabfff9d1415", size = 198674, upload-time = "2026-07-10T08:50:37.887Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/e5/6d/b53b99a9f2766d095985947a5782f1702cabb129a34f7a802d7197af832f/tzdata-2026.3-py2.py3-none-any.whl", hash = "sha256:dc096730c87af6cab1b171c9d532be840741ff5d459015e7f6947bd7d7e54931", size = 348168, upload-time = "2026-07-10T08:50:36.46Z" },
 ]
 
 [[package]]
@@ -766,6 +811,22 @@ wheels = [
 ]
 
 [[package]]
+name = "workalendar"
+version = "17.0.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "convertdate" },
+    { name = "lunardate" },
+    { name = "pyluach" },
+    { name = "python-dateutil" },
+    { name = "tzdata", marker = "sys_platform == 'win32'" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/a7/16/e2d59c5a3b2d01519778dc1820daab70054022d88ff8291df602b2620481/workalendar-17.0.0.tar.gz", hash = "sha256:b82d6024aed452505b01baf06dbe8d6309a3135ff1d39dee07c31b21ece853b4", size = 153468, upload-time = "2023-01-01T22:33:06.471Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/4a/23/2fd9e240ae95be5653d57cc39d5377278eb376b4b3f30e27526d831b1668/workalendar-17.0.0-py3-none-any.whl", hash = "sha256:8fe1d6758f9a1af05d59cb81480afb912246ec7fa46e246b909897127cdbb1b0", size = 210652, upload-time = "2023-01-01T22:33:03.869Z" },
+]
+
+[[package]]
 name = "ynab-auto-sync"
 version = "0.1.1"
 source = { editable = "." }
@@ -780,6 +841,7 @@ dependencies = [
     { name = "pyyaml" },
     { name = "tenacity" },
     { name = "uvicorn", extra = ["standard"] },
+    { name = "workalendar" },
 ]
 
 [package.optional-dependencies]
@@ -806,5 +868,6 @@ requires-dist = [
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.5" },
     { name = "tenacity", specifier = ">=8.4" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.30" },
+    { name = "workalendar", specifier = ">=17.0" },
 ]
 provides-extras = ["dev"]

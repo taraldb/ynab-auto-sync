@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date
 
+from ynab_auto_sync.sync.date_window import MatchWindowUnit, days_between
+
 
 @dataclass(frozen=True)
 class TransferCandidate:
@@ -27,12 +29,17 @@ class TransferCandidate:
 
 
 def find_transfer_pairs(
-    candidates: list[TransferCandidate], match_window_days: int
+    candidates: list[TransferCandidate],
+    match_window_days: int,
+    unit: MatchWindowUnit = "calendar_days",
 ) -> list[tuple[int, int]]:
     """Match pairs of candidates that look like two legs of the same
     transfer: opposite sign, equal absolute amount, different accounts,
-    dates within match_window_days of each other, AND at least one leg's
-    remote_account_number names the other leg's real account_number.
+    dates within match_window_days of each other (counted in `unit` - see
+    sync/date_window.py; default "calendar_days" so every existing call
+    site is unaffected unless it opts into "working_days"), AND at least
+    one leg's remote_account_number names the other leg's real
+    account_number.
 
     That last condition was added after a real false positive: a 158.48 kr
     salary deposit got linked to an unrelated 158.48 kr grocery purchase 4
@@ -76,7 +83,7 @@ def find_transfer_pairs(
             and other.index != c.index
             and other.account_key != c.account_key
             and other.amount_milliunits == -c.amount_milliunits
-            and abs((other.date - c.date).days) <= match_window_days
+            and days_between(c.date, other.date, unit) <= match_window_days
             and (
                 (c.remote_account_number is not None
                  and c.remote_account_number == other.account_number)

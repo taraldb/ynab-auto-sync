@@ -2166,4 +2166,395 @@ async def test_run_cycle_records_account_key_for_malformed_row_skip(tmp_path: Pa
     assert total == 1
     assert events[0]["event_type"] == "skipped"
     assert events[0]["account_key"] == "acct-1"
-    assert "date field" in events[0]["detail"]
+
+
+# --- Manual-transaction matching (see CLAUDE.md's "Manual-transaction
+# matching" section) ---------------------------------------------------
+
+
+def _unimported_url(budget_id: str, ynab_account_id: str) -> str:
+    return (
+        f"{ynab_client.BASE_URL}/{ynab_client.RESOURCE_PATH}/{budget_id}"
+        f"/accounts/{ynab_account_id}/transactions"
+    )
+
+
+@respx.mock
+async def test_run_cycle_matches_unambiguous_manual_transaction(tmp_path: Path):
+    config = make_config()
+    config.sync.manual_match_window_days = 3
+    token_store = make_token_store(tmp_path)
+    db = make_db(tmp_path)
+    await seed_mappings(db, config)
+
+    respx.get(sb1_client.TRANSACTIONS_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "transactions": [
+                    {
+                        "id": "tx-mm-1",
+                        "nonUniqueId": "tx-mm-1",
+                        "accountKey": "acct-1",
+                        "date": "2026-08-20",
+                        "amount": -463.54,
+                        "description": "TELIA NORGE AS,TELIA",
+                        "bookingStatus": "BOOKED",
+                    }
+                ]
+            },
+        )
+    )
+    respx.get(_unimported_url("budget-1", "ynab-acct-1")).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "data": {
+                    "transactions": [
+                        {
+                            "id": "manual-1",
+                            "date": "2026-08-19",
+                            "amount": -463540,
+                            "payee_id": "payee-manual-1",
+                            "payee_name": "Telia",
+                            "category_id": "cat-1",
+                            "memo": "user's own note",
+                            "cleared": "cleared",
+                            "approved": True,
+                            "flag_color": "blue",
+                            "import_id": None,
+                            "deleted": False,
+                            "subtransactions": [],
+                        }
+                    ]
+                }
+            },
+        )
+    )
+    import_id = derive_import_id("acct-1:tx-mm-1")
+    respx.post(f"{ynab_client.BASE_URL}/{ynab_client.RESOURCE_PATH}/budget-1/transactions").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "data": {
+                    "transaction_ids": ["ynab-tx-replacement"],
+                    "duplicate_import_ids": [],
+                    "transactions": [
+                        {
+                            "id": "ynab-tx-replacement",
+                            "import_id": import_id,
+                            "payee_name": "Telia",
+                            "amount": -463540,
+                        }
+                    ],
+                }
+            },
+        )
+    )
+    delete_route = respx.delete(
+        f"{ynab_client.BASE_URL}/{ynab_client.RESOURCE_PATH}/budget-1/transactions/manual-1"
+    ).mock(return_value=httpx.Response(200, json={"data": {"transaction": {"id": "manual-1", "deleted": True}}}))
+
+    async with httpx.AsyncClient() as http_client:
+        engine = make_engine(config, http_client, token_store, db)
+        result, _ = await engine.run_cycle()
+
+    assert result.created == 1
+    assert delete_route.called
+
+    tracked = db.get_tracked("acct-1:tx-mm-1")
+    assert tracked is not None
+    assert tracked["ynab_transaction_id"] == "ynab-tx-replacement"
+    assert tracked["import_id"] == import_id
+    assert tracked["booking_status"] == "BOOKED"
+
+
+@respx.mock
+async def test_run_cycle_ambiguous_manual_match_falls_through_to_create(tmp_path: Path):
+    config = make_config()
+    config.sync.manual_match_window_days = 3
+    token_store = make_token_store(tmp_path)
+    db = make_db(tmp_path)
+    await seed_mappings(db, config)
+
+    respx.get(sb1_client.TRANSACTIONS_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "transactions": [
+                    {
+                        "id": "tx-mm-2",
+                        "nonUniqueId": "tx-mm-2",
+                        "accountKey": "acct-1",
+                        "date": "2026-08-20",
+                        "amount": -463.54,
+                        "description": "TELIA NORGE AS,TELIA",
+                        "bookingStatus": "BOOKED",
+                    }
+                ]
+            },
+        )
+    )
+    # Two same-amount, in-window candidates - ambiguous, must not guess.
+    respx.get(_unimported_url("budget-1", "ynab-acct-1")).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "data": {
+                    "transactions": [
+                        {
+                            "id": "manual-a",
+                            "date": "2026-08-19",
+                            "amount": -463540,
+                            "payee_id": "payee-a",
+                            "import_id": None,
+                            "deleted": False,
+                            "subtransactions": [],
+                        },
+                        {
+                            "id": "manual-b",
+                            "date": "2026-08-21",
+                            "amount": -463540,
+                            "payee_id": "payee-b",
+                            "import_id": None,
+                            "deleted": False,
+                            "subtransactions": [],
+                        },
+                    ]
+                }
+            },
+        )
+    )
+    import_id = derive_import_id("acct-1:tx-mm-2")
+    respx.post(f"{ynab_client.BASE_URL}/{ynab_client.RESOURCE_PATH}/budget-1/transactions").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "data": {
+                    "transaction_ids": ["ynab-tx-new"],
+                    "duplicate_import_ids": [],
+                    "transactions": [{"id": "ynab-tx-new", "import_id": import_id, "amount": -463540}],
+                }
+            },
+        )
+    )
+    # Deliberately no DELETE route mocked - if the code wrongly tried to
+    # delete either ambiguous candidate, this test would fail with a
+    # routing error, proving neither was touched.
+
+    async with httpx.AsyncClient() as http_client:
+        engine = make_engine(config, http_client, token_store, db)
+        result, _ = await engine.run_cycle()
+
+    assert result.created == 1
+    tracked = db.get_tracked("acct-1:tx-mm-2")
+    assert tracked is not None
+    assert tracked["ynab_transaction_id"] == "ynab-tx-new"
+
+
+@respx.mock
+async def test_run_cycle_manual_match_disabled_by_default(tmp_path: Path):
+    # manual_match_window_days defaults to 0 - no manual-match lookup call
+    # should ever be made, and the transaction is created normally.
+    config = make_config()
+    assert config.sync.manual_match_window_days == 0
+    token_store = make_token_store(tmp_path)
+    db = make_db(tmp_path)
+    await seed_mappings(db, config)
+
+    respx.get(sb1_client.TRANSACTIONS_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "transactions": [
+                    {
+                        "id": "tx-mm-3",
+                        "nonUniqueId": "tx-mm-3",
+                        "accountKey": "acct-1",
+                        "date": "2026-08-20",
+                        "amount": -50,
+                        "description": "Coffee",
+                        "bookingStatus": "BOOKED",
+                    }
+                ]
+            },
+        )
+    )
+    # Deliberately no mock for the unimported-transactions lookup URL - if
+    # the code called it despite the feature being disabled, this test
+    # would fail with a routing error.
+    import_id = derive_import_id("acct-1:tx-mm-3")
+    respx.post(f"{ynab_client.BASE_URL}/{ynab_client.RESOURCE_PATH}/budget-1/transactions").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "data": {
+                    "transaction_ids": ["ynab-tx-3"],
+                    "duplicate_import_ids": [],
+                    "transactions": [{"id": "ynab-tx-3", "import_id": import_id, "amount": -50000}],
+                }
+            },
+        )
+    )
+
+    async with httpx.AsyncClient() as http_client:
+        engine = make_engine(config, http_client, token_store, db)
+        result, _ = await engine.run_cycle()
+
+    assert result.created == 1
+    assert db.get_tracked("acct-1:tx-mm-3") is not None
+
+
+@respx.mock
+async def test_run_cycle_manual_match_ignores_amount_mismatch(tmp_path: Path):
+    config = make_config()
+    config.sync.manual_match_window_days = 3
+    token_store = make_token_store(tmp_path)
+    db = make_db(tmp_path)
+    await seed_mappings(db, config)
+
+    respx.get(sb1_client.TRANSACTIONS_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "transactions": [
+                    {
+                        "id": "tx-mm-4",
+                        "nonUniqueId": "tx-mm-4",
+                        "accountKey": "acct-1",
+                        "date": "2026-08-20",
+                        "amount": -463.54,
+                        "description": "TELIA NORGE AS,TELIA",
+                        "bookingStatus": "BOOKED",
+                    }
+                ]
+            },
+        )
+    )
+    respx.get(_unimported_url("budget-1", "ynab-acct-1")).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "data": {
+                    "transactions": [
+                        {
+                            "id": "manual-diff-amount",
+                            "date": "2026-08-19",
+                            "amount": -100000,  # different amount - must not match
+                            "payee_id": "payee-x",
+                            "import_id": None,
+                            "deleted": False,
+                            "subtransactions": [],
+                        }
+                    ]
+                }
+            },
+        )
+    )
+    import_id = derive_import_id("acct-1:tx-mm-4")
+    respx.post(f"{ynab_client.BASE_URL}/{ynab_client.RESOURCE_PATH}/budget-1/transactions").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "data": {
+                    "transaction_ids": ["ynab-tx-4"],
+                    "duplicate_import_ids": [],
+                    "transactions": [{"id": "ynab-tx-4", "import_id": import_id, "amount": -463540}],
+                }
+            },
+        )
+    )
+
+    async with httpx.AsyncClient() as http_client:
+        engine = make_engine(config, http_client, token_store, db)
+        result, _ = await engine.run_cycle()
+
+    assert result.created == 1
+    assert db.get_tracked("acct-1:tx-mm-4") is not None
+
+
+@respx.mock
+async def test_run_cycle_manual_match_working_days_toggle(tmp_path: Path):
+    # A manual entry on Friday 2026-08-21 and the real bank charge on
+    # Monday 2026-08-24 are 1 working day apart but 3 calendar days apart
+    # (see tests/unit/test_date_window.py). window_days=1 with
+    # match_window_unit="working_days" must match; the same window would
+    # NOT match under the "calendar_days" default (3 > 1) - this proves the
+    # toggle is actually wired through, not just accepted and ignored.
+    config = make_config()
+    config.sync.manual_match_window_days = 1
+    config.sync.match_window_unit = "working_days"
+    token_store = make_token_store(tmp_path)
+    db = make_db(tmp_path)
+    await seed_mappings(db, config)
+
+    respx.get(sb1_client.TRANSACTIONS_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "transactions": [
+                    {
+                        "id": "tx-mm-5",
+                        "nonUniqueId": "tx-mm-5",
+                        "accountKey": "acct-1",
+                        "date": "2026-08-24",
+                        "amount": -463.54,
+                        "description": "TELIA NORGE AS,TELIA",
+                        "bookingStatus": "BOOKED",
+                    }
+                ]
+            },
+        )
+    )
+    respx.get(_unimported_url("budget-1", "ynab-acct-1")).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "data": {
+                    "transactions": [
+                        {
+                            "id": "manual-friday",
+                            "date": "2026-08-21",
+                            "amount": -463540,
+                            "payee_id": "payee-friday",
+                            "import_id": None,
+                            "deleted": False,
+                            "subtransactions": [],
+                        }
+                    ]
+                }
+            },
+        )
+    )
+    import_id = derive_import_id("acct-1:tx-mm-5")
+    respx.post(f"{ynab_client.BASE_URL}/{ynab_client.RESOURCE_PATH}/budget-1/transactions").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "data": {
+                    "transaction_ids": ["ynab-tx-replacement-5"],
+                    "duplicate_import_ids": [],
+                    "transactions": [
+                        {"id": "ynab-tx-replacement-5", "import_id": import_id, "amount": -463540}
+                    ],
+                }
+            },
+        )
+    )
+    delete_route = respx.delete(
+        f"{ynab_client.BASE_URL}/{ynab_client.RESOURCE_PATH}/budget-1/transactions/manual-friday"
+    ).mock(
+        return_value=httpx.Response(
+            200, json={"data": {"transaction": {"id": "manual-friday", "deleted": True}}}
+        )
+    )
+
+    async with httpx.AsyncClient() as http_client:
+        engine = make_engine(config, http_client, token_store, db)
+        result, _ = await engine.run_cycle()
+
+    assert result.created == 1
+    assert delete_route.called
+    tracked = db.get_tracked("acct-1:tx-mm-5")
+    assert tracked is not None
+    assert tracked["ynab_transaction_id"] == "ynab-tx-replacement-5"

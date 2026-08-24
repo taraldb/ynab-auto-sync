@@ -14,6 +14,7 @@ dependencies = [
     "python-multipart>=0.0.9",
     "openpyxl>=3.1",
     "croniter>=2.0",
+    "workalendar>=17.0",
 ]
 
 [project.optional-dependencies]

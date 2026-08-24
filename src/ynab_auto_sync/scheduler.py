@@ -4,11 +4,13 @@ import asyncio
 import contextlib
 import logging
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any
 
 from croniter import croniter
 
 from ynab_auto_sync.alerts.base import CycleStats, EventNotifier
+from ynab_auto_sync.api_response_logging import prune_old_logs
 from ynab_auto_sync.config import AppConfig
 from ynab_auto_sync.notifications.base import NotificationSink
 from ynab_auto_sync.providers.base import ProviderAuthRequiredError
@@ -45,6 +47,7 @@ class Scheduler:
         stop_event: asyncio.Event,
         sink: NotificationSink,
         notifier: EventNotifier,
+        log_dir: Path = Path("state"),
     ):
         self._config = config
         self._engine = engine
@@ -52,6 +55,11 @@ class Scheduler:
         self._stop_event = stop_event
         self._sink = sink
         self._notifier = notifier
+        # Base dir for API response log files (see api_response_logging.py) -
+        # only ever read from when api_response_logging.enabled, in
+        # _prune_tracked_transactions() below. Defaulted so existing
+        # callers/tests that predate this feature don't need updating.
+        self._log_dir = log_dir
         self._sync_now_event = asyncio.Event()
 
         # Retry/backoff state for a failed cycle - see _do_cycle() and
@@ -302,5 +310,13 @@ class Scheduler:
             if pruned:
                 logger.info("Pruned %d stale BOOKED tracked_transactions row(s)", pruned)
             await self._db.maybe_vacuum(min_interval_days=VACUUM_MIN_INTERVAL_DAYS)
+
+            if self._config.api_response_logging.enabled:
+                log_cutoff = datetime.now(UTC) - timedelta(
+                    days=self._config.api_response_logging.retention_days
+                )
+                pruned_logs = prune_old_logs(self._log_dir / "api_logs", log_cutoff)
+                if pruned_logs:
+                    logger.info("Pruned %d stale API response log file(s)", pruned_logs)
         except Exception:
             logger.exception("tracked_transactions pruning failed (non-fatal)")

@@ -134,6 +134,21 @@ class LoggingConfig(BaseModel):
     level: str = "INFO"
 
 
+class ApiResponseLoggingConfig(BaseModel):
+    """Optional debug aid: write every raw provider/YNAB HTTP response to a
+    gitignored file under state/api_logs/ for troubleshooting. Off by
+    default - this is a debugging feature, not something a normal
+    deployment needs running. Authorization headers and known-secret body
+    fields (client_secret/refresh_token/access_token/password) are always
+    redacted before anything is written - see api_response_logging.py's
+    redact(). retention_days controls how long log files are kept before
+    the scheduler's regular pruning pass (see scheduler.py) deletes them,
+    same shape as sync.retention_days but for files instead of DB rows."""
+
+    enabled: bool = False
+    retention_days: int = Field(default=7, ge=1)
+
+
 class AppConfig(BaseModel):
     # Keyed by an arbitrary user-chosen name (the key is what
     # account_mappings.provider stores), so two entries of the same `type`
@@ -151,6 +166,7 @@ class AppConfig(BaseModel):
     mqtt: MqttConfig | None = None
     notifications: NotificationsConfig | None = None
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
+    api_response_logging: ApiResponseLoggingConfig = Field(default_factory=ApiResponseLoggingConfig)
 
     @model_validator(mode="after")
     def _validate_account_references(self) -> AppConfig:

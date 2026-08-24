@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import httpx
@@ -82,6 +83,53 @@ async def get_accounts(
     response.raise_for_status()
     accounts = response.json()["data"]["accounts"]
     return [a for a in accounts if not a.get("closed") and not a.get("deleted")]
+
+
+# How long a fetched budget's account list is trusted before
+# YnabAccountsCache.get_accounts() hits the API again - accounts are
+# added/renamed rarely, mirroring providers/sparebank1/provider.py's own
+# _ACCOUNTS_CACHE_TTL/list_accounts() cache for the exact same reason (the
+# Mappings tab's drop targets shouldn't re-hit a live endpoint on every tab
+# visit). force_refresh=True (wired from the GUI's existing "Refresh"
+# button, alongside the provider-side one it already bypasses) skips it.
+ACCOUNTS_CACHE_TTL = timedelta(minutes=5)
+
+
+class YnabAccountsCache:
+    """Per-budget TTL cache in front of get_accounts(), for
+    routes/providers.py's GET /api/ynab/accounts (the mapping UI's YNAB-side
+    drop targets). Instance-level, no lock: this project runs on one asyncio
+    event loop per process (see StateDB's own concurrency notes for the same
+    reasoning), so no two coroutines can interleave inside a single cache
+    read/write here. Meant to be constructed once per process and shared
+    (see webapp/app.py's create_app), the same lifetime as
+    SpareBank1Provider's own accounts cache.
+    """
+
+    def __init__(self) -> None:
+        self._cache: dict[str, list[dict[str, Any]]] = {}
+        self._cached_at: dict[str, datetime] = {}
+
+    async def get_accounts(
+        self,
+        http_client: httpx.AsyncClient,
+        personal_access_token: str,
+        budget_id: str,
+        force_refresh: bool = False,
+    ) -> list[dict[str, Any]]:
+        cached_at = self._cached_at.get(budget_id)
+        if (
+            not force_refresh
+            and budget_id in self._cache
+            and cached_at is not None
+            and datetime.now(UTC) - cached_at < ACCOUNTS_CACHE_TTL
+        ):
+            return list(self._cache[budget_id])
+
+        accounts = await get_accounts(http_client, personal_access_token, budget_id)
+        self._cache[budget_id] = accounts
+        self._cached_at[budget_id] = datetime.now(UTC)
+        return list(accounts)
 
 
 def find_transfer_payee_id(payees: list[dict[str, Any]], target_account_id: str) -> str | None:

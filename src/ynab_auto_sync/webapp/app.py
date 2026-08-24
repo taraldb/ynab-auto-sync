@@ -22,6 +22,7 @@ from ynab_auto_sync.webapp.routes import (
     sync_now,
     ws,
 )
+from ynab_auto_sync.ynab.client import YnabAccountsCache
 
 
 def create_app(
@@ -43,6 +44,10 @@ def create_app(
     app.state.providers = providers_map or {}
     app.state.scheduler = scheduler
     app.state.ws_manager = ws_manager
+    # Trivial to construct (no external resources), so unlike providers_map/
+    # scheduler/ws_manager above there's no need for this to be an optional
+    # kwarg - every app instance, test or real, gets its own cache.
+    app.state.ynab_accounts_cache = YnabAccountsCache()
 
     app.include_router(status.router)
     app.include_router(audit.router)

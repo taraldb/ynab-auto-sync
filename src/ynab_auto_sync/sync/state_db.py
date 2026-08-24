@@ -825,6 +825,41 @@ class StateDB:
             )
             self._conn.commit()
 
+    async def delete_payee_mappings_for_ids(
+        self, ynab_budget_id: str, ynab_payee_ids: set[str]
+    ) -> int:
+        """Heals invariant 12's known gap: a cached ynab_payee_id whose real
+        YNAB payee has since been deleted/merged away. The caller
+        (SyncEngine.reconcile_payee_mappings) passes only ids YNAB itself
+        reports `deleted: true` for - never ids merely absent from a fetch,
+        since YNAB confirmed keeps deleted/merged payees present in the
+        payee list with the flag set rather than removing them (see
+        scripts/verify_ynab_payee_deletion.py). Treating "absent from this
+        fetch" as evidence of deletion would be unsafe: a transient or
+        incomplete response could otherwise mass-invalidate a whole
+        budget's cache.
+
+        Deliberately does not attempt to guess what a deleted payee was
+        merged into (YNAB's payee list gives no such linkage) - the next
+        create for that raw payee text simply re-learns a fresh payee_id
+        through the normal _classify()/_record_created() path.
+
+        Returns the number of rows actually deleted; a no-op (no query run)
+        for an empty ynab_payee_ids, which is the overwhelmingly common
+        case every cycle.
+        """
+        if not ynab_payee_ids:
+            return 0
+        async with self._lock:
+            placeholders = ",".join("?" for _ in ynab_payee_ids)
+            cursor = self._conn.execute(
+                f"DELETE FROM payee_mappings WHERE ynab_budget_id = ? "
+                f"AND ynab_payee_id IN ({placeholders})",
+                (ynab_budget_id, *ynab_payee_ids),
+            )
+            self._conn.commit()
+            return cursor.rowcount
+
     # -- audit_events -------------------------------------------------
     #
     # Append-only per-transaction event log (created/updated/duplicate/

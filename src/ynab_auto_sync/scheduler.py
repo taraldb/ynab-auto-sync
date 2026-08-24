@@ -194,6 +194,7 @@ class Scheduler:
             # to stop showing in-cycle progress (see publish_progress).
             await self._sink.publish_sync_state("idle")
             await self._prune_tracked_transactions()
+            await self._reconcile_payee_mappings()
 
     async def _report_progress(self, phase: str, context: dict[str, Any]) -> None:
         await self._sink.publish_progress(phase, **context)
@@ -310,3 +311,19 @@ class Scheduler:
             await self._db.maybe_vacuum(min_interval_days=VACUUM_MIN_INTERVAL_DAYS)
         except Exception:
             logger.exception("tracked_transactions/audit_events pruning failed (non-fatal)")
+
+    async def _reconcile_payee_mappings(self) -> None:
+        # Separate try/except from _prune_tracked_transactions() above,
+        # deliberately not merged into it: this step makes a live YNAB HTTP
+        # call per budget (a genuinely different failure mode than
+        # pruning's pure local SQLite work), so a YNAB outage here must
+        # never suppress the always-safe local pruning/vacuum step, and
+        # vice versa.
+        try:
+            healed = await self._engine.reconcile_payee_mappings()
+            if healed:
+                logger.info(
+                    "Payee-mapping reconcile healed %d stale row(s) total this cycle", healed
+                )
+        except Exception:
+            logger.exception("payee_mappings reconcile failed (non-fatal)")

@@ -108,6 +108,7 @@ class FakeEngine:
         result: CycleResult | None = None,
         error: Exception | None = None,
         submit_error: Exception | None = None,
+        reconcile_payee_mappings_error: Exception | None = None,
     ):
         self._result = result or CycleResult(
             created=0, updated=0, duplicates=0, resolved_deleted=0, accounts_processed=0, fetched=0
@@ -116,8 +117,10 @@ class FakeEngine:
         # tests already use for "the cycle fails."
         self._fetch_error = error
         self._submit_error = submit_error
+        self._reconcile_payee_mappings_error = reconcile_payee_mappings_error
         self.fetch_call_count = 0
         self.submit_call_count = 0
+        self.reconcile_payee_mappings_call_count = 0
         self.progress_calls: list[tuple[str, dict]] = []
 
     async def fetch_and_classify(self, on_progress=None):
@@ -141,6 +144,12 @@ class FakeEngine:
     async def run_cycle(self):
         classified = await self.fetch_and_classify()
         return await self.submit(classified)
+
+    async def reconcile_payee_mappings(self) -> int:
+        self.reconcile_payee_mappings_call_count += 1
+        if self._reconcile_payee_mappings_error is not None:
+            raise self._reconcile_payee_mappings_error
+        return 0
 
     @property
     def call_count(self) -> int:
@@ -219,6 +228,31 @@ async def test_do_cycle_prune_failure_does_not_affect_recorded_success(tmp_path:
         raise RuntimeError("prune exploded")
 
     monkeypatch.setattr(db, "prune_audit_events", boom)
+
+    await scheduler._do_cycle()  # must not raise
+
+    meta = db.read_run_metadata()
+    assert meta["last_error"] is None
+
+
+async def test_do_cycle_calls_reconcile_payee_mappings(tmp_path: Path):
+    config = make_config()
+    db = StateDB(tmp_path / "state.db")
+    engine = FakeEngine()
+    scheduler = Scheduler(config, engine, db, asyncio.Event(), NullSink(), NullNotifier())
+
+    await scheduler._do_cycle()
+
+    assert engine.reconcile_payee_mappings_call_count == 1
+
+
+async def test_do_cycle_reconcile_payee_mappings_failure_does_not_affect_recorded_success(
+    tmp_path: Path,
+):
+    config = make_config()
+    db = StateDB(tmp_path / "state.db")
+    engine = FakeEngine(reconcile_payee_mappings_error=RuntimeError("payee reconcile exploded"))
+    scheduler = Scheduler(config, engine, db, asyncio.Event(), NullSink(), NullNotifier())
 
     await scheduler._do_cycle()  # must not raise
 

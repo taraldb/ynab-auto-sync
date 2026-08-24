@@ -9,8 +9,8 @@ from fastapi import APIRouter, Depends
 from ynab_auto_sync.config import AppConfig
 from ynab_auto_sync.providers.base import ProviderAuthRequiredError, TransactionProvider
 from ynab_auto_sync.sync.state_db import StateDB
-from ynab_auto_sync.webapp.deps import get_config, get_db, get_providers
-from ynab_auto_sync.ynab import client as ynab_client
+from ynab_auto_sync.webapp.deps import get_config, get_db, get_providers, get_ynab_accounts_cache
+from ynab_auto_sync.ynab.client import YnabAccountsCache
 
 logger = logging.getLogger(__name__)
 
@@ -83,15 +83,29 @@ async def list_providers(
 
 
 @router.get("/api/ynab/accounts")
-async def list_ynab_accounts(config: AppConfig = Depends(get_config)) -> list[dict[str, Any]]:
+async def list_ynab_accounts(
+    force_refresh: bool = False,
+    config: AppConfig = Depends(get_config),
+    cache: YnabAccountsCache = Depends(get_ynab_accounts_cache),
+) -> list[dict[str, Any]]:
     """Every configured YNAB budget's accounts - the drop targets the
     mapping UI offers when a provider account is dragged onto YNAB.
+
+    Served from a per-process TTL cache (YnabAccountsCache, mirroring
+    SpareBank1Provider's own accounts cache) so a Mappings-tab visit
+    doesn't re-hit YNAB's live /accounts endpoint every time - accounts are
+    added/renamed rarely. force_refresh (wired from the GUI's existing
+    "Refresh" button, same query param name/style as /api/providers) always
+    bypasses it.
     """
     result: list[dict[str, Any]] = []
     async with httpx.AsyncClient(timeout=30) as http_client:
         for alias, budget_id in config.ynab.budgets.items():
-            accounts = await ynab_client.get_accounts(
-                http_client, config.ynab.personal_access_token, budget_id
+            accounts = await cache.get_accounts(
+                http_client,
+                config.ynab.personal_access_token,
+                budget_id,
+                force_refresh=force_refresh,
             )
             result.append(
                 {

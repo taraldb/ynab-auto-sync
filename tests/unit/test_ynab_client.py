@@ -1,9 +1,11 @@
 import json
+from datetime import UTC, datetime, timedelta
 
 import httpx
 import respx
 
 from ynab_auto_sync.ynab import client as ynab_client
+from ynab_auto_sync.ynab.client import YnabAccountsCache
 
 
 @respx.mock
@@ -160,3 +162,67 @@ async def test_find_transaction_including_deleted_not_found_returns_none():
             http_client, "pat", "budget-1", "SB1:missing"
         )
     assert result is None
+
+
+@respx.mock
+async def test_ynab_accounts_cache_serves_second_call_from_cache():
+    route = respx.get(f"{ynab_client.BASE_URL}/{ynab_client.RESOURCE_PATH}/budget-1/accounts").mock(
+        return_value=httpx.Response(200, json={"data": {"accounts": []}})
+    )
+    cache = YnabAccountsCache()
+    async with httpx.AsyncClient() as http_client:
+        await cache.get_accounts(http_client, "pat", "budget-1")
+        await cache.get_accounts(http_client, "pat", "budget-1")
+    assert route.call_count == 1
+
+
+@respx.mock
+async def test_ynab_accounts_cache_force_refresh_bypasses_cache():
+    route = respx.get(f"{ynab_client.BASE_URL}/{ynab_client.RESOURCE_PATH}/budget-1/accounts").mock(
+        return_value=httpx.Response(200, json={"data": {"accounts": []}})
+    )
+    cache = YnabAccountsCache()
+    async with httpx.AsyncClient() as http_client:
+        await cache.get_accounts(http_client, "pat", "budget-1")
+        await cache.get_accounts(http_client, "pat", "budget-1", force_refresh=True)
+    assert route.call_count == 2
+
+
+@respx.mock
+async def test_ynab_accounts_cache_expires_after_ttl(monkeypatch):
+    route = respx.get(f"{ynab_client.BASE_URL}/{ynab_client.RESOURCE_PATH}/budget-1/accounts").mock(
+        return_value=httpx.Response(200, json={"data": {"accounts": []}})
+    )
+    cache = YnabAccountsCache()
+
+    class FixedDatetime(datetime):
+        current = datetime(2026, 8, 24, 12, 0, 0, tzinfo=UTC)
+
+        @classmethod
+        def now(cls, tz=None):
+            return cls.current
+
+    monkeypatch.setattr("ynab_auto_sync.ynab.client.datetime", FixedDatetime)
+
+    async with httpx.AsyncClient() as http_client:
+        await cache.get_accounts(http_client, "pat", "budget-1")
+        FixedDatetime.current += timedelta(minutes=6)  # past the 5-minute TTL
+        await cache.get_accounts(http_client, "pat", "budget-1")
+
+    assert route.call_count == 2
+
+
+@respx.mock
+async def test_ynab_accounts_cache_is_scoped_per_budget():
+    route_1 = respx.get(f"{ynab_client.BASE_URL}/{ynab_client.RESOURCE_PATH}/budget-1/accounts").mock(
+        return_value=httpx.Response(200, json={"data": {"accounts": []}})
+    )
+    route_2 = respx.get(f"{ynab_client.BASE_URL}/{ynab_client.RESOURCE_PATH}/budget-2/accounts").mock(
+        return_value=httpx.Response(200, json={"data": {"accounts": []}})
+    )
+    cache = YnabAccountsCache()
+    async with httpx.AsyncClient() as http_client:
+        await cache.get_accounts(http_client, "pat", "budget-1")
+        await cache.get_accounts(http_client, "pat", "budget-2")
+    assert route_1.call_count == 1
+    assert route_2.call_count == 1

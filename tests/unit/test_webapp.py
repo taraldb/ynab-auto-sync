@@ -801,6 +801,32 @@ def test_list_ynab_accounts_returns_accounts_per_budget(tmp_path: Path):
     assert [a["id"] for a in entry["accounts"]] == ["ynab-acct-1"]
 
 
+@respx.mock
+def test_list_ynab_accounts_caches_between_requests(tmp_path: Path):
+    client, _db = make_client(tmp_path)
+    route = respx.get(f"{ynab_client.BASE_URL}/{ynab_client.RESOURCE_PATH}/budget-1/accounts").mock(
+        return_value=httpx.Response(200, json={"data": {"accounts": []}})
+    )
+
+    client.get("/api/ynab/accounts")
+    client.get("/api/ynab/accounts")
+
+    assert route.call_count == 1
+
+
+@respx.mock
+def test_list_ynab_accounts_force_refresh_bypasses_cache(tmp_path: Path):
+    client, _db = make_client(tmp_path)
+    route = respx.get(f"{ynab_client.BASE_URL}/{ynab_client.RESOURCE_PATH}/budget-1/accounts").mock(
+        return_value=httpx.Response(200, json={"data": {"accounts": []}})
+    )
+
+    client.get("/api/ynab/accounts")
+    client.get("/api/ynab/accounts?force_refresh=true")
+
+    assert route.call_count == 2
+
+
 # -- /api/sync-now ---------------------------------------------------------
 
 

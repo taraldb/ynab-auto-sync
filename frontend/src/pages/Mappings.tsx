@@ -50,10 +50,10 @@ export default function Mappings() {
     void loadAll();
   }, []);
 
-  async function loadAll(forceRefreshProviders?: boolean) {
+  async function loadAll(forceRefresh?: boolean) {
     await Promise.all([
-      loadProviders(forceRefreshProviders),
-      loadBudgets(),
+      loadProviders(forceRefresh),
+      loadBudgets(forceRefresh),
       loadMappings(),
     ]);
   }
@@ -70,9 +70,9 @@ export default function Mappings() {
     }
   }
 
-  async function loadBudgets() {
+  async function loadBudgets(forceRefresh?: boolean) {
     try {
-      const data = await listYnabAccounts();
+      const data = await listYnabAccounts(forceRefresh);
       setBudgets(data);
       setBudgetsError(null);
     } catch (e) {

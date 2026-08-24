@@ -837,6 +837,51 @@ class SyncEngine:
                     p for idx, p in enumerate(pending_creates) if idx not in indices_to_remove
                 ]
 
+    async def reconcile_payee_mappings(self) -> int:
+        """Maintenance pass closing invariant 12's known gap: a cached
+        payee_mappings row's ynab_payee_id can go stale if the user later
+        deletes or merges that payee in YNAB. Re-fetches every configured
+        budget's payee list and deletes any payee_mappings row anchored to
+        an id YNAB now reports `deleted: true` (see
+        StateDB.delete_payee_mappings_for_ids for why only explicit
+        `deleted: true` counts, never mere absence from the fetch).
+
+        Called non-fatally once per cycle from scheduler.py - a fetch
+        failure for one budget is isolated (logged, that budget skipped)
+        so it can never prevent reconciling any other configured budget,
+        mirroring routes/providers.py's "one broken provider can't break
+        the rest" stance, applied here to budgets instead of providers.
+
+        Returns the total number of payee_mappings rows healed across all
+        budgets, for the caller to log.
+        """
+        total_healed = 0
+        for budget_id in self._config.ynab.budgets.values():
+            try:
+                payees = await ynab_client.get_payees(
+                    self._http_client, self._config.ynab.personal_access_token, budget_id
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to fetch payees for budget %s during payee-mapping "
+                    "reconcile (non-fatal, skipping this budget this cycle)",
+                    budget_id,
+                )
+                continue
+            deleted_ids = {p["id"] for p in payees if p.get("deleted")}
+            if not deleted_ids:
+                continue
+            healed = await self._db.delete_payee_mappings_for_ids(budget_id, deleted_ids)
+            if healed:
+                logger.info(
+                    "Healed %d stale payee_mappings row(s) for budget %s "
+                    "(payee deleted/merged in YNAB since last cached)",
+                    healed,
+                    budget_id,
+                )
+            total_healed += healed
+        return total_healed
+
     async def _backfill_duplicates(
         self,
         budget_id: str,

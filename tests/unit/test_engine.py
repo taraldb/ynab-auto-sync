@@ -1323,6 +1323,128 @@ async def test_run_cycle_falls_back_to_normal_import_when_no_transfer_payee_foun
     )
 
 
+def _payees_route(budget_id: str, payees: list[dict]):
+    return respx.get(f"{ynab_client.BASE_URL}/{ynab_client.RESOURCE_PATH}/{budget_id}/payees").mock(
+        return_value=httpx.Response(200, json={"data": {"payees": payees}})
+    )
+
+
+@respx.mock
+async def test_reconcile_payee_mappings_deletes_stale_rows_marked_deleted(tmp_path: Path):
+    config = make_config()
+    token_store = make_token_store(tmp_path)
+    db = make_db(tmp_path)
+    await db.upsert_payee_mapping("budget-1", "MERCHANT A", "payee-a")
+    _payees_route("budget-1", [{"id": "payee-a", "deleted": True}])
+    _payees_route("budget-2", [])
+
+    async with httpx.AsyncClient() as http_client:
+        engine = make_engine(config, http_client, token_store, db)
+        healed = await engine.reconcile_payee_mappings()
+
+    assert healed == 1
+    assert db.get_payee_id("budget-1", "MERCHANT A") is None
+
+
+@respx.mock
+async def test_reconcile_payee_mappings_does_not_delete_when_id_merely_absent(tmp_path: Path):
+    # The single most important test here: an id simply missing from the
+    # fetch (a transient/incomplete response, or just a payee that still
+    # exists but wasn't returned for some other reason) must NEVER be
+    # treated as evidence of deletion - only an explicit deleted: true does.
+    config = make_config()
+    token_store = make_token_store(tmp_path)
+    db = make_db(tmp_path)
+    await db.upsert_payee_mapping("budget-1", "MERCHANT A", "payee-a")
+    _payees_route("budget-1", [{"id": "payee-other", "deleted": False}])
+    _payees_route("budget-2", [])
+
+    async with httpx.AsyncClient() as http_client:
+        engine = make_engine(config, http_client, token_store, db)
+        healed = await engine.reconcile_payee_mappings()
+
+    assert healed == 0
+    assert db.get_payee_id("budget-1", "MERCHANT A") == "payee-a"
+
+
+@respx.mock
+async def test_reconcile_payee_mappings_leaves_non_deleted_rows_alone(tmp_path: Path):
+    config = make_config()
+    token_store = make_token_store(tmp_path)
+    db = make_db(tmp_path)
+    await db.upsert_payee_mapping("budget-1", "MERCHANT A", "payee-a")
+    await db.upsert_payee_mapping("budget-1", "MERCHANT B", "payee-b")
+    _payees_route(
+        "budget-1",
+        [{"id": "payee-a", "deleted": False}, {"id": "payee-b", "deleted": True}],
+    )
+    _payees_route("budget-2", [])
+
+    async with httpx.AsyncClient() as http_client:
+        engine = make_engine(config, http_client, token_store, db)
+        healed = await engine.reconcile_payee_mappings()
+
+    assert healed == 1
+    assert db.get_payee_id("budget-1", "MERCHANT A") == "payee-a"
+    assert db.get_payee_id("budget-1", "MERCHANT B") is None
+
+
+@respx.mock
+async def test_reconcile_payee_mappings_is_per_budget_scoped(tmp_path: Path):
+    config = make_config()  # budgets: personal->budget-1, shared->budget-2
+    token_store = make_token_store(tmp_path)
+    db = make_db(tmp_path)
+    await db.upsert_payee_mapping("budget-1", "MERCHANT A", "payee-a")
+    await db.upsert_payee_mapping("budget-2", "MERCHANT A", "payee-a")
+    _payees_route("budget-1", [{"id": "payee-a", "deleted": True}])
+    budget_2_route = _payees_route("budget-2", [{"id": "payee-a", "deleted": False}])
+
+    async with httpx.AsyncClient() as http_client:
+        engine = make_engine(config, http_client, token_store, db)
+        healed = await engine.reconcile_payee_mappings()
+
+    assert healed == 1
+    assert db.get_payee_id("budget-1", "MERCHANT A") is None
+    assert db.get_payee_id("budget-2", "MERCHANT A") == "payee-a"
+    assert budget_2_route.called
+
+
+@respx.mock
+async def test_reconcile_payee_mappings_skips_budget_on_fetch_failure(tmp_path: Path):
+    config = make_config()
+    token_store = make_token_store(tmp_path)
+    db = make_db(tmp_path)
+    await db.upsert_payee_mapping("budget-1", "MERCHANT A", "payee-a")
+    await db.upsert_payee_mapping("budget-2", "MERCHANT A", "payee-a")
+    respx.get(f"{ynab_client.BASE_URL}/{ynab_client.RESOURCE_PATH}/budget-1/payees").mock(
+        return_value=httpx.Response(500)
+    )
+    _payees_route("budget-2", [{"id": "payee-a", "deleted": True}])
+
+    async with httpx.AsyncClient() as http_client:
+        engine = make_engine(config, http_client, token_store, db)
+        healed = await engine.reconcile_payee_mappings()  # must not raise
+
+    assert healed == 1
+    assert db.get_payee_id("budget-1", "MERCHANT A") == "payee-a"  # untouched - budget-1 fetch failed
+    assert db.get_payee_id("budget-2", "MERCHANT A") is None
+
+
+@respx.mock
+async def test_reconcile_payee_mappings_is_noop_when_nothing_stale(tmp_path: Path):
+    config = make_config()
+    token_store = make_token_store(tmp_path)
+    db = make_db(tmp_path)
+    _payees_route("budget-1", [])
+    _payees_route("budget-2", [])
+
+    async with httpx.AsyncClient() as http_client:
+        engine = make_engine(config, http_client, token_store, db)
+        healed = await engine.reconcile_payee_mappings()
+
+    assert healed == 0
+
+
 @respx.mock
 async def test_run_cycle_does_not_link_coincidental_same_amount_pair(tmp_path: Path):
     """Regression test for a real false positive: a 158.48 kr salary

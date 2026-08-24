@@ -877,6 +877,40 @@ async def test_upsert_payee_mapping_first_write_wins(tmp_path: Path):
     assert db.get_payee_id("budget-1", "SOME MERCHANT") == "payee-abc"
 
 
+async def test_delete_payee_mappings_for_ids_removes_matching_rows(tmp_path: Path):
+    db = StateDB(tmp_path / "state.db")
+    await db.upsert_payee_mapping("budget-1", "MERCHANT A", "payee-a")
+    await db.upsert_payee_mapping("budget-1", "MERCHANT B", "payee-b")
+
+    deleted = await db.delete_payee_mappings_for_ids("budget-1", {"payee-a"})
+
+    assert deleted == 1
+    assert db.get_payee_id("budget-1", "MERCHANT A") is None
+    assert db.get_payee_id("budget-1", "MERCHANT B") == "payee-b"
+
+
+async def test_delete_payee_mappings_for_ids_is_noop_when_ids_empty(tmp_path: Path):
+    db = StateDB(tmp_path / "state.db")
+    await db.upsert_payee_mapping("budget-1", "MERCHANT A", "payee-a")
+
+    deleted = await db.delete_payee_mappings_for_ids("budget-1", set())
+
+    assert deleted == 0
+    assert db.get_payee_id("budget-1", "MERCHANT A") == "payee-a"
+
+
+async def test_delete_payee_mappings_for_ids_is_scoped_per_budget(tmp_path: Path):
+    db = StateDB(tmp_path / "state.db")
+    await db.upsert_payee_mapping("budget-1", "MERCHANT A", "payee-a")
+    await db.upsert_payee_mapping("budget-2", "MERCHANT A", "payee-a")
+
+    deleted = await db.delete_payee_mappings_for_ids("budget-1", {"payee-a"})
+
+    assert deleted == 1
+    assert db.get_payee_id("budget-1", "MERCHANT A") is None
+    assert db.get_payee_id("budget-2", "MERCHANT A") == "payee-a"
+
+
 # -- audit_events -----------------------------------------------------
 
 

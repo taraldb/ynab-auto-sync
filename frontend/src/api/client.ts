@@ -278,8 +278,13 @@ export async function listProviders(
   return handleJson<ProviderInfo[]>(res);
 }
 
-export async function listYnabAccounts(): Promise<YnabBudget[]> {
-  const res = await fetch("/api/ynab/accounts");
+export async function listYnabAccounts(
+  forceRefresh?: boolean,
+): Promise<YnabBudget[]> {
+  const url = forceRefresh
+    ? "/api/ynab/accounts?force_refresh=true"
+    : "/api/ynab/accounts";
+  const res = await fetch(url);
   return handleJson<YnabBudget[]>(res);
 }
 

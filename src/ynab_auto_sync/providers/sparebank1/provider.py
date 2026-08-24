@@ -198,6 +198,8 @@ class SpareBank1Provider(TransactionProvider):
                         payee_name=_extract_payee_name(sb1_tx),
                         memo=_extract_memo(sb1_tx),
                         booking_status=booking_status,
+                        account_number=transform.get_account_number(sb1_tx),
+                        remote_account_number=transform.get_remote_account_number(sb1_tx),
                     )
                 )
 

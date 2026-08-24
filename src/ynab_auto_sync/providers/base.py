@@ -87,6 +87,21 @@ class NormalizedTransaction:
     memo: str | None
     booking_status: BookingStatus
 
+    # Real account-number cross-reference, used only for transfer-pair
+    # matching (see sync/transfers.py) - not a category guess but a direct
+    # identity check ("does one leg literally name the other account?"),
+    # confirmed more reliable against real data than a provider-specific
+    # transaction-type code (a credit card bill payment's two legs don't
+    # share any type code that reads as "transfer", but they DO name each
+    # other's real account number, at least in one direction - see
+    # transform.get_account_number/get_remote_account_number's docstrings
+    # for the live-confirmed details). Both default to None so any
+    # provider/test that doesn't populate them just never participates in
+    # transfer-matching - a safe default, not a regression, since SpareBank1
+    # is the only provider that sets these today.
+    account_number: str | None = None
+    remote_account_number: str | None = None
+
 
 class ProviderAuthRequiredError(Exception):
     """Raised only when a provider's fetch/list_accounts call fails because

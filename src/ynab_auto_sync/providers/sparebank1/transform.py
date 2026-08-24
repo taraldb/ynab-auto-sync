@@ -120,6 +120,51 @@ def get_booking_status(sb1_tx: dict[str, Any]) -> str:
     return sb1_tx.get("bookingStatus") or BOOKING_STATUS_BOOKED
 
 
+# Sentinel SpareBank1 uses for "no remote account number applies" - confirmed
+# live on every card-purchase transaction inspected (a merchant purchase has
+# no bank account on the other side). Treated as absent, never as a literal
+# value to compare - see get_remote_account_number below.
+REMOTE_ACCOUNT_NUMBER_NONE = "-1"
+
+
+def get_account_number(sb1_tx: dict[str, Any]) -> str | None:
+    """The owning account's own real account number, e.g. "32096894308" -
+    confirmed live to be present, in the same nested {"value": ...,
+    "formatted": ..., "unformatted": ...} shape, on both regular bank
+    accounts and credit card accounts (the credit card's own accountNumber
+    is its masked card number, e.g. "K1861615456" - still present, just a
+    different format). Used only for transfer-pair cross-referencing (see
+    sync/transfers.py) - never MissingFieldError, since a transaction with
+    no recognizable account number just can't participate in that matching
+    and should import as an ordinary transaction, not be skipped entirely.
+    """
+    account_number = sb1_tx.get("accountNumber")
+    if not isinstance(account_number, dict):
+        return None
+    value = account_number.get("value")
+    return str(value) if value is not None else None
+
+
+def get_remote_account_number(sb1_tx: dict[str, Any]) -> str | None:
+    """The counterparty account number a transaction names, if any -
+    confirmed live: populated with the real account number for a genuine
+    bank-to-bank transfer between the user's own accounts, "-1" for a card
+    purchase (no bank account applies), and - for a credit card BILL
+    PAYMENT specifically - the card issuer's own internal clearing account
+    number rather than the card's own account number (confirmed live: a
+    real credit card payment's checking-account leg named
+    "Sparebank 1 Kreditt AS"'s clearing account, not the card itself, while
+    the matching leg on the card's own transaction feed correctly named the
+    checking account back). This asymmetry is exactly why
+    sync/transfers.py's cross-reference check only requires ONE direction
+    to match, not both.
+    """
+    value = sb1_tx.get("remoteAccountNumber")
+    if value is None or str(value) == REMOTE_ACCOUNT_NUMBER_NONE:
+        return None
+    return str(value)
+
+
 def derive_import_id(sb1_transaction_id: str) -> str:
     """SpareBank1's import_id namespace. Delegates the hashing to
     sync.import_ids so every source shares one implementation, but the

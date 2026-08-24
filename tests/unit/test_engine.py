@@ -1015,6 +1015,10 @@ def make_transfer_config():
 
 
 def mock_sb1_transfer_fetch(out_date="2026-08-20", in_date="2026-08-20"):
+    # accountNumber/remoteAccountNumber mirror the real 39722.10 kr transfer
+    # pair used to design this cross-reference check (both directions
+    # correctly name each other's real account number) - see
+    # sync/transfers.py's find_transfer_pairs docstring.
     respx.get(sb1_client.TRANSACTIONS_URL).mock(
         return_value=httpx.Response(
             200,
@@ -1027,6 +1031,8 @@ def mock_sb1_transfer_fetch(out_date="2026-08-20", in_date="2026-08-20"):
                         "date": out_date,
                         "amount": -50,
                         "bookingStatus": "BOOKED",
+                        "accountNumber": {"value": "11110000001"},
+                        "remoteAccountNumber": "22220000002",
                     },
                     {
                         "id": "tx-in-1",
@@ -1035,6 +1041,8 @@ def mock_sb1_transfer_fetch(out_date="2026-08-20", in_date="2026-08-20"):
                         "date": in_date,
                         "amount": 50,
                         "bookingStatus": "BOOKED",
+                        "accountNumber": {"value": "22220000002"},
+                        "remoteAccountNumber": "11110000001",
                     },
                 ]
             },
@@ -1313,6 +1321,82 @@ async def test_run_cycle_falls_back_to_normal_import_when_no_transfer_payee_foun
     assert db.get_tracked("acct-in:tx-in-1")["import_id"] == derive_import_id(
         "acct-in:tx-in-1"
     )
+
+
+@respx.mock
+async def test_run_cycle_does_not_link_coincidental_same_amount_pair(tmp_path: Path):
+    """Regression test for a real false positive: a 158.48 kr salary
+    deposit and an unrelated 158.48 kr grocery purchase on a different
+    account, opposite sign, within the match window - but neither names
+    the other's real account number. Must import as two ordinary,
+    unlinked transactions, not a matched transfer.
+    """
+    config = make_transfer_config()
+    token_store = make_token_store(tmp_path)
+    db = make_db(tmp_path)
+    await seed_mappings(db, config)
+
+    respx.get(sb1_client.TRANSACTIONS_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "transactions": [
+                    {
+                        "id": "tx-salary",
+                        "nonUniqueId": "tx-salary",
+                        "accountKey": "acct-out",
+                        "date": "2026-08-20",
+                        "amount": 158.48,
+                        "bookingStatus": "BOOKED",
+                        "accountNumber": {"value": "11110000001"},
+                        "remoteAccountNumber": "99998888777",
+                    },
+                    {
+                        "id": "tx-grocery",
+                        "nonUniqueId": "tx-grocery",
+                        "accountKey": "acct-in",
+                        "date": "2026-08-24",
+                        "amount": -158.48,
+                        "bookingStatus": "BOOKED",
+                        "accountNumber": {"value": "K1861615456"},
+                        "remoteAccountNumber": "-1",
+                    },
+                ]
+            },
+        )
+    )
+    payees_route = mock_payees_route("budget-1")
+
+    def create_side_effect(request):
+        body = json.loads(request.content)
+        sent = body["transactions"]
+        assert len(sent) == 2, "unrelated same-amount transactions must not be linked"
+        return httpx.Response(
+            200,
+            json={
+                "data": {
+                    "transaction_ids": [],
+                    "duplicate_import_ids": [],
+                    "transactions": [
+                        {"id": f"ynab-{i}", "import_id": tx["import_id"], "amount": tx["amount"]}
+                        for i, tx in enumerate(sent)
+                    ],
+                }
+            },
+        )
+
+    respx.post(f"{ynab_client.BASE_URL}/{ynab_client.RESOURCE_PATH}/budget-1/transactions").mock(
+        side_effect=create_side_effect
+    )
+
+    async with httpx.AsyncClient() as http_client:
+        engine = make_engine(config, http_client, token_store, db)
+        result, _ = await engine.run_cycle()
+
+    # No cross-reference between the two legs -> never even attempted as a
+    # transfer, so get_payees is never called at all.
+    assert not payees_route.called
+    assert result.created == 2
 
 
 def make_row(row_index: int, day: int, amount_milliunits: int, payee: str, memo=None):

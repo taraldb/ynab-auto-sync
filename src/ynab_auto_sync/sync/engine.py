@@ -105,6 +105,14 @@ class _PendingCreate:
     # leg's own _PendingCreate, which is never itself submitted since YNAB
     # auto-creates it as a linked transaction.
     transfer_secondary: _PendingCreate | None = field(default=None)
+    # Real account-number cross-reference, carried through from
+    # NormalizedTransaction purely for transfer-pair matching (see
+    # sync/transfers.py and providers/base.py's NormalizedTransaction
+    # docstring for why this is more reliable than a transaction-type
+    # code). None for the file-import path, which never reaches
+    # _match_transfers anyway.
+    account_number: str | None = field(default=None)
+    remote_account_number: str | None = field(default=None)
 
 
 @dataclass
@@ -293,6 +301,8 @@ class SyncEngine:
                 provider_account_id=ntx.provider_account_id,
                 provider_type=provider_type,
                 payee_name=ntx.payee_name,
+                account_number=ntx.account_number,
+                remote_account_number=ntx.remote_account_number,
             )
 
         if (
@@ -669,6 +679,8 @@ class SyncEngine:
                     account_key=f"{p.provider_type}:{p.provider_account_id}",
                     date=date.fromisoformat(p.ynab_tx["date"]),
                     amount_milliunits=p.ynab_tx["amount"],
+                    account_number=p.account_number,
+                    remote_account_number=p.remote_account_number,
                 )
                 for i, p in enumerate(pending_creates)
             ]

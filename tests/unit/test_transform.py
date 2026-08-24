@@ -3,7 +3,9 @@ import pytest
 from ynab_auto_sync.providers.sparebank1.transform import (
     MissingFieldError,
     derive_import_id,
+    get_account_number,
     get_booking_status,
+    get_remote_account_number,
     get_tracking_key,
     get_transaction_date,
     get_transaction_id,
@@ -162,6 +164,29 @@ def test_get_booking_status_defaults_to_booked_when_absent():
     assert get_booking_status({}) == "BOOKED"
     assert get_booking_status({"bookingStatus": "PENDING"}) == "PENDING"
     assert get_booking_status({"bookingStatus": "BOOKED"}) == "BOOKED"
+
+
+def test_get_account_number_reads_nested_value():
+    sb1_tx = {"accountNumber": {"value": "32096894308", "formatted": "3209 68 94308"}}
+    assert get_account_number(sb1_tx) == "32096894308"
+
+
+def test_get_account_number_returns_none_when_absent_or_wrong_shape():
+    assert get_account_number({}) is None
+    assert get_account_number({"accountNumber": "not-a-dict"}) is None
+    assert get_account_number({"accountNumber": {}}) is None
+
+
+def test_get_remote_account_number_passthrough():
+    assert get_remote_account_number({"remoteAccountNumber": "32096220447"}) == "32096220447"
+
+
+def test_get_remote_account_number_treats_sentinel_and_missing_as_none():
+    # "-1" is SpareBank1's own sentinel for "no remote account applies" -
+    # confirmed live on every card-purchase transaction seen - must never
+    # be compared as a literal value.
+    assert get_remote_account_number({"remoteAccountNumber": "-1"}) is None
+    assert get_remote_account_number({}) is None
 
 
 def test_transform_transaction_is_uncleared_when_pending():

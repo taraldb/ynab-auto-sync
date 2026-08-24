@@ -388,6 +388,47 @@ async def test_epoch_millisecond_and_iso_dates_both_parse(tmp_path: Path):
 
 
 @respx.mock
+async def test_fetch_sets_account_number_and_remote_account_number(tmp_path: Path):
+    mock_transactions(
+        [
+            {
+                "accountKey": "acct-1",
+                "nonUniqueId": "nu-transfer",
+                "date": "2026-08-20",
+                "amount": -100,
+                "description": "transfer out",
+                "bookingStatus": "BOOKED",
+                "accountNumber": {"value": "32096894308", "formatted": "3209 68 94308"},
+                "remoteAccountNumber": "32096220447",
+            },
+            {
+                "accountKey": "acct-1",
+                "nonUniqueId": "nu-purchase",
+                "date": "2026-08-20",
+                "amount": -50,
+                "description": "card purchase",
+                "bookingStatus": "BOOKED",
+                "accountNumber": {"value": "K1861615456", "formatted": "K186 16 15456"},
+                # "-1" is SpareBank1's own sentinel for "not applicable".
+                "remoteAccountNumber": "-1",
+            },
+        ]
+    )
+    async with httpx.AsyncClient() as http_client:
+        provider = make_provider(tmp_path, http_client)
+        results = await provider.fetch(SINCE)
+
+    by_tracking_key = {ntx.tracking_key: ntx for ntx in results}
+    transfer_ntx = by_tracking_key["acct-1:nu-transfer"]
+    assert transfer_ntx.account_number == "32096894308"
+    assert transfer_ntx.remote_account_number == "32096220447"
+
+    purchase_ntx = by_tracking_key["acct-1:nu-purchase"]
+    assert purchase_ntx.account_number == "K1861615456"
+    assert purchase_ntx.remote_account_number is None
+
+
+@respx.mock
 async def test_fetch_does_not_drop_rows_older_than_since(tmp_path: Path):
     # fetch() over-fetches on purpose (providers/base.py's fetch() docstring)
     # - the engine, not the provider, is responsible for dropping rows older

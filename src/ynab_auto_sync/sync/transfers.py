@@ -18,23 +18,43 @@ class TransferCandidate:
     account_key: str
     date: date
     amount_milliunits: int
+    # Real account-number cross-reference (see providers/base.py's
+    # NormalizedTransaction docstring) - None when the source doesn't
+    # populate it, in which case this candidate can never satisfy the
+    # cross-reference check below and so never matches anything.
+    account_number: str | None = None
+    remote_account_number: str | None = None
 
 
 def find_transfer_pairs(
     candidates: list[TransferCandidate], match_window_days: int
 ) -> list[tuple[int, int]]:
     """Match pairs of candidates that look like two legs of the same
-    transfer: opposite sign, equal absolute amount, different accounts, and
-    dates within match_window_days of each other.
+    transfer: opposite sign, equal absolute amount, different accounts,
+    dates within match_window_days of each other, AND at least one leg's
+    remote_account_number names the other leg's real account_number.
+
+    That last condition was added after a real false positive: a 158.48 kr
+    salary deposit got linked to an unrelated 158.48 kr grocery purchase 4
+    days later on a different account - same amount, opposite sign, no
+    other similarity. Neither transaction's remote_account_number named the
+    other's account_number, so requiring the cross-reference excludes it.
+    Confirmed against two genuine transfers too: a same-day account-to-
+    account transfer where BOTH legs' remote_account_number correctly named
+    the other's account_number, and a credit-card bill payment where only
+    ONE direction resolved (the checking-account leg named the card
+    issuer's own internal clearing account rather than the card itself,
+    but the card's own transaction feed correctly named the checking
+    account back) - which is why this checks EITHER direction, not both.
 
     Ambiguous candidates - more than one transaction that could plausibly
     be the other leg - are skipped entirely on BOTH sides, never guessed,
     matching this project's existing "don't guess, fall back to the safe
-    default" stance elsewhere (see engine.py's _backfill_duplicates). A
-    coincidental same-amount, opposite-sign, same-window transaction that
-    isn't really a transfer is an accepted, low-probability false-positive
-    risk when it uniquely matches - the alternative (never linking anything)
-    was explicitly not what was asked for.
+    default" stance elsewhere (see engine.py's _backfill_duplicates). This
+    narrows, but does not eliminate, the false-positive risk: two unrelated
+    genuine transfers that coincidentally net to the same amount in the
+    same window, both correctly cross-referencing their own real
+    counterparties, remain a (much smaller) accepted risk.
 
     Only call this within a single YNAB budget's own candidate set - two
     accounts in different budgets can never be linked by YNAB's transfer
@@ -57,6 +77,12 @@ def find_transfer_pairs(
             and other.account_key != c.account_key
             and other.amount_milliunits == -c.amount_milliunits
             and abs((other.date - c.date).days) <= match_window_days
+            and (
+                (c.remote_account_number is not None
+                 and c.remote_account_number == other.account_number)
+                or (other.remote_account_number is not None
+                    and other.remote_account_number == c.account_number)
+            )
         ]
 
     for candidate in candidates:

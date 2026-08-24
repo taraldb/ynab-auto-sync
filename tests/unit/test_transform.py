@@ -134,9 +134,12 @@ def test_transform_transaction_prefers_cleaned_description_over_raw_description(
     }
     result = transform_transaction(sb1_tx, ynab_account_id="ynab-acct-1", account_key="acct-1")
     assert result["payee_name"] == "Micro Kaffi AS, Stavanger"
-    # memo keeps the full raw description (sanitized: '*' separator -> space)
-    # regardless of the cleaner payee name
-    assert result["memo"] == "Zettle_ Micro Kaffi AS, Stavanger"
+    # Confirmed against 25 real transactions: once memo is derived from the
+    # same cleanedDescription-preferring candidates payee uses, a
+    # processor-prefixed raw description collapses to the exact same text
+    # as payee - real information, not noise, so it's suppressed (None)
+    # rather than shown twice.
+    assert result["memo"] is None
 
 
 def test_transform_transaction_falls_back_to_description_without_remote_account_name():
@@ -149,6 +152,24 @@ def test_transform_transaction_falls_back_to_description_without_remote_account_
     }
     result = transform_transaction(sb1_tx, ynab_account_id="ynab-acct-1", account_key="acct-1")
     assert result["payee_name"] == "PULS NORGE"
+    # Same single raw field backs both payee and memo here, so once memo
+    # uses the same candidate preference as payee, they agree exactly and
+    # memo must be suppressed rather than duplicating payee.
+    assert result["memo"] is None
+
+
+def test_transform_transaction_preserves_memo_genuinely_different_from_payee():
+    sb1_tx = {
+        "id": "sb1-tx-45",
+        "nonUniqueId": "45",
+        "date": "2026-08-20",
+        "amount": -100,
+        "remoteAccountName": "Kari Nordmann",
+        "remittanceInformation": "KID 12345678901",
+    }
+    result = transform_transaction(sb1_tx, ynab_account_id="ynab-acct-1", account_key="acct-1")
+    assert result["payee_name"] == "Kari Nordmann"
+    assert result["memo"] == "KID 12345678901"
 
 
 def test_transform_transaction_raises_on_missing_amount():

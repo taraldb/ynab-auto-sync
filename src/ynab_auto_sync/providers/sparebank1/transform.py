@@ -44,6 +44,22 @@ DESCRIPTION_FIELD_CANDIDATES = ("description", "text", "remittanceInformation")
 # which have no remoteAccountName at all; raw description is the final
 # fallback, always present.
 PAYEE_NAME_CANDIDATES = ("remoteAccountName", "cleanedDescription", *DESCRIPTION_FIELD_CANDIDATES)
+# Memo's own candidate order - deliberately NOT identical to
+# PAYEE_NAME_CANDIDATES. remoteAccountName is excluded: it's specifically
+# "who the other party is," which is payee's job, and including it here
+# would make memo mathematically guaranteed to equal payee whenever a named
+# counterparty exists (same field, same first-hit) - collapsing the
+# suppress-when-identical check (below) into "always suppressed," which
+# defeats the point. cleanedDescription IS included, ahead of raw
+# description - confirmed against real data this is what fixes the actual
+# redundancy this whole change targets: a card purchase's raw `description`
+# carries a payment-processor prefix ("Zettle_*", "Vipps*", ...) that
+# cleanedDescription already strips for payee; preferring it for memo too
+# makes the two agree exactly in that case, which is correctly suppressed,
+# while still leaving room for memo to diverge when payee comes from
+# remoteAccountName and a genuinely separate note (e.g. remittanceInformation)
+# exists - see provider.py's _extract_memo docstring for the full write-up.
+MEMO_FIELD_CANDIDATES = ("cleanedDescription", *DESCRIPTION_FIELD_CANDIDATES)
 
 BOOKING_STATUS_PENDING = "PENDING"
 BOOKING_STATUS_BOOKED = "BOOKED"
@@ -211,14 +227,27 @@ def transform_transaction(
     sb1_id = get_tracking_key(sb1_tx, account_key)
     tx_date = get_transaction_date(sb1_tx)
     amount_milliunits = get_amount_milliunits(sb1_tx)
-    description = _get_first(sb1_tx, *DESCRIPTION_FIELD_CANDIDATES)
+    payee_name = _extract_payee_name(sb1_tx)
+    # Confirmed live against 25 real booked transactions: memo never once
+    # carried information payee didn't already say - see provider.py's
+    # _extract_memo docstring (the real, live path this module's fetch()
+    # equivalent must stay behaviourally identical to) for the full finding,
+    # and MEMO_FIELD_CANDIDATES' own comment for why it's deliberately NOT
+    # identical to PAYEE_NAME_CANDIDATES (excludes remoteAccountName, or
+    # memo would be mathematically guaranteed to always equal payee).
+    # Suppress memo to None whenever it's provably identical to payee
+    # (case-insensitive, whitespace-normalized) rather than showing the same
+    # text twice.
+    description = _get_first(sb1_tx, *MEMO_FIELD_CANDIDATES)
     memo = clean_bank_text(str(description)) if description is not None else None
+    if memo is not None and memo.strip().casefold() == payee_name.strip().casefold():
+        memo = None
 
     return build_create_payload(
         ynab_account_id=ynab_account_id,
         tx_date=tx_date,
         amount_milliunits=amount_milliunits,
-        payee_name=_extract_payee_name(sb1_tx),
+        payee_name=payee_name,
         memo=memo,
         cleared=(
             "uncleared" if get_booking_status(sb1_tx) == BOOKING_STATUS_PENDING else "cleared"

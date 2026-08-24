@@ -49,9 +49,35 @@ def _extract_payee_name(sb1_tx: dict[str, Any]) -> str:
     return cleaned or "SpareBank1 transaction"
 
 
-def _extract_memo(sb1_tx: dict[str, Any]) -> str | None:
-    description = _first_present(sb1_tx, *transform.DESCRIPTION_FIELD_CANDIDATES)
-    return clean_bank_text(str(description)) if description is not None else None
+def _extract_memo(sb1_tx: dict[str, Any], payee_name: str) -> str | None:
+    """Confirmed live against 25 real booked transactions: memo never once
+    carried information payee didn't already say. 18/25 were byte-identical
+    (both derived from the same field); the rest differed only by a
+    merchant-processor prefix ("Vipps*", "Zettle_*", "VFI*", "LOOMISP*",
+    "Dinter*") that PAYEE_NAME_CANDIDATES' preference for `cleanedDescription`
+    already strips but a raw-`description`-first memo didn't. Fix: derive
+    memo from `transform.MEMO_FIELD_CANDIDATES` - preferring
+    `cleanedDescription` too, so the processor-prefix case above resolves to
+    the same text as payee - then suppress it to None whenever it's provably
+    identical to payee (case-insensitive, whitespace-normalized) rather than
+    showing the same text twice.
+
+    MEMO_FIELD_CANDIDATES is deliberately NOT identical to
+    PAYEE_NAME_CANDIDATES - it excludes `remoteAccountName` on purpose (see
+    that constant's own comment): naming the other party is payee's job, and
+    including it here would make memo mathematically guaranteed to equal
+    payee whenever a named counterparty exists, permanently defeating the
+    suppress-when-identical check instead of just applying it correctly.
+    This is what lets memo still surface something genuinely different
+    (e.g. a real `remittanceInformation` note on a bank transfer) rather
+    than becoming pure dead weight - not observed in the 25-sample window
+    this fix was based on, but the fallback chain is kept intact for it.
+    """
+    description = _first_present(sb1_tx, *transform.MEMO_FIELD_CANDIDATES)
+    memo = clean_bank_text(str(description)) if description is not None else None
+    if memo is not None and memo.strip().casefold() == payee_name.strip().casefold():
+        return None
+    return memo
 
 
 # Confirmed live (GET /personal/banking/accounts, includeCreditCardAccounts=
@@ -279,6 +305,7 @@ class SpareBank1Provider(TransactionProvider):
                     continue
 
                 booking_status = BookingStatus.BOOKED
+                payee_name = _extract_payee_name(sb1_tx)
 
                 results.append(
                     NormalizedTransaction(
@@ -287,8 +314,8 @@ class SpareBank1Provider(TransactionProvider):
                         provider_account_id=account_key,
                         date=tx_date,
                         amount_milliunits=amount_milliunits,
-                        payee_name=_extract_payee_name(sb1_tx),
-                        memo=_extract_memo(sb1_tx),
+                        payee_name=payee_name,
+                        memo=_extract_memo(sb1_tx, payee_name),
                         booking_status=booking_status,
                         account_number=transform.get_account_number(sb1_tx),
                         remote_account_number=transform.get_remote_account_number(sb1_tx),

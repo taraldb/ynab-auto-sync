@@ -457,6 +457,104 @@ async def test_fetch_does_not_drop_rows_older_than_since(tmp_path: Path):
 
 
 @respx.mock
+async def test_memo_suppressed_when_processor_prefix_stripped_matches_payee(tmp_path: Path):
+    # Real, live-confirmed shape: a card purchase's raw `description` carries
+    # a payment-processor prefix ("Zettle_*") that `cleanedDescription`
+    # already stripped for payee - once memo prefers the same candidate,
+    # the two agree exactly and memo must be suppressed rather than shown
+    # as noisy near-duplicate text.
+    mock_transactions(
+        [
+            {
+                "accountKey": "acct-1",
+                "nonUniqueId": "nu-1",
+                "date": "2026-08-20",
+                "amount": -130,
+                "description": "Zettle_*Micro Kaffi AS, Stavanger",
+                "cleanedDescription": "Micro Kaffi AS, Stavanger",
+                "bookingStatus": "BOOKED",
+            }
+        ]
+    )
+    async with httpx.AsyncClient() as http_client:
+        provider = make_provider(tmp_path, http_client)
+        results = await provider.fetch(SINCE)
+
+    assert results[0].payee_name == "Micro Kaffi AS, Stavanger"
+    assert results[0].memo is None
+
+
+@respx.mock
+async def test_memo_suppressed_when_identical_to_payee(tmp_path: Path):
+    mock_transactions(
+        [
+            {
+                "accountKey": "acct-1",
+                "nonUniqueId": "nu-1",
+                "date": "2026-08-20",
+                "amount": -100,
+                "description": "REMA 1000 SANDVED, SANDNES, NOR",
+                "cleanedDescription": "REMA 1000 SANDVED, SANDNES, NOR",
+                "bookingStatus": "BOOKED",
+            }
+        ]
+    )
+    async with httpx.AsyncClient() as http_client:
+        provider = make_provider(tmp_path, http_client)
+        results = await provider.fetch(SINCE)
+
+    assert results[0].payee_name == "REMA 1000 SANDVED, SANDNES, NOR"
+    assert results[0].memo is None
+
+
+@respx.mock
+async def test_memo_preserved_when_genuinely_different_from_payee(tmp_path: Path):
+    # Not observed in the live sample this fix was based on, but the
+    # candidate fallback chain still reaches remittanceInformation when
+    # nothing else is present - a genuinely distinct note must survive,
+    # not be guessed away.
+    mock_transactions(
+        [
+            {
+                "accountKey": "acct-1",
+                "nonUniqueId": "nu-1",
+                "date": "2026-08-20",
+                "amount": -100,
+                "remoteAccountName": "Kari Nordmann",
+                "remittanceInformation": "KID 12345678901",
+                "bookingStatus": "BOOKED",
+            }
+        ]
+    )
+    async with httpx.AsyncClient() as http_client:
+        provider = make_provider(tmp_path, http_client)
+        results = await provider.fetch(SINCE)
+
+    assert results[0].payee_name == "Kari Nordmann"
+    assert results[0].memo == "KID 12345678901"
+
+
+@respx.mock
+async def test_memo_none_when_no_description_shaped_field_present(tmp_path: Path):
+    mock_transactions(
+        [
+            {
+                "accountKey": "acct-1",
+                "nonUniqueId": "nu-1",
+                "date": "2026-08-20",
+                "amount": -100,
+                "bookingStatus": "BOOKED",
+            }
+        ]
+    )
+    async with httpx.AsyncClient() as http_client:
+        provider = make_provider(tmp_path, http_client)
+        results = await provider.fetch(SINCE)
+
+    assert results[0].memo is None
+
+
+@respx.mock
 async def test_on_skip_called_for_each_malformed_row(tmp_path: Path):
     mock_transactions(
         [

@@ -52,13 +52,22 @@ sync:
   match_window_unit: "calendar_days"
   # Opt-in (0 = disabled, the default): days of slack to look for a
   # pre-existing, manually-typed YNAB transaction with the exact same
-  # amount as an incoming bank transaction, before creating a new one.
+  # amount as an incoming BOOKED bank transaction, before creating a new
+  # one. Only affects BOOKED transactions - a PENDING transaction's own
+  # manual-matching is controlled by pending_import_enabled below instead,
+  # independent of this setting.
   manual_match_window_days: 0
   # Opt-in (false = disabled, the default): import PENDING SpareBank1
   # transactions on CREDITCARD accounts immediately (uncleared, at their
   # whole-kroner preauth amount), fuzzy-correlated with their later-booked
   # self. See CLAUDE.md's "PENDING-transaction import" section - scoped to
-  # credit cards only, never bank transfers.
+  # credit cards only, never bank transfers. Also makes a PENDING
+  # transaction check against your own manually-typed YNAB entries before
+  # creating a new one (using pending_import_amount_tolerance_kroner/
+  # pending_import_date_window_days below), regardless of
+  # manual_match_window_days above - a PENDING import colliding with
+  # something you already typed in by hand is expected, not a separate
+  # opt-in.
   pending_import_enabled: false
   pending_import_amount_tolerance_kroner: 2.0
   pending_import_date_window_days: 5

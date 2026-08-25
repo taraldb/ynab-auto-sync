@@ -437,7 +437,23 @@ class SyncEngine:
                         account_key=ntx.provider_account_id,
                     )
 
-            if manual_candidates:
+            # Each booking status has its OWN independent opt-in, not a
+            # shared one - see _get_manual_candidates' fetch-gate comment.
+            # A PENDING transaction colliding with something the user
+            # already typed into YNAB by hand is an expected, first-class
+            # scenario for pending-import specifically (confirmed live,
+            # 2026-08-25 production: 3 of 9 PENDING imports duplicated
+            # manually-typed entries because this used to share
+            # manual_match_window_days, which was off) - so it's gated on
+            # pending_import_enabled alone, never on the separate BOOKED-
+            # transaction opt-in below, which keeps its own unchanged "no
+            # strong signal, off by default" risk profile.
+            manual_match_allowed = (
+                self._config.sync.pending_import_enabled
+                if ntx.booking_status == BookingStatus.PENDING
+                else self._config.sync.manual_match_window_days > 0
+            )
+            if manual_candidates and manual_match_allowed:
                 if ntx.booking_status == BookingStatus.PENDING:
                     # A PENDING transaction's amount is always whole kroner
                     # (a preauth hold), so it will almost never exactly
@@ -577,7 +593,15 @@ class SyncEngine:
         async def _get_manual_candidates(
             ynab_account_id: str, ynab_budget_id: str
         ) -> list[dict[str, Any]]:
-            if self._config.sync.manual_match_window_days <= 0:
+            # Fetched whenever EITHER toggle might need it - manual_match_
+            # window_days for a BOOKED ntx's exact match below, pending_
+            # import_enabled for a PENDING ntx's tolerant match. _classify()
+            # gates actual usage per-status independently (see its own
+            # comment) - this only controls whether the list is worth
+            # fetching at all this cycle.
+            if self._config.sync.manual_match_window_days <= 0 and not (
+                self._config.sync.pending_import_enabled
+            ):
                 return []
             if ynab_account_id not in manual_candidates_cache:
                 manual_candidates_cache[ynab_account_id] = (
@@ -949,6 +973,27 @@ class SyncEngine:
             p = by_import_id.get(created.get("import_id"))
             if p is None:
                 continue
+            # Confirmed live (2026-08-25, production): a create submitted
+            # with a cached payee_id that no longer resolves to a real YNAB
+            # payee (deleted/merged since it was cached) is NOT rejected -
+            # YNAB returns 200 but silently drops it, coming back with
+            # payee_id AND payee_name both null. This is a stronger failure
+            # than the daily reconcile pass (see StateDB.
+            # delete_payee_mappings_for_ids) was built to guard against: it
+            # only protects the NEXT create after its once-a-day sweep, not
+            # the create that first hits a payee deleted inside that
+            # window. Excludes a transfer primary leg (transfer_secondary
+            # is not None) - its payee_id is YNAB's own auto-generated
+            # transfer payee, never our merchant cache, and should never
+            # legitimately land here.
+            stale_payee_id = (
+                p.transfer_secondary is None
+                and bool(p.ynab_tx.get("payee_id"))
+                and not created.get("payee_id")
+            )
+            resolved_payee_name = p.ynab_tx.get("payee_name") or created.get("payee_name")
+            if stale_payee_id:
+                resolved_payee_name = p.payee_name
             await self._db.upsert_tracked(
                 p.tracking_key,
                 import_id=p.ynab_tx["import_id"],
@@ -957,7 +1002,7 @@ class SyncEngine:
                 account_key=p.provider_account_id,
                 booking_status=p.booking_status,
                 amount_milliunits=p.ynab_tx["amount"],
-                payee_name=p.ynab_tx.get("payee_name") or created.get("payee_name"),
+                payee_name=resolved_payee_name,
                 memo=p.ynab_tx["memo"],
                 transaction_date=p.ynab_tx["date"],
                 ynab_account_id=p.ynab_tx["account_id"],
@@ -972,13 +1017,31 @@ class SyncEngine:
                 ynab_transaction_id=created["id"],
                 ynab_budget_id=budget_id,
                 ynab_account_id=p.ynab_tx["account_id"],
-                payee_name=p.ynab_tx.get("payee_name") or created.get("payee_name"),
+                payee_name=resolved_payee_name,
                 memo=p.ynab_tx["memo"],
                 transaction_date=p.ynab_tx["date"],
                 amount_milliunits=p.ynab_tx["amount"],
                 detail="transfer primary leg" if p.transfer_secondary is not None else None,
             )
             tracked_count += 1
+            if stale_payee_id:
+                stale_id = p.ynab_tx["payee_id"]
+                logger.warning(
+                    "Create for %r used cached payee_id %s, which YNAB silently "
+                    "dropped (came back null) - the payee was likely deleted or "
+                    "merged in YNAB since it was cached. Healing the cache and "
+                    "correcting the created transaction %s's payee now.",
+                    p.payee_name,
+                    stale_id,
+                    created["id"],
+                )
+                await self._db.delete_payee_mappings_for_ids(budget_id, {stale_id})
+                await ynab_client.update_transactions(
+                    self._http_client,
+                    self._config.ynab.personal_access_token,
+                    budget_id,
+                    [{"id": created["id"], "payee_name": p.payee_name}],
+                )
             # Only anchor a NEW payee_mappings entry when this create was
             # actually submitted with payee_name (no "payee_id" key at all
             # in the payload) - a transfer's primary leg already carries

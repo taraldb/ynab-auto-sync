@@ -336,6 +336,93 @@ async def test_run_cycle_uses_cached_payee_id_instead_of_payee_name(tmp_path: Pa
 
 
 @respx.mock
+async def test_run_cycle_stale_cached_payee_id_self_heals(tmp_path: Path):
+    # Confirmed live in production (2026-08-25): submitting a create with a
+    # cached payee_id that no longer resolves to a real YNAB payee (deleted
+    # or merged since it was cached) is NOT rejected - YNAB returns 200 but
+    # silently drops it, coming back with payee_id AND payee_name both
+    # null. The engine must notice this, heal the stale cache entry, and
+    # issue a corrective PATCH so the transaction doesn't permanently lose
+    # its payee.
+    config = make_config()
+    token_store = make_token_store(tmp_path)
+    db = make_db(tmp_path)
+    await seed_mappings(db, config)
+    await db.upsert_payee_mapping("budget-1", "Coffee", "payee-deleted-1")
+
+    respx.get(sb1_client.TRANSACTIONS_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "transactions": [
+                    {
+                        "id": "tx-stale-payee",
+                        "nonUniqueId": "tx-stale-payee",
+                        "accountKey": "acct-1",
+                        "date": "2026-08-20",
+                        "amount": -50,
+                        "description": "Coffee",
+                        "bookingStatus": "BOOKED",
+                    }
+                ]
+            },
+        )
+    )
+    import_id = derive_import_id("acct-1:tx-stale-payee")
+    create_route_mock = respx.post(
+        f"{ynab_client.BASE_URL}/{ynab_client.RESOURCE_PATH}/budget-1/transactions"
+    ).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "data": {
+                    "transaction_ids": ["ynab-tx-stale"],
+                    "duplicate_import_ids": [],
+                    "transactions": [
+                        {
+                            "id": "ynab-tx-stale",
+                            "import_id": import_id,
+                            "amount": -50000,
+                            "payee_id": None,
+                            "payee_name": None,
+                        }
+                    ],
+                }
+            },
+        )
+    )
+    patch_route = respx.patch(
+        f"{ynab_client.BASE_URL}/{ynab_client.RESOURCE_PATH}/budget-1/transactions"
+    ).mock(return_value=httpx.Response(200, json={"data": {}}))
+
+    async with httpx.AsyncClient() as http_client:
+        engine = make_engine(config, http_client, token_store, db)
+        result, _ = await engine.run_cycle()
+
+    # The create was submitted with the (stale) cached payee_id, not the
+    # raw payee_name.
+    sent = json.loads(create_route_mock.calls[0].request.content)["transactions"][0]
+    assert sent["payee_id"] == "payee-deleted-1"
+    assert "payee_name" not in sent
+
+    # Cache healed, so a future create for "Coffee" re-learns a fresh id.
+    assert db.get_payee_id("budget-1", "Coffee") is None
+
+    # Corrective PATCH sent to attach the real payee to the transaction
+    # YNAB otherwise would have left permanently payee-less.
+    assert patch_route.called
+    patched = json.loads(patch_route.calls.last.request.content)["transactions"]
+    assert patched == [{"id": "ynab-tx-stale", "payee_name": "Coffee"}]
+
+    # Local tracking reflects the real payee too, not the null YNAB
+    # returned.
+    assert result.created == 1
+    tracked = db.get_tracked("acct-1:tx-stale-payee")
+    assert tracked is not None
+    assert tracked["payee_name"] == "Coffee"
+
+
+@respx.mock
 async def test_run_cycle_skips_pending_transaction_entirely(tmp_path: Path):
     # SpareBank1's amount is unreliable while PENDING (confirmed against
     # real data) - the provider layer (providers/sparebank1/provider.py)
@@ -2663,6 +2750,12 @@ async def test_run_cycle_creates_pending_placeholder_when_enabled(tmp_path: Path
     await seed_mappings(db, config)
 
     _mock_creditcard_account()
+    # pending_import_enabled alone now also fetches manual-match candidates
+    # (see the PENDING-vs-manual-entry decoupling fix) - this account has
+    # no manually-typed duplicates, so the list is empty.
+    respx.get(_unimported_url("budget-1", "ynab-acct-1")).mock(
+        return_value=httpx.Response(200, json={"data": {"transactions": []}})
+    )
     respx.get(sb1_client.TRANSACTIONS_URL).mock(
         return_value=httpx.Response(
             200,
@@ -2756,6 +2849,9 @@ async def test_run_cycle_fuzzy_matches_pending_to_booked_across_different_tracki
     await seed_mappings(db, config)
 
     _mock_creditcard_account()
+    respx.get(_unimported_url("budget-1", "ynab-acct-1")).mock(
+        return_value=httpx.Response(200, json={"data": {"transactions": []}})
+    )
 
     call_count = {"n": 0}
 
@@ -2863,6 +2959,9 @@ async def test_run_cycle_fuzzy_transition_retry_safe(tmp_path: Path):
     )
 
     _mock_creditcard_account()
+    respx.get(_unimported_url("budget-1", "ynab-acct-1")).mock(
+        return_value=httpx.Response(200, json={"data": {"transactions": []}})
+    )
     respx.get(sb1_client.TRANSACTIONS_URL).mock(
         return_value=httpx.Response(
             200,
@@ -2996,6 +3095,199 @@ async def test_run_cycle_tolerant_manual_match_replaces_with_pending_transaction
     # not the manual entry's amount - it's corrected to the real final
     # amount once booked, same as any other pending placeholder.
     assert tracked["amount_milliunits"] == -218000
+
+
+@respx.mock
+async def test_run_cycle_pending_manual_match_independent_of_manual_match_window_days(
+    tmp_path: Path,
+):
+    # Confirmed live in production (2026-08-25): with pending_import_enabled
+    # on and manual_match_window_days at its default of 0, 3 of 9 PENDING
+    # imports duplicated transactions the user had already typed into YNAB
+    # by hand, because manual-matching used to be gated entirely behind
+    # manual_match_window_days. A PENDING transaction colliding with a
+    # manual entry is expected, first-class behavior for pending-import
+    # specifically - it must be tried regardless of the separate,
+    # BOOKED-only manual_match_window_days toggle (see the next test for
+    # confirmation that toggle is unaffected for BOOKED transactions).
+    config = make_config()
+    config.sync.pending_import_enabled = True
+    assert config.sync.manual_match_window_days == 0
+    token_store = make_token_store(tmp_path)
+    db = make_db(tmp_path)
+    await seed_mappings(db, config)
+
+    _mock_creditcard_account()
+    respx.get(sb1_client.TRANSACTIONS_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "transactions": [
+                    {
+                        "nonUniqueId": "444444444",
+                        "accountKey": "acct-1",
+                        "date": "2026-08-20",
+                        "amount": -218,
+                        "description": "MERCHANT ONE, LOC-A",
+                        "bookingStatus": "PENDING",
+                    }
+                ]
+            },
+        )
+    )
+    respx.get(_unimported_url("budget-1", "ynab-acct-1")).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "data": {
+                    "transactions": [
+                        {
+                            "id": "manual-7",
+                            "date": "2026-08-19",
+                            "amount": -218300,
+                            "payee_id": "payee-manual-7",
+                            "payee_name": "Merchant One",
+                            "category_id": "cat-1",
+                            "memo": None,
+                            "cleared": "cleared",
+                            "approved": True,
+                            "flag_color": None,
+                            "import_id": None,
+                            "deleted": False,
+                            "subtransactions": [],
+                        }
+                    ]
+                }
+            },
+        )
+    )
+    import_id = derive_import_id("acct-1:444444444")
+    respx.post(f"{ynab_client.BASE_URL}/{ynab_client.RESOURCE_PATH}/budget-1/transactions").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "data": {
+                    "transaction_ids": ["ynab-replacement-7"],
+                    "duplicate_import_ids": [],
+                    "transactions": [
+                        {"id": "ynab-replacement-7", "import_id": import_id, "amount": -218000}
+                    ],
+                }
+            },
+        )
+    )
+    delete_route = respx.delete(
+        f"{ynab_client.BASE_URL}/{ynab_client.RESOURCE_PATH}/budget-1/transactions/manual-7"
+    ).mock(
+        return_value=httpx.Response(
+            200, json={"data": {"transaction": {"id": "manual-7", "deleted": True}}}
+        )
+    )
+
+    async with httpx.AsyncClient() as http_client:
+        engine = make_engine(config, http_client, token_store, db)
+        result, _ = await engine.run_cycle()
+
+    assert result.created == 1
+    assert delete_route.called
+    tracked = db.get_tracked("acct-1:444444444")
+    assert tracked is not None
+    assert tracked["booking_status"] == "PENDING"
+
+
+@respx.mock
+async def test_run_cycle_booked_manual_match_still_requires_window_days_when_pending_import_enabled(
+    tmp_path: Path,
+):
+    # The flip side of the previous test: pending_import_enabled must NOT
+    # silently turn on manual-matching for already-BOOKED transactions too
+    # - that keeps its own separate, unchanged "no strong signal, off by
+    # default" opt-in (manual_match_window_days). The candidate list IS
+    # still fetched (pending_import_enabled alone is enough to fetch it,
+    # since a PENDING transaction elsewhere in the same account might need
+    # it), but a BOOKED transaction must not be matched against it.
+    config = make_config()
+    config.sync.pending_import_enabled = True
+    assert config.sync.manual_match_window_days == 0
+    token_store = make_token_store(tmp_path)
+    db = make_db(tmp_path)
+    await seed_mappings(db, config)
+
+    _mock_creditcard_account()
+    respx.get(sb1_client.TRANSACTIONS_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "transactions": [
+                    {
+                        "id": "tx-booked-mm",
+                        "nonUniqueId": "tx-booked-mm",
+                        "accountKey": "acct-1",
+                        "date": "2026-08-20",
+                        "amount": -50,
+                        "description": "Coffee",
+                        "bookingStatus": "BOOKED",
+                    }
+                ]
+            },
+        )
+    )
+    # An exact-amount candidate is available - if the BOOKED path wrongly
+    # ignored manual_match_window_days too, this would get matched instead
+    # of a fresh create.
+    respx.get(_unimported_url("budget-1", "ynab-acct-1")).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "data": {
+                    "transactions": [
+                        {
+                            "id": "manual-8",
+                            "date": "2026-08-20",
+                            "amount": -50000,
+                            "payee_id": "payee-manual-8",
+                            "payee_name": "Coffee",
+                            "category_id": "cat-1",
+                            "memo": None,
+                            "cleared": "cleared",
+                            "approved": True,
+                            "flag_color": None,
+                            "import_id": None,
+                            "deleted": False,
+                            "subtransactions": [],
+                        }
+                    ]
+                }
+            },
+        )
+    )
+    import_id = derive_import_id("acct-1:tx-booked-mm")
+    respx.post(f"{ynab_client.BASE_URL}/{ynab_client.RESOURCE_PATH}/budget-1/transactions").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "data": {
+                    "transaction_ids": ["ynab-tx-booked-mm"],
+                    "duplicate_import_ids": [],
+                    "transactions": [
+                        {"id": "ynab-tx-booked-mm", "import_id": import_id, "amount": -50000}
+                    ],
+                }
+            },
+        )
+    )
+    # Deliberately no mock for a DELETE of manual-8 - if the code wrongly
+    # matched and tried to delete it, this test would fail with a routing
+    # error.
+
+    async with httpx.AsyncClient() as http_client:
+        engine = make_engine(config, http_client, token_store, db)
+        result, _ = await engine.run_cycle()
+
+    assert result.created == 1
+    tracked = db.get_tracked("acct-1:tx-booked-mm")
+    assert tracked is not None
+    assert tracked["ynab_transaction_id"] == "ynab-tx-booked-mm"
 
 
 @respx.mock
@@ -3178,6 +3470,9 @@ async def test_run_cycle_ambiguous_fuzzy_match_falls_through_to_new_create(tmp_p
     )
 
     _mock_creditcard_account()
+    respx.get(_unimported_url("budget-1", "ynab-acct-1")).mock(
+        return_value=httpx.Response(200, json={"data": {"transactions": []}})
+    )
     respx.get(sb1_client.TRANSACTIONS_URL).mock(
         return_value=httpx.Response(
             200,

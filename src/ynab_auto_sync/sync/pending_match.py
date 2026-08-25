@@ -1,14 +1,13 @@
-"""Prototype: correlating a self-created "pending" transaction with its
-later-booked real-world self, and (separately) with an existing hand-typed
-YNAB manual transaction, without relying on exact tracking-key equality.
+"""Correlates a self-created "pending" transaction with its later-booked
+real-world self, and (separately) with an existing hand-typed YNAB manual
+transaction, without relying on exact tracking-key equality.
 
-**This module is a standalone, tested prototype - it is NOT wired into
-provider.py's fetch() or engine.py's _classify()/submit() path.**
-providers/sparebank1/provider.py::fetch() still skips every PENDING row
-entirely; engine.py's "transitioned" branch is unaffected. See CLAUDE.md's
-"Explored (not shipped): PENDING-transaction fuzzy correlation prototype"
-for the full write-up of why this exists and what a future wiring task
-would still need to decide.
+Wired into engine.py::_classify() - a BOOKED ntx with nothing tracked under
+its own key is tried against find_pending_match() before the manual-match
+check, and a PENDING ntx's manual-match branch uses
+find_manual_match_tolerant() instead of the exact matcher. See CLAUDE.md's
+"PENDING-transaction import (opt-in, credit-card only)" for the full
+write-up, including why exact tracking-key matching can't be reused here.
 
 Why exact tracking-key matching can't be reused here (confirmed against
 real SpareBank1 fetch data, not assumed):

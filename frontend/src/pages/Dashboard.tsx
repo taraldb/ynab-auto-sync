@@ -429,7 +429,10 @@ export default function Dashboard() {
       </div>
 
       <div className="flex items-center justify-between text-xs text-slate-600">
-        <span>{error ?? ""}</span>
+        <span className="flex items-center gap-3">
+          <span>{status.version}</span>
+          <span>{error ?? ""}</span>
+        </span>
         {connectionState === "open" ? (
           <span className="flex items-center gap-1.5 text-emerald-400">
             <span className="h-1.5 w-1.5 rounded-full bg-emerald-400" />

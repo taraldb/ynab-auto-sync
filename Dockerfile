@@ -21,6 +21,12 @@ RUN if [ -f package-lock.json ]; then npm ci; else npm install; fi \
 
 FROM python:3.12-slim AS runtime
 
+# Set from CI via --build-arg to the pushed git tag (e.g. "v0.1.7"); "dev"
+# is what a local `docker build` with no --build-arg gets, and what the
+# GUI's footer falls back to displaying.
+ARG APP_VERSION=dev
+ENV APP_VERSION=${APP_VERSION}
+
 # Unraid runs Docker containers as nobody:users (uid 99, gid 100) by default
 # - confirmed against Unraid's own docs/forums, not assumed. Used numerically
 # rather than via useradd/groupadd: python:3.12-slim's base Debian image

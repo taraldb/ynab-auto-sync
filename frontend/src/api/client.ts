@@ -27,6 +27,7 @@ export interface StatusResponse {
   accounts: Account[];
   cron_expression: string;
   next_fire_at: string;
+  version: string;
 }
 
 export interface DeletedTransaction {

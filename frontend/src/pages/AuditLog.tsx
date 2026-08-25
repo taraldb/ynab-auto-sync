@@ -10,28 +10,16 @@ import {
   type SortDir,
 } from "../api/client";
 import { formatDateTime, formatNok } from "../lib/format";
+import { TYPE_BADGE, TILE_LABEL } from "../lib/auditEventStyles";
+import AuditEventModal from "../components/AuditEventModal";
 
 const PAGE_SIZE = 50;
-
-const TYPE_BADGE: Record<AuditEventType, string> = {
-  created: "bg-emerald-500/15 text-emerald-300 ring-1 ring-inset ring-emerald-500/30",
-  updated: "bg-sky-500/15 text-sky-300 ring-1 ring-inset ring-sky-500/30",
-  duplicate: "bg-amber-500/15 text-amber-300 ring-1 ring-inset ring-amber-500/30",
-  skipped: "bg-rose-500/15 text-rose-300 ring-1 ring-inset ring-rose-500/30",
-};
 
 const TILE_ACCENT: Record<AuditEventType, string> = {
   created: "text-emerald-400",
   updated: "text-sky-400",
   duplicate: "text-amber-400",
   skipped: "text-rose-400",
-};
-
-const TILE_LABEL: Record<AuditEventType, string> = {
-  created: "Created",
-  updated: "Updated",
-  duplicate: "Duplicate",
-  skipped: "Skipped",
 };
 
 const CATEGORY_FILTERS: AuditEventType[] = [
@@ -83,6 +71,7 @@ export default function AuditLog() {
   const [sortBy, setSortBy] = useState<AuditEventSortColumn>("occurred_at");
   const [sortDir, setSortDir] = useState<SortDir>("desc");
   const [accounts, setAccounts] = useState<Account[]>([]);
+  const [selectedId, setSelectedId] = useState<number | null>(null);
 
   useEffect(() => {
     getStatus()
@@ -163,6 +152,7 @@ export default function AuditLog() {
   const hasMore = events.length < data.total;
 
   return (
+    <>
     <div className="space-y-4">
       <div className="flex items-center justify-between">
         <div>
@@ -277,7 +267,11 @@ export default function AuditLog() {
                 const isNegative =
                   ev.amount_milliunits !== null && ev.amount_milliunits < 0;
                 return (
-                  <tr key={ev.id}>
+                  <tr
+                    key={ev.id}
+                    onClick={() => setSelectedId(ev.id)}
+                    className="cursor-pointer hover:bg-slate-800/40 transition-colors"
+                  >
                     <td className="whitespace-nowrap px-4 py-3 text-slate-300">
                       {formatDateTime(ev.occurred_at)}
                     </td>
@@ -339,5 +333,14 @@ export default function AuditLog() {
         </div>
       )}
     </div>
+    {selectedId !== null && (
+      <AuditEventModal
+        eventId={selectedId}
+        initialEvent={events.find((e) => e.id === selectedId)!}
+        accounts={accounts}
+        onClose={() => setSelectedId(null)}
+      />
+    )}
+    </>
   );
 }

@@ -358,6 +358,29 @@ export interface AuditEvent {
   detail: string | null;
 }
 
+export interface TrackedTransaction {
+  sb1_transaction_id: string;
+  import_id: string;
+  ynab_transaction_id: string;
+  ynab_budget_id: string;
+  account_key: string;
+  booking_status: string;
+  amount_milliunits: number;
+  first_seen_at: string;
+  last_checked_at: string;
+  payee_name: string | null;
+  memo: string | null;
+  transaction_date: string | null;
+  ynab_account_id: string | null;
+  cleared: string | null;
+  readd_count: number;
+}
+
+export interface AuditEventDetailResponse {
+  event: AuditEvent;
+  tracked: TrackedTransaction | null;
+}
+
 export interface AuditEventsResponse {
   events: AuditEvent[];
   total: number;
@@ -383,4 +406,9 @@ export async function listAuditEvents(params: {
   qs.set("offset", String(params.offset ?? 0));
   const res = await fetch(`/api/audit-events?${qs.toString()}`);
   return handleJson<AuditEventsResponse>(res);
+}
+
+export async function getAuditEvent(id: number): Promise<AuditEventDetailResponse> {
+  const res = await fetch(`/api/audit-events/${id}`);
+  return handleJson<AuditEventDetailResponse>(res);
 }

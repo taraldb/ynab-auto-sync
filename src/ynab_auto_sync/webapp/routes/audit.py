@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 
 from ynab_auto_sync.sync.state_db import StateDB
 from ynab_auto_sync.webapp.deps import get_db
@@ -42,3 +42,15 @@ async def list_audit_events(
         "total": total,
         "counts": db.count_audit_events_by_type(),
     }
+
+
+@router.get("/api/audit-events/{event_id}")
+async def get_audit_event(
+    event_id: int,
+    db: StateDB = Depends(get_db),
+) -> dict[str, Any]:
+    event = db.get_audit_event(event_id)
+    if event is None:
+        raise HTTPException(status_code=404, detail="audit event not found")
+    tracked = db.get_tracked(event["tracking_key"]) if event["tracking_key"] else None
+    return {"event": event, "tracked": tracked}

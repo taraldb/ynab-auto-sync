@@ -989,6 +989,14 @@ class StateDB:
             )
             self._conn.commit()
 
+    def get_audit_event(self, event_id: int) -> dict[str, Any] | None:
+        """Fetch a single audit event by id, or None if not found."""
+        row = self._conn.execute(
+            "SELECT * FROM audit_events WHERE id = ?",
+            (event_id,),
+        ).fetchone()
+        return dict(row) if row is not None else None
+
     def list_audit_events(
         self,
         *,

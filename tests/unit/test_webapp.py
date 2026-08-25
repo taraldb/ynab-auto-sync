@@ -298,6 +298,62 @@ def test_list_audit_events_rejects_invalid_event_type(tmp_path: Path):
     assert response.status_code == 422
 
 
+async def test_get_audit_event_not_found(tmp_path: Path):
+    client, _db = make_client(tmp_path)
+
+    response = client.get("/api/audit-events/999999")
+
+    assert response.status_code == 404
+    assert "audit event not found" in response.json()["detail"]
+
+
+async def test_get_audit_event_no_tracking_key(tmp_path: Path):
+    client, db = make_client(tmp_path)
+    await db.insert_audit_event(event_type="skipped", source="sparebank1", tracking_key=None)
+
+    response = client.get("/api/audit-events/1")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["event"]["event_type"] == "skipped"
+    assert body["event"]["source"] == "sparebank1"
+    assert body["event"]["tracking_key"] is None
+    assert body["tracked"] is None
+
+
+async def test_get_audit_event_with_tracked_join(tmp_path: Path):
+    client, db = make_client(tmp_path)
+    tracking_key = "acct-1:tx-123"
+    await db.insert_audit_event(
+        event_type="created",
+        source="sparebank1",
+        tracking_key=tracking_key,
+        account_key="acct-1",
+        payee_name="Test Shop",
+        amount_milliunits=-5000,
+    )
+    await db.upsert_tracked(
+        tracking_key,
+        import_id=derive_import_id(tracking_key),
+        ynab_transaction_id="ynab-123",
+        ynab_budget_id="budget-1",
+        account_key="acct-1",
+        booking_status="BOOKED",
+        amount_milliunits=-5000,
+        payee_name="Test Shop",
+    )
+
+    response = client.get("/api/audit-events/1")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["event"]["event_type"] == "created"
+    assert body["event"]["tracking_key"] == tracking_key
+    assert body["tracked"] is not None
+    assert body["tracked"]["ynab_transaction_id"] == "ynab-123"
+    assert body["tracked"]["payee_name"] == "Test Shop"
+
+
 def test_readd_deleted_transaction_unknown_key_returns_400(tmp_path: Path):
     client, _db = make_client(tmp_path)
 

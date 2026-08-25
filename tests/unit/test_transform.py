@@ -77,6 +77,41 @@ def test_get_tracking_key_correlates_pending_and_booked_same_reservation():
     assert get_tracking_key(pending_tx, "4526895") == get_tracking_key(booked_tx, "4526895")
 
 
+def test_get_tracking_key_normalizes_prefixed_credit_card_non_unique_id_to_bare():
+    # Confirmed live in production: creditCardIdentifiers.nonUniqueId can
+    # arrive already prefixed with "{partitionKey}-" (observed once a
+    # transaction aged from source "RECENT" into "HISTORIC"). Must still
+    # collapse to the same bare-form key the un-prefixed observation
+    # produces, or the same real transaction gets two different tracking
+    # keys/import_ids across two polls.
+    sb1_tx = {
+        "creditCardIdentifiers": {"partitionKey": "2926243", "nonUniqueId": "2926243-708046574"},
+    }
+    assert get_tracking_key(sb1_tx, "4526895") == "4526895:708046574"
+
+
+def test_get_tracking_key_same_transaction_stable_across_recent_and_historic_forms():
+    # The real RECENT vs HISTORIC pair from the production bug report -
+    # both must collapse to the identical literal tracking key.
+    recent_tx = {
+        "creditCardIdentifiers": {"partitionKey": "2926243", "nonUniqueId": "708046574"},
+    }
+    historic_tx = {
+        "creditCardIdentifiers": {"partitionKey": "2926243", "nonUniqueId": "2926243-708046574"},
+    }
+    assert get_tracking_key(recent_tx, "4526895") == "4526895:708046574"
+    assert get_tracking_key(historic_tx, "4526895") == "4526895:708046574"
+
+
+def test_get_tracking_key_leaves_non_unique_id_unchanged_when_not_partition_prefixed():
+    # Guard against over-aggressive stripping: only an exact
+    # "{partitionKey}-" prefix match is stripped.
+    sb1_tx = {
+        "creditCardIdentifiers": {"partitionKey": "9999999", "nonUniqueId": "2926243-708046574"},
+    }
+    assert get_tracking_key(sb1_tx, "4526895") == "4526895:2926243-708046574"
+
+
 def test_get_transaction_date_accepts_date_or_datetime_strings():
     assert get_transaction_date({"date": "2026-08-20"}).isoformat() == "2026-08-20"
     assert get_transaction_date({"bookingDate": "2026-08-21T00:00:00Z"}).isoformat() == "2026-08-21"

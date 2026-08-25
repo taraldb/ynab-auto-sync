@@ -99,10 +99,25 @@ def get_tracking_key(sb1_tx: dict[str, Any], account_key: str) -> str:
     bank-transfer transactions, which never have creditCardIdentifiers).
     account_key scopes the result, since SpareBank1's own field naming
     ("nonUniqueId") warns it is not guaranteed globally unique.
+
+    creditCardIdentifiers.nonUniqueId was separately confirmed live to be
+    format-unstable in its own right: for the identical already-booked
+    transaction, SpareBank1 re-served it bare (e.g. "708046574") when
+    freshly observed (source: "RECENT") and partitionKey-prefixed (e.g.
+    "2926243-708046574", matching the top-level nonUniqueId field) once
+    the same transaction aged into source: "HISTORIC". A raw prefix is
+    stripped below so the result always collapses to the bare form -
+    never the other way around - because years of already-tracked
+    credit-card import_ids were derived from the bare form, and switching
+    the canonical output to prefixed would mass-duplicate every one of
+    them on their next poll.
     """
     credit_card_ids = sb1_tx.get("creditCardIdentifiers")
     if isinstance(credit_card_ids, dict) and credit_card_ids.get("nonUniqueId"):
         raw_id = str(credit_card_ids["nonUniqueId"])
+        partition_key = credit_card_ids.get("partitionKey")
+        if partition_key is not None:
+            raw_id = raw_id.removeprefix(f"{partition_key}-")
     else:
         non_unique_id = sb1_tx.get("nonUniqueId")
         if non_unique_id is None:

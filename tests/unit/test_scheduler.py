@@ -165,11 +165,24 @@ def test_seconds_until_next_fire_matches_cron_schedule(tmp_path: Path, monkeypat
     scheduler = Scheduler(config, FakeEngine(), db, asyncio.Event(), NullSink(), NullNotifier())
 
     class FixedDatetime(datetime):
+        # now() is called with different tz arguments across scheduler.py
+        # (UTC) and cron.py (the configured Europe/Oslo) - both calls must
+        # represent the SAME real instant, just labeled differently, or the
+        # deltas below become meaningless. astimezone() from one fixed base
+        # instant guarantees that.
+        _BASE = None
+
         @classmethod
         def now(cls, tz=None):
-            return cls(2026, 8, 24, 5, 0, 0, tzinfo=tz)
+            base = cls._BASE
+            return base.astimezone(tz) if tz else base
 
+    FixedDatetime._BASE = FixedDatetime(2026, 8, 24, 5, 0, 0, tzinfo=UTC)
     monkeypatch.setattr("ynab_auto_sync.scheduler.datetime", FixedDatetime)
+    # _next_cron_fire_at() now delegates to cron.next_fire_at(), which has
+    # its own datetime reference - both must be frozen to the same fixed
+    # instant for these deltas to be meaningful.
+    monkeypatch.setattr("ynab_auto_sync.cron.datetime", FixedDatetime)
 
     seconds = scheduler._seconds_until_next_fire()
 
@@ -401,13 +414,26 @@ async def test_gives_up_retrying_when_backoff_would_land_after_next_cron_fire(
     scheduler = Scheduler(config, engine, db, asyncio.Event(), NullSink(), NullNotifier())
 
     class FixedDatetime(datetime):
+        # now() is called with different tz arguments across scheduler.py
+        # (UTC) and cron.py (the configured Europe/Oslo) - both calls must
+        # represent the SAME real instant, just labeled differently, or the
+        # deltas below become meaningless. astimezone() from one fixed base
+        # instant guarantees that.
+        _BASE = None
+
         @classmethod
         def now(cls, tz=None):
-            # 30s before the 06:00 fire - shorter than the default 60s base
-            # backoff delay, so a retry would land at or after that fire.
-            return cls(2026, 8, 24, 5, 59, 30, tzinfo=tz)
+            base = cls._BASE
+            return base.astimezone(tz) if tz else base
 
+    # 30s before the 06:00 UTC fire - shorter than the default 60s base
+    # backoff delay, so a retry would land at or after that fire.
+    FixedDatetime._BASE = FixedDatetime(2026, 8, 24, 5, 59, 30, tzinfo=UTC)
     monkeypatch.setattr("ynab_auto_sync.scheduler.datetime", FixedDatetime)
+    # _next_cron_fire_at() now delegates to cron.next_fire_at(), which has
+    # its own datetime reference - both must be frozen to the same fixed
+    # instant for these deltas to be meaningful.
+    monkeypatch.setattr("ynab_auto_sync.cron.datetime", FixedDatetime)
 
     await scheduler._do_cycle()
 
@@ -438,11 +464,24 @@ def test_seconds_until_next_wake_prefers_earlier_retry_deadline(tmp_path: Path, 
     scheduler = Scheduler(config, FakeEngine(), db, asyncio.Event(), NullSink(), NullNotifier())
 
     class FixedDatetime(datetime):
+        # now() is called with different tz arguments across scheduler.py
+        # (UTC) and cron.py (the configured Europe/Oslo) - both calls must
+        # represent the SAME real instant, just labeled differently, or the
+        # deltas below become meaningless. astimezone() from one fixed base
+        # instant guarantees that.
+        _BASE = None
+
         @classmethod
         def now(cls, tz=None):
-            return cls(2026, 8, 24, 5, 0, 0, tzinfo=tz)
+            base = cls._BASE
+            return base.astimezone(tz) if tz else base
 
+    FixedDatetime._BASE = FixedDatetime(2026, 8, 24, 5, 0, 0, tzinfo=UTC)
     monkeypatch.setattr("ynab_auto_sync.scheduler.datetime", FixedDatetime)
+    # _next_cron_fire_at() now delegates to cron.next_fire_at(), which has
+    # its own datetime reference - both must be frozen to the same fixed
+    # instant for these deltas to be meaningful.
+    monkeypatch.setattr("ynab_auto_sync.cron.datetime", FixedDatetime)
 
     scheduler._retry_deadline = FixedDatetime(2026, 8, 24, 5, 0, 30, tzinfo=UTC)
     assert scheduler._seconds_until_next_wake() == 30

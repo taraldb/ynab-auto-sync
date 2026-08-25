@@ -45,6 +45,7 @@ def test_load_config_parses_valid_yaml(tmp_path: Path):
     assert config.mqtt.host == "mqtt.local"
     # defaults
     assert config.sync.cron_expression == "0 6,8,10,12,16,20 * * *"
+    assert config.sync.timezone == "Europe/Oslo"
     assert config.sync.retention_days == 270
     assert config.gui.enabled is True
     assert config.gui.port == 8080
@@ -274,6 +275,35 @@ mqtt:
         load_config(config_path)
 
     assert "cron_expression" in str(exc_info.value)
+
+
+def test_load_config_invalid_timezone_raises(tmp_path: Path):
+    yaml_text = """
+providers:
+  sparebank1:
+    type: sparebank1
+    client_id: "cid"
+    client_secret: "secret"
+    redirect_uri: "http://localhost:8765/callback"
+
+ynab:
+  personal_access_token: "pat"
+  budgets:
+    personal: "budget-1"
+
+sync:
+  timezone: "Not/A_Real_Zone"
+
+mqtt:
+  host: "mqtt.local"
+"""
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(yaml_text)
+
+    with pytest.raises(ValidationError) as exc_info:
+        load_config(config_path)
+
+    assert "sync.timezone" in str(exc_info.value)
 
 
 def test_load_config_notifications_section_absent_is_none(tmp_path: Path):

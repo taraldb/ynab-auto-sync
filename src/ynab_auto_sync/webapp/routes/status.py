@@ -1,12 +1,11 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
 from typing import Any
 
-from croniter import croniter
 from fastapi import APIRouter, Depends
 
 from ynab_auto_sync.config import AppConfig
+from ynab_auto_sync.cron import next_fire_at as compute_next_fire_at
 from ynab_auto_sync.sync.state_db import StateDB
 from ynab_auto_sync.webapp.deps import get_config, get_db
 
@@ -17,8 +16,7 @@ def build_status_payload(config: AppConfig, db: StateDB) -> dict[str, Any]:
     """The full GET /api/status shape - factored out so webapp/routes/ws.py
     can send the exact same payload as one `status_snapshot` message right
     after a websocket connects, without duplicating this assembly logic."""
-    now = datetime.now(UTC)
-    next_fire_at = croniter(config.sync.cron_expression, now).get_next(datetime)
+    next_fire_at = compute_next_fire_at(config.sync.cron_expression, config.sync.timezone)
 
     # Mappings store the RESOLVED budget id, but this field is rendered
     # straight into the dashboard's accounts table, where a raw UUID is

@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 from pathlib import Path
 from typing import Annotated, Literal
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import yaml
 from croniter import croniter
@@ -52,8 +53,17 @@ class AccountMapping(BaseModel):
 
 class SyncConfig(BaseModel):
     # A single cron expression rather than a fixed interval - nothing needs
-    # fetching overnight. Default: 06:00/08:00/10:00/12:00/16:00/20:00 daily.
+    # fetching overnight. Default: 06:00/08:00/10:00/12:00/16:00/20:00 daily,
+    # evaluated in `timezone` below (local wall-clock time, not UTC - see
+    # CLAUDE.md's "Resolved: cron ran in UTC, not local time").
     cron_expression: str = "0 6,8,10,12,16,20 * * *"
+    # IANA zone name cron_expression's hours are evaluated in. Defaults to
+    # Europe/Oslo since this project's only real deployment target is a
+    # Norwegian bank via SpareBank1 - was previously implicitly UTC with no
+    # way to express "local time" at all, which silently offset every fire
+    # by the local UTC offset (1-2h depending on DST). See src/ynab_auto_sync
+    # /cron.py, the single place this is actually evaluated.
+    timezone: str = "Europe/Oslo"
     lookback_overlap_hours: int = 72
     initial_backfill_days: int = 30
     # How long a BOOKED tracked_transactions row survives before it's
@@ -209,6 +219,13 @@ class AppConfig(BaseModel):
             errors.append(
                 f"sync.cron_expression '{self.sync.cron_expression}' is not a valid cron "
                 "expression"
+            )
+
+        try:
+            ZoneInfo(self.sync.timezone)
+        except (ZoneInfoNotFoundError, ValueError):
+            errors.append(
+                f"sync.timezone '{self.sync.timezone}' is not a recognized IANA timezone name"
             )
 
         fetch_horizon_days = self.sync.initial_backfill_days + math.ceil(

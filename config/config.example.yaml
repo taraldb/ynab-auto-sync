@@ -29,8 +29,11 @@ ynab:
 
 sync:
   # Single cron expression - no need to fetch overnight. Default fires at
-  # 06:00/08:00/10:00/12:00/16:00/20:00 daily.
+  # 06:00/08:00/10:00/12:00/16:00/20:00 daily, LOCAL wall-clock time in the
+  # `timezone` below - not UTC.
   cron_expression: "0 6,8,10,12,16,20 * * *"
+  # IANA zone name cron_expression's hours are evaluated in.
+  timezone: "Europe/Oslo"
   # How far back every cycle re-fetches, as a safety margin against late-settling
   # transactions and clock drift. YNAB's import_id dedup makes re-fetching safe.
   lookback_overlap_hours: 72

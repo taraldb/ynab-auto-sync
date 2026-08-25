@@ -7,11 +7,10 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from croniter import croniter
-
 from ynab_auto_sync.alerts.base import CycleStats, EventNotifier
 from ynab_auto_sync.api_response_logging import prune_old_logs
 from ynab_auto_sync.config import AppConfig
+from ynab_auto_sync.cron import next_fire_at
 from ynab_auto_sync.notifications.base import NotificationSink
 from ynab_auto_sync.providers.base import ProviderAuthRequiredError
 from ynab_auto_sync.sync.engine import ClassifiedCycle, SyncEngine
@@ -119,8 +118,7 @@ class Scheduler:
                 logger.exception("Error handling command %r", command)
 
     def _next_cron_fire_at(self) -> datetime:
-        now = datetime.now(UTC)
-        return croniter(self._config.sync.cron_expression, now).get_next(datetime)
+        return next_fire_at(self._config.sync.cron_expression, self._config.sync.timezone)
 
     def _seconds_until_next_fire(self) -> float:
         now = datetime.now(UTC)

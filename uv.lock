@@ -840,6 +840,7 @@ dependencies = [
     { name = "python-multipart" },
     { name = "pyyaml" },
     { name = "tenacity" },
+    { name = "tzdata" },
     { name = "uvicorn", extra = ["standard"] },
     { name = "workalendar" },
 ]
@@ -867,6 +868,7 @@ requires-dist = [
     { name = "respx", marker = "extra == 'dev'", specifier = ">=0.21" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.5" },
     { name = "tenacity", specifier = ">=8.4" },
+    { name = "tzdata", specifier = ">=2024.1" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.30" },
     { name = "workalendar", specifier = ">=17.0" },
 ]

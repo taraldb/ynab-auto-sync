@@ -17,3 +17,17 @@ def next_fire_at(cron_expression: str, timezone: str) -> datetime:
     """
     now = datetime.now(ZoneInfo(timezone))
     return croniter(cron_expression, now).get_next(datetime)
+
+
+def previous_fire_at(cron_expression: str, timezone: str) -> datetime:
+    """The most recent time cron_expression fired at or before now - the
+    mirror image of next_fire_at() above, using croniter's get_prev()
+    instead of get_next(). Used by scheduler.py at startup to detect
+    whether a scheduled fire was missed while the process wasn't running
+    (see "don't sync at startup unless a cron trigger was missed" in
+    CLAUDE.md).
+
+    Returns a timezone-aware datetime whose tzinfo is the given zone.
+    """
+    now = datetime.now(ZoneInfo(timezone))
+    return croniter(cron_expression, now).get_prev(datetime)

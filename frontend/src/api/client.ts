@@ -293,6 +293,19 @@ export async function syncNow(): Promise<SyncNowResponse> {
   return handleJson<SyncNowResponse>(res);
 }
 
+export interface PauseResponse {
+  paused: boolean;
+}
+
+export async function setPaused(paused: boolean): Promise<PauseResponse> {
+  const res = await fetch("/api/pause", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ paused }),
+  });
+  return handleJson<PauseResponse>(res);
+}
+
 export type LogLevel = "DEBUG" | "INFO" | "WARNING" | "ERROR" | "CRITICAL";
 
 export interface Settings {

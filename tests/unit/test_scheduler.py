@@ -530,6 +530,128 @@ async def test_sync_now_event_short_circuits_the_wait(tmp_path: Path):
     await asyncio.wait_for(task, timeout=2)
 
 
+async def test_startup_skips_immediate_sync_when_no_cron_fire_was_missed(
+    tmp_path: Path, monkeypatch
+):
+    # A last_run_at recorded just after the most recent scheduled fire
+    # (06:00 UTC) - nothing missed while the process was down, so startup
+    # must not sync immediately, only once the next cron fire (or a manual
+    # trigger) actually happens. Written directly via SQL rather than
+    # StateDB.record_success(), since that method stamps its own
+    # datetime.now(UTC) internally - unaffected by the FixedDatetime
+    # monkeypatches below, which only cover scheduler.py/cron.py's own
+    # imports.
+    config = make_config(cron_expression="0 6,8,10,12,16,20 * * *")
+    db = StateDB(tmp_path / "state.db")
+    db._conn.execute(
+        "UPDATE run_metadata SET last_run_at = ? WHERE id = 1",
+        ("2026-08-24T06:05:00+00:00",),
+    )
+    db._conn.commit()
+
+    class FixedDatetime(datetime):
+        _BASE = None
+
+        @classmethod
+        def now(cls, tz=None):
+            base = cls._BASE
+            return base.astimezone(tz) if tz else base
+
+    FixedDatetime._BASE = FixedDatetime(2026, 8, 24, 6, 30, 0, tzinfo=UTC)
+    monkeypatch.setattr("ynab_auto_sync.scheduler.datetime", FixedDatetime)
+    monkeypatch.setattr("ynab_auto_sync.cron.datetime", FixedDatetime)
+
+    engine = FakeEngine()
+    stop_event = asyncio.Event()
+    scheduler = Scheduler(config, engine, db, stop_event, NullSink(), NullNotifier())
+
+    task = asyncio.create_task(scheduler._run_loop())
+    await asyncio.sleep(0.05)
+    stop_event.set()
+    await asyncio.wait_for(task, timeout=2)
+
+    assert engine.call_count == 0  # no immediate sync - nothing was missed
+
+
+async def test_startup_syncs_immediately_when_a_cron_fire_was_missed(
+    tmp_path: Path, monkeypatch
+):
+    # last_run_at predates the most recent scheduled fire (06:00 UTC) - a
+    # fire was missed while the process was down, so startup should sync
+    # right away rather than waiting for the next one. See the previous
+    # test for why this is written directly via SQL.
+    config = make_config(cron_expression="0 6,8,10,12,16,20 * * *")
+    db = StateDB(tmp_path / "state.db")
+    db._conn.execute(
+        "UPDATE run_metadata SET last_run_at = ? WHERE id = 1",
+        ("2026-08-24T04:00:00+00:00",),
+    )
+    db._conn.commit()
+
+    class FixedDatetime(datetime):
+        _BASE = None
+
+        @classmethod
+        def now(cls, tz=None):
+            base = cls._BASE
+            return base.astimezone(tz) if tz else base
+
+    FixedDatetime._BASE = FixedDatetime(2026, 8, 24, 6, 30, 0, tzinfo=UTC)
+    monkeypatch.setattr("ynab_auto_sync.scheduler.datetime", FixedDatetime)
+    monkeypatch.setattr("ynab_auto_sync.cron.datetime", FixedDatetime)
+
+    engine = FakeEngine()
+    stop_event = asyncio.Event()
+    scheduler = Scheduler(config, engine, db, stop_event, NullSink(), NullNotifier())
+
+    task = asyncio.create_task(scheduler._run_loop())
+    await asyncio.sleep(0.05)
+    stop_event.set()
+    await asyncio.wait_for(task, timeout=2)
+
+    assert engine.call_count == 1  # the missed 06:00 fire is synced immediately
+
+
+async def test_startup_sync_check_only_applies_to_first_iteration(tmp_path: Path):
+    # Regression guard: after the startup decision, every later wake (here,
+    # via sync_now) must always cycle, never re-consult
+    # _missed_scheduled_fire().
+    config = make_config(cron_expression="0 0 1 1 *")  # next fire ~a year away
+    db = StateDB(tmp_path / "state.db")
+    await db.record_success({}, imported=0, updated=0, duplicates=0)  # nothing missed
+    engine = FakeEngine()
+    stop_event = asyncio.Event()
+    scheduler = Scheduler(config, engine, db, stop_event, NullSink(), NullNotifier())
+
+    task = asyncio.create_task(scheduler._run_loop())
+    await asyncio.sleep(0.05)
+    assert engine.call_count == 0  # skipped at startup - nothing missed
+
+    scheduler.request_sync_now()
+    await asyncio.sleep(0.05)
+    assert engine.call_count == 1  # manual trigger still works right after
+
+    stop_event.set()
+    await asyncio.wait_for(task, timeout=2)
+
+
+async def test_set_paused_writes_db_and_publishes_state(tmp_path: Path):
+    config = make_config()
+    db = StateDB(tmp_path / "state.db")
+    sink = FakeSink()
+    scheduler = Scheduler(config, FakeEngine(), db, asyncio.Event(), sink, NullNotifier())
+
+    await scheduler.set_paused(True)
+
+    assert db.read_paused() is True
+    assert ("state:paused", "ON") in sink.published
+
+    await scheduler.set_paused(False)
+
+    assert db.read_paused() is False
+    assert ("state:paused", "OFF") in sink.published
+
+
 async def test_run_uses_null_sink_end_to_end(tmp_path: Path):
     # A full run() cycle against NullSink, with no MQTT involved at all -
     # proves the scheduler doesn't secretly still depend on aiomqtt.

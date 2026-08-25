@@ -16,6 +16,7 @@ from ynab_auto_sync.webapp.routes import (
     deleted,
     file_import,
     mappings,
+    pause,
     providers,
     settings,
     status,
@@ -54,6 +55,7 @@ def create_app(
     app.include_router(deleted.router)
     app.include_router(file_import.router)
     app.include_router(mappings.router)
+    app.include_router(pause.router)
     app.include_router(providers.router)
     app.include_router(settings.router)
     app.include_router(sync_now.router)

@@ -10,7 +10,7 @@ from typing import Any
 from ynab_auto_sync.alerts.base import CycleStats, EventNotifier
 from ynab_auto_sync.api_response_logging import prune_old_logs
 from ynab_auto_sync.config import AppConfig
-from ynab_auto_sync.cron import next_fire_at
+from ynab_auto_sync.cron import next_fire_at, previous_fire_at
 from ynab_auto_sync.notifications.base import NotificationSink
 from ynab_auto_sync.providers.base import ProviderAuthRequiredError
 from ynab_auto_sync.sync.engine import ClassifiedCycle, SyncEngine
@@ -86,6 +86,15 @@ class Scheduler:
         available for the web UI to call directly later."""
         self._sync_now_event.set()
 
+    async def set_paused(self, paused: bool) -> None:
+        """Pause/resume scheduled syncing. Shared by MQTT's pause command
+        handling and the GUI's POST /api/pause route so the two can never
+        drift apart (same "factor out to avoid drift" reasoning as
+        cron.next_fire_at() being one shared implementation) - both the DB
+        write and the MQTT/HA state republish happen here exactly once."""
+        await self._db.set_paused(paused)
+        await self._sink.publish_state_value("paused", "ON" if paused else "OFF")
+
     async def run(self) -> None:
         async with self._sink:
             await self._sink.publish_status(self._db.read_run_metadata())
@@ -107,8 +116,7 @@ class Scheduler:
                 elif command.name == "pause":
                     paused = command.payload.strip().upper() == "ON"
                     logger.info("Received pause command: %s", paused)
-                    await self._db.set_paused(paused)
-                    await self._sink.publish_state_value("paused", "ON" if paused else "OFF")
+                    await self.set_paused(paused)
             except Exception:
                 # A single bad command must never kill this task - without
                 # this, an exception here (a transient publish failure, a DB
@@ -168,12 +176,47 @@ class Scheduler:
             # hours stale.
             self._clear_retry_state()
 
+    def _missed_scheduled_fire(self) -> bool:
+        """True when a cron fire happened while this process wasn't
+        running - i.e. the most recent scheduled fire time is after the
+        last recorded run attempt, or there's no recorded attempt at all
+        (a fresh install/state DB). Checked only once, on _run_loop's first
+        iteration, to decide whether startup should sync immediately or
+        just wait for the next natural fire - see CLAUDE.md's "don't sync
+        at startup unless a cron trigger was missed". Uses last_run_at (set
+        on both success and failure, see StateDB.record_success/
+        record_failure) rather than last_success_at - even a failed attempt
+        means that scheduled slot was already handled; retrying it is the
+        existing backoff mechanism's job, not startup's."""
+        last_run_at = self._db.read_run_metadata()["last_run_at"]
+        if last_run_at is None:
+            return True
+        last_run = datetime.fromisoformat(last_run_at)
+        previous_fire = previous_fire_at(
+            self._config.sync.cron_expression, self._config.sync.timezone
+        )
+        return previous_fire.astimezone(UTC) > last_run.astimezone(UTC)
+
     async def _run_loop(self) -> None:
+        startup = True
         while not self._stop_event.is_set():
-            if not self._db.read_paused():
-                await self._do_cycle()
-            else:
+            # Only ever evaluated on the very first iteration - short-circuit
+            # on `startup` means _missed_scheduled_fire() (a DB read plus a
+            # croniter call) isn't paid on every subsequent wake, and every
+            # later iteration keeps its pre-existing "always cycle when
+            # woken" behavior.
+            skip_startup_sync = startup and not self._missed_scheduled_fire()
+            startup = False
+
+            if self._db.read_paused():
                 logger.info("Sync paused - skipping scheduled cycle")
+            elif skip_startup_sync:
+                logger.info(
+                    "Startup: no cron fire was missed while the service was down - "
+                    "waiting for the next scheduled run instead of syncing immediately"
+                )
+            else:
+                await self._do_cycle()
 
             self._sync_now_event.clear()
             wait_stop = asyncio.create_task(self._stop_event.wait())

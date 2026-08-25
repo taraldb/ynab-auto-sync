@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import {
   ApiError,
   getSettings,
+  setPaused,
   syncNow,
   updateSettings,
   type LogLevel,
@@ -111,6 +112,8 @@ export default function Dashboard() {
   const [logLevel, setLogLevel] = useState<LogLevel | null>(null);
   const [logLevelSaving, setLogLevelSaving] = useState(false);
   const [logLevelError, setLogLevelError] = useState<string | null>(null);
+  const [pauseSaving, setPauseSaving] = useState(false);
+  const [pauseError, setPauseError] = useState<string | null>(null);
 
   useEffect(() => {
     getSettings()
@@ -137,6 +140,24 @@ export default function Dashboard() {
       );
     } finally {
       setLogLevelSaving(false);
+    }
+  }
+
+  async function handleTogglePaused(nextPaused: boolean) {
+    setPauseSaving(true);
+    setPauseError(null);
+    try {
+      await setPaused(nextPaused);
+    } catch (e) {
+      setPauseError(
+        e instanceof ApiError
+          ? e.detail
+          : e instanceof Error
+            ? e.message
+            : "Failed to update pause state",
+      );
+    } finally {
+      setPauseSaving(false);
     }
   }
 
@@ -217,19 +238,49 @@ export default function Dashboard() {
           </div>
         </div>
         <div className="flex flex-col items-start gap-2 sm:items-end">
-          <button
-            onClick={handleSyncNow}
-            disabled={syncNowState === "loading"}
-            className="inline-flex items-center gap-1.5 rounded-lg bg-sky-500/15 px-3 py-1.5 text-xs font-semibold text-sky-300 ring-1 ring-inset ring-sky-500/30 hover:bg-sky-500/25 disabled:cursor-not-allowed disabled:opacity-60"
-          >
-            {syncNowState === "loading" && (
-              <span className="h-3 w-3 animate-spin rounded-full border-2 border-sky-300/40 border-t-sky-300" />
+          <div className="flex items-center gap-2">
+            <button
+              onClick={handleSyncNow}
+              disabled={syncNowState === "loading"}
+              className="inline-flex items-center gap-1.5 rounded-lg bg-sky-500/15 px-3 py-1.5 text-xs font-semibold text-sky-300 ring-1 ring-inset ring-sky-500/30 hover:bg-sky-500/25 disabled:cursor-not-allowed disabled:opacity-60"
+            >
+              {syncNowState === "loading" && (
+                <span className="h-3 w-3 animate-spin rounded-full border-2 border-sky-300/40 border-t-sky-300" />
+              )}
+              {syncNowState === "requested" ? "Sync requested" : "Sync now"}
+            </button>
+            {rm.paused ? (
+              <button
+                onClick={() => void handleTogglePaused(false)}
+                disabled={pauseSaving}
+                className="inline-flex items-center gap-1.5 rounded-lg bg-emerald-500/15 px-3 py-1.5 text-xs font-semibold text-emerald-300 ring-1 ring-inset ring-emerald-500/30 hover:bg-emerald-500/25 disabled:cursor-not-allowed disabled:opacity-60"
+              >
+                {pauseSaving && (
+                  <span className="h-3 w-3 animate-spin rounded-full border-2 border-emerald-300/40 border-t-emerald-300" />
+                )}
+                Resume syncing
+              </button>
+            ) : (
+              <button
+                onClick={() => void handleTogglePaused(true)}
+                disabled={pauseSaving}
+                className="inline-flex items-center gap-1.5 rounded-lg bg-amber-500/15 px-3 py-1.5 text-xs font-semibold text-amber-300 ring-1 ring-inset ring-amber-500/30 hover:bg-amber-500/25 disabled:cursor-not-allowed disabled:opacity-60"
+              >
+                {pauseSaving && (
+                  <span className="h-3 w-3 animate-spin rounded-full border-2 border-amber-300/40 border-t-amber-300" />
+                )}
+                Pause syncing
+              </button>
             )}
-            {syncNowState === "requested" ? "Sync requested" : "Sync now"}
-          </button>
+          </div>
           {syncNowState === "error" && (
             <p className="max-w-[16rem] text-xs text-rose-400">
               {syncNowError}
+            </p>
+          )}
+          {pauseError && (
+            <p className="max-w-[16rem] text-xs text-rose-400">
+              {pauseError}
             </p>
           )}
           <div className="text-left sm:text-right">

@@ -25,11 +25,11 @@ SPAREBANK1 = SpareBank1Provider.type_name()
 
 
 def build_providers(
-    http_client: httpx.AsyncClient, token_store: TokenStore
+    http_client: httpx.AsyncClient, token_store: TokenStore, timezone: str = "Europe/Oslo"
 ) -> dict[str, Any]:
     """The provider map SyncEngine takes, wired the same way __main__ wires
     the real one."""
-    return {SPAREBANK1: SpareBank1Provider(http_client, token_store)}
+    return {SPAREBANK1: SpareBank1Provider(http_client, token_store, timezone)}
 
 
 def make_engine(
@@ -38,7 +38,9 @@ def make_engine(
     token_store: TokenStore,
     db: StateDB,
 ) -> SyncEngine:
-    return SyncEngine(config, http_client, db, build_providers(http_client, token_store))
+    return SyncEngine(
+        config, http_client, db, build_providers(http_client, token_store, config.sync.timezone)
+    )
 
 
 def seed_mappings_sync(db_path: Any, config: AppConfig) -> None:

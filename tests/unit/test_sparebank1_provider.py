@@ -32,7 +32,7 @@ def make_token_store(tmp_path: Path) -> TokenStore:
 
 
 def make_provider(tmp_path: Path, http_client: httpx.AsyncClient) -> SpareBank1Provider:
-    return SpareBank1Provider(http_client, make_token_store(tmp_path))
+    return SpareBank1Provider(http_client, make_token_store(tmp_path), "Europe/Oslo")
 
 
 def mock_transactions(txs: list[dict]) -> None:
@@ -222,9 +222,7 @@ async def test_unrecognized_account_key_is_skipped_and_logged(
 
     assert len(results) == 1
     assert results[0].tracking_key == "acct-1:nu-2"
-    assert any(
-        "unrecognized or missing accountKey" in record.message for record in caplog.records
-    )
+    assert any("unrecognized or missing accountKey" in record.message for record in caplog.records)
     assert any(record.levelno == logging.ERROR for record in caplog.records)
 
 
@@ -249,9 +247,7 @@ async def test_missing_account_key_field_is_skipped_and_logged(
             results = await provider.fetch(SINCE)
 
     assert results == []
-    assert any(
-        "unrecognized or missing accountKey" in record.message for record in caplog.records
-    )
+    assert any("unrecognized or missing accountKey" in record.message for record in caplog.records)
 
 
 @respx.mock
@@ -604,7 +600,9 @@ async def test_on_skip_called_for_each_malformed_row(tmp_path: Path):
     # Every malformed row still known to belong to acct-1 carries that
     # account_key through in its context, so the engine can attribute the
     # skip to an account for the Audit Log's account filter/column.
-    acct1_contexts = [ctx for reason, ctx in skipped if reason != "malformed: unrecognized or missing accountKey"]
+    acct1_contexts = [
+        ctx for reason, ctx in skipped if reason != "malformed: unrecognized or missing accountKey"
+    ]
     assert all(ctx.get("account_key") == "acct-1" for ctx in acct1_contexts)
 
 

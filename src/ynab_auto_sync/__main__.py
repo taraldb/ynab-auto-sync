@@ -71,8 +71,10 @@ def _build_providers(
             logger.info("Provider %r is disabled in config - not started", name)
             continue
         if provider_config.type == SpareBank1Provider.type_name():
-            token_store = TokenStore(JsonStateStore(token_store_path(STATE_DIR, name)), provider_config)
-            providers[name] = SpareBank1Provider(http_client, token_store)
+            token_store = TokenStore(
+                JsonStateStore(token_store_path(STATE_DIR, name)), provider_config
+            )
+            providers[name] = SpareBank1Provider(http_client, token_store, config.sync.timezone)
         else:  # pragma: no cover - unreachable while the union has one member
             raise ValueError(f"Unsupported provider type {provider_config.type!r} for {name!r}")
     return providers
@@ -206,8 +208,7 @@ async def main() -> None:
         notifier = _build_notifier(config)
         scheduler = Scheduler(config, engine, db, stop_event, sink, notifier, log_dir=STATE_DIR)
         logger.info(
-            "Starting ynab-auto-sync: %d account mapping(s), %d provider(s), "
-            "cron schedule '%s'",
+            "Starting ynab-auto-sync: %d account mapping(s), %d provider(s), cron schedule '%s'",
             len(db.list_mappings(enabled_only=True)),
             len(providers),
             config.sync.cron_expression,

@@ -67,8 +67,7 @@ def list_candidates(db: StateDB) -> None:
             f"    resolved at: {row['last_checked_at']} (previously re-added {row['readd_count']}x)\n"
         )
     print(
-        "Re-add one with: python scripts/readd_deleted_transaction.py "
-        "--tracking-key <tracking_key>"
+        "Re-add one with: python scripts/readd_deleted_transaction.py --tracking-key <tracking_key>"
     )
 
 
@@ -82,7 +81,9 @@ async def readd(config_path: str, state_dir: str, tracking_key: str) -> None:
 
     async with httpx.AsyncClient(timeout=30) as http_client:
         providers = {
-            SpareBank1Provider.type_name(): SpareBank1Provider(http_client, token_store)
+            SpareBank1Provider.type_name(): SpareBank1Provider(
+                http_client, token_store, config.sync.timezone
+            )
         }
         engine = SyncEngine(config, http_client, db, providers)
         try:
@@ -94,11 +95,13 @@ async def readd(config_path: str, state_dir: str, tracking_key: str) -> None:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     parser.add_argument(
         "--tracking-key",
         help="Tracking key to re-add (the sb1_transaction_id column, which despite "
-             "its name holds a tracking key from any source); omit to list candidates",
+        "its name holds a tracking key from any source); omit to list candidates",
     )
     parser.add_argument("--config", default="config/config.yaml")
     parser.add_argument("--state-dir", default="state")

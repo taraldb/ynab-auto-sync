@@ -148,9 +148,10 @@ class SpareBank1Provider(TransactionProvider):
     every structurally-parseable fetched row is normalized and returned.
     """
 
-    def __init__(self, http_client: httpx.AsyncClient, token_store: TokenStore):
+    def __init__(self, http_client: httpx.AsyncClient, token_store: TokenStore, timezone: str):
         self._http_client = http_client
         self._token_store = token_store
+        self._timezone = timezone
         self._accounts_cache: list[ProviderAccount] | None = None
         self._accounts_cached_at: datetime | None = None
 
@@ -236,11 +237,10 @@ class SpareBank1Provider(TransactionProvider):
         for account_key, sb1_txs in sb1_txs_by_account.items():
             for sb1_tx in sb1_txs:
                 try:
-                    tx_date = transform.get_transaction_date(sb1_tx)
+                    tx_date = transform.get_transaction_date(sb1_tx, self._timezone)
                 except MissingFieldError:
                     logger.error(
-                        "Skipping SpareBank1 transaction with no recognizable date "
-                        "field: %r",
+                        "Skipping SpareBank1 transaction with no recognizable date field: %r",
                         sb1_tx,
                     )
                     await report_skip(
@@ -254,8 +254,7 @@ class SpareBank1Provider(TransactionProvider):
                     tracking_key = transform.get_tracking_key(sb1_tx, account_key)
                 except MissingFieldError:
                     logger.error(
-                        "Skipping SpareBank1 transaction with no recognizable id "
-                        "field: %r",
+                        "Skipping SpareBank1 transaction with no recognizable id field: %r",
                         sb1_tx,
                     )
                     await report_skip(

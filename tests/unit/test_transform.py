@@ -113,14 +113,30 @@ def test_get_tracking_key_leaves_non_unique_id_unchanged_when_not_partition_pref
 
 
 def test_get_transaction_date_accepts_date_or_datetime_strings():
-    assert get_transaction_date({"date": "2026-08-20"}).isoformat() == "2026-08-20"
-    assert get_transaction_date({"bookingDate": "2026-08-21T00:00:00Z"}).isoformat() == "2026-08-21"
+    assert get_transaction_date({"date": "2026-08-20"}, "Europe/Oslo").isoformat() == "2026-08-20"
+    assert (
+        get_transaction_date({"bookingDate": "2026-08-21T00:00:00Z"}, "Europe/Oslo").isoformat()
+        == "2026-08-21"
+    )
 
 
 def test_get_transaction_date_accepts_epoch_milliseconds():
     # Confirmed via a live probe against a real SpareBank1 transaction:
-    # "date" is Unix epoch milliseconds, not an ISO string.
-    assert get_transaction_date({"date": 1787176800000}).isoformat() == "2026-08-19"
+    # "date" is Unix epoch milliseconds, not an ISO string - and it encodes
+    # LOCAL (Europe/Oslo) midnight for the transaction's real calendar day,
+    # not UTC midnight (see CLAUDE.md's "Resolved: SpareBank1 transaction
+    # dates were a day early"). 1787176800000 is Oslo-local midnight
+    # 2026-08-20 - truncating in UTC instead (the pre-fix bug) would give
+    # 2026-08-19, one day early.
+    assert get_transaction_date({"date": 1787176800000}, "Europe/Oslo").isoformat() == "2026-08-20"
+
+
+def test_get_transaction_date_real_kanelsnurren_transaction():
+    # Regression test pinning a real, live-confirmed transaction (see
+    # responses-dev/250820261943.json, nonUniqueId "2926243-708150808"):
+    # its CSV export confirms Kjøpsdato = 2026-08-24, and the pre-fix code
+    # (UTC truncation) returned 2026-08-23 - one day early.
+    assert get_transaction_date({"date": 1787522400000}, "Europe/Oslo").isoformat() == "2026-08-24"
 
 
 def test_transform_transaction_maps_expected_fields():
@@ -131,7 +147,9 @@ def test_transform_transaction_maps_expected_fields():
         "amount": -125.5,
         "description": "Kiwi Grünerløkka",
     }
-    result = transform_transaction(sb1_tx, ynab_account_id="ynab-acct-1", account_key="acct-1")
+    result = transform_transaction(
+        sb1_tx, ynab_account_id="ynab-acct-1", account_key="acct-1", timezone="Europe/Oslo"
+    )
 
     assert result["account_id"] == "ynab-acct-1"
     assert result["date"] == "2026-08-20"
@@ -151,7 +169,9 @@ def test_transform_transaction_prefers_remote_account_name_over_description():
         "description": "raw description",
         "remoteAccountName": "Rema 1000",
     }
-    result = transform_transaction(sb1_tx, ynab_account_id="ynab-acct-1", account_key="acct-1")
+    result = transform_transaction(
+        sb1_tx, ynab_account_id="ynab-acct-1", account_key="acct-1", timezone="Europe/Oslo"
+    )
     assert result["payee_name"] == "Rema 1000"
 
 
@@ -167,7 +187,9 @@ def test_transform_transaction_prefers_cleaned_description_over_raw_description(
         "description": "Zettle_*Micro Kaffi AS, Stavanger",
         "cleanedDescription": "Micro Kaffi AS, Stavanger",
     }
-    result = transform_transaction(sb1_tx, ynab_account_id="ynab-acct-1", account_key="acct-1")
+    result = transform_transaction(
+        sb1_tx, ynab_account_id="ynab-acct-1", account_key="acct-1", timezone="Europe/Oslo"
+    )
     assert result["payee_name"] == "Micro Kaffi AS, Stavanger"
     # Confirmed against 25 real transactions: once memo is derived from the
     # same cleanedDescription-preferring candidates payee uses, a
@@ -185,7 +207,9 @@ def test_transform_transaction_falls_back_to_description_without_remote_account_
         "amount": 10,
         "description": "PULS NORGE",
     }
-    result = transform_transaction(sb1_tx, ynab_account_id="ynab-acct-1", account_key="acct-1")
+    result = transform_transaction(
+        sb1_tx, ynab_account_id="ynab-acct-1", account_key="acct-1", timezone="Europe/Oslo"
+    )
     assert result["payee_name"] == "PULS NORGE"
     # Same single raw field backs both payee and memo here, so once memo
     # uses the same candidate preference as payee, they agree exactly and
@@ -202,7 +226,9 @@ def test_transform_transaction_preserves_memo_genuinely_different_from_payee():
         "remoteAccountName": "Kari Nordmann",
         "remittanceInformation": "KID 12345678901",
     }
-    result = transform_transaction(sb1_tx, ynab_account_id="ynab-acct-1", account_key="acct-1")
+    result = transform_transaction(
+        sb1_tx, ynab_account_id="ynab-acct-1", account_key="acct-1", timezone="Europe/Oslo"
+    )
     assert result["payee_name"] == "Kari Nordmann"
     assert result["memo"] == "KID 12345678901"
 
@@ -213,6 +239,7 @@ def test_transform_transaction_raises_on_missing_amount():
             {"id": "x", "nonUniqueId": "x", "date": "2026-08-20"},
             ynab_account_id="a",
             account_key="acct-1",
+            timezone="Europe/Oslo",
         )
 
 
@@ -254,7 +281,9 @@ def test_transform_transaction_is_uncleared_when_pending():
         "description": "Zettle_*Micro Kaffi AS",
         "bookingStatus": "PENDING",
     }
-    result = transform_transaction(sb1_tx, ynab_account_id="ynab-acct-1", account_key="acct-1")
+    result = transform_transaction(
+        sb1_tx, ynab_account_id="ynab-acct-1", account_key="acct-1", timezone="Europe/Oslo"
+    )
     assert result["cleared"] == "uncleared"
 
 
@@ -268,10 +297,14 @@ def test_transform_transaction_is_cleared_when_booked_or_missing_status():
     }
     no_status_tx = {"id": "sb1-tx-47", "nonUniqueId": "47", "date": "2026-08-20", "amount": -10}
     assert (
-        transform_transaction(booked_tx, ynab_account_id="a", account_key="acct-1")["cleared"]
+        transform_transaction(
+            booked_tx, ynab_account_id="a", account_key="acct-1", timezone="Europe/Oslo"
+        )["cleared"]
         == "cleared"
     )
     assert (
-        transform_transaction(no_status_tx, ynab_account_id="a", account_key="acct-1")["cleared"]
+        transform_transaction(
+            no_status_tx, ynab_account_id="a", account_key="acct-1", timezone="Europe/Oslo"
+        )["cleared"]
         == "cleared"
     )

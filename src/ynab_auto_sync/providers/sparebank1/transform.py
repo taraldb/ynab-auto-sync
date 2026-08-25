@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-from datetime import UTC, date, datetime
+from datetime import date, datetime
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from ynab_auto_sync.sync.import_ids import derive_import_id as shared_derive_import_id
 from ynab_auto_sync.sync.sanitize import clean_bank_text
@@ -82,8 +83,7 @@ def get_transaction_id(sb1_tx: dict[str, Any]) -> str:
     value = _get_first(sb1_tx, *ID_FIELD_CANDIDATES)
     if value is None:
         raise MissingFieldError(
-            f"No stable id field found among {ID_FIELD_CANDIDATES} in transaction: "
-            f"{sb1_tx!r}"
+            f"No stable id field found among {ID_FIELD_CANDIDATES} in transaction: {sb1_tx!r}"
         )
     return str(value)
 
@@ -129,7 +129,18 @@ def get_tracking_key(sb1_tx: dict[str, Any], account_key: str) -> str:
     return f"{account_key}:{raw_id}"
 
 
-def get_transaction_date(sb1_tx: dict[str, Any]) -> date:
+def get_transaction_date(sb1_tx: dict[str, Any], timezone: str) -> date:
+    """`timezone` is required, not defaulted - deliberately, so no call site
+    can silently fall back to UTC. Confirmed live (cross-referenced against
+    a real CSV export with separate Kjøpsdato/Posteringsdato columns) that
+    SpareBank1's epoch-ms `date` field encodes LOCAL (Europe/Oslo) midnight
+    for the transaction's real calendar date - truncating it in UTC rolls
+    every transaction back onto the previous calendar day, in every season,
+    since Oslo is always ahead of UTC. Pass config.sync.timezone here, the
+    same field cron.py::next_fire_at() already uses for local wall-clock
+    time - see CLAUDE.md's "Resolved: SpareBank1 transaction dates were a
+    day early" for the full incident writeup.
+    """
     value = _get_first(sb1_tx, *DATE_FIELD_CANDIDATES)
     if value is None:
         raise MissingFieldError(
@@ -138,7 +149,7 @@ def get_transaction_date(sb1_tx: dict[str, Any]) -> date:
     if isinstance(value, (int, float)):
         # Confirmed via a live probe: SpareBank1 returns Unix epoch
         # milliseconds here, not an ISO string.
-        return datetime.fromtimestamp(value / 1000, tz=UTC).date()
+        return datetime.fromtimestamp(value / 1000, tz=ZoneInfo(timezone)).date()
     # Accept either a full ISO datetime or a plain date string, in case a
     # different account/product type returns one.
     return date.fromisoformat(str(value)[:10])
@@ -233,14 +244,14 @@ def get_amount_milliunits(sb1_tx: dict[str, Any]) -> int:
 
 
 def transform_transaction(
-    sb1_tx: dict[str, Any], ynab_account_id: str, account_key: str
+    sb1_tx: dict[str, Any], ynab_account_id: str, account_key: str, timezone: str
 ) -> dict[str, Any]:
     """Map one SpareBank1 transaction dict to a YNAB transaction payload,
     including the deterministic import_id that is the primary no-duplicates
     safety net (see sync/engine.py).
     """
     sb1_id = get_tracking_key(sb1_tx, account_key)
-    tx_date = get_transaction_date(sb1_tx)
+    tx_date = get_transaction_date(sb1_tx, timezone)
     amount_milliunits = get_amount_milliunits(sb1_tx)
     payee_name = _extract_payee_name(sb1_tx)
     # Confirmed live against 25 real booked transactions: memo never once

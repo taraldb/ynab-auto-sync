@@ -15,3 +15,7 @@ def detect_transformer(headers: list[str]) -> TransformerBase | None:
         if cls.can_handle(headers):
             return cls()
     return None
+
+
+def list_transformer_names() -> list[str]:
+    return [cls.name() for cls in REGISTRY]

@@ -3,11 +3,16 @@ import {
   ApiError,
   getStatus,
   importFile,
+  listTransformers,
+  listYnabAccounts,
   type Account,
   type ImportResponse,
   type ImportRowStatus,
+  type TransformerInfo,
+  type YnabBudget,
 } from "../api/client";
 import { formatNok } from "../lib/format";
+import TransformerSettingsModal from "../components/TransformerSettingsModal";
 
 type Phase = "idle" | "previewing" | "previewed" | "confirming" | "committed";
 
@@ -36,6 +41,13 @@ export default function Import() {
   const [dragActive, setDragActive] = useState(false);
   const [accounts, setAccounts] = useState<Account[]>([]);
   const [accountsError, setAccountsError] = useState<string | null>(null);
+  const [transformers, setTransformers] = useState<TransformerInfo[]>([]);
+  const [budgets, setBudgets] = useState<YnabBudget[]>([]);
+  const [showTransformerSettings, setShowTransformerSettings] =
+    useState(false);
+  const [accountFilterAlias, setAccountFilterAlias] = useState<string | null>(
+    null,
+  );
   const inputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
@@ -56,12 +68,35 @@ export default function Import() {
     };
   }, []);
 
+  useEffect(() => {
+    let cancelled = false;
+    listTransformers()
+      .then((res) => {
+        if (!cancelled) setTransformers(res);
+      })
+      .catch(() => {
+        // Non-fatal: the transformer-defaults modal just shows stale/empty
+        // data. This is secondary to the core upload flow.
+      });
+    listYnabAccounts()
+      .then((res) => {
+        if (!cancelled) setBudgets(res);
+      })
+      .catch(() => {
+        // Non-fatal, same reasoning as above.
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
   function resetForNewFile(f: File | null) {
     setFile(f);
     setPreview(null);
     setFinal(null);
     setErrorDetail(null);
     setPhase("idle");
+    setAccountFilterAlias(null);
   }
 
   function handleFileList(files: FileList | null) {
@@ -90,6 +125,12 @@ export default function Import() {
             ? e.message
             : "Preview failed";
       setErrorDetail(detail);
+      if (e instanceof ApiError && e.transformer) {
+        const alias = transformers.find(
+          (t) => t.name === e.transformer,
+        )?.default_ynab_budget_alias;
+        if (alias) setAccountFilterAlias(alias);
+      }
       setPhase("idle");
     }
   }
@@ -114,6 +155,12 @@ export default function Import() {
             ? e.message
             : "Import failed";
       setErrorDetail(detail);
+      if (e instanceof ApiError && e.transformer) {
+        const alias = transformers.find(
+          (t) => t.name === e.transformer,
+        )?.default_ynab_budget_alias;
+        if (alias) setAccountFilterAlias(alias);
+      }
       setPhase("previewed");
     }
   }
@@ -124,19 +171,43 @@ export default function Import() {
     setFinal(null);
     setErrorDetail(null);
     setPhase("idle");
+    setAccountFilterAlias(null);
     if (inputRef.current) inputRef.current.value = "";
   }
 
   return (
+    <>
     <div className="space-y-6">
-      <div>
-        <h1 className="text-lg font-semibold text-slate-100">
-          Import from spreadsheet
-        </h1>
-        <p className="mt-0.5 text-sm text-slate-400">
-          Upload a bank export, preview how it will be classified, then
-          confirm to actually create transactions in YNAB.
-        </p>
+      <div className="flex items-start justify-between gap-3">
+        <div>
+          <h1 className="text-lg font-semibold text-slate-100">
+            Import from spreadsheet
+          </h1>
+          <p className="mt-0.5 text-sm text-slate-400">
+            Upload a bank export, preview how it will be classified, then
+            confirm to actually create transactions in YNAB.
+          </p>
+        </div>
+        <button
+          onClick={() => setShowTransformerSettings(true)}
+          className="inline-flex shrink-0 items-center gap-1.5 rounded-lg border border-slate-700 bg-slate-800/60 px-3 py-2 text-sm font-medium text-slate-400 hover:bg-slate-700/60 hover:text-slate-200"
+          title="Transformer defaults"
+        >
+          <svg
+            xmlns="http://www.w3.org/2000/svg"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth={1.5}
+            strokeLinecap="round"
+            strokeLinejoin="round"
+            className="h-4 w-4"
+          >
+            <path d="M12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6Z" />
+            <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09a1.65 1.65 0 0 0-1.08-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09a1.65 1.65 0 0 0 1.51-1.08 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1Z" />
+          </svg>
+          Transformer defaults
+        </button>
       </div>
 
       {/* Dropzone */}
@@ -211,7 +282,10 @@ export default function Import() {
             className="w-64 rounded-lg border border-slate-700 bg-slate-900/60 px-3 py-2 text-sm text-slate-200 focus:border-emerald-500 focus:outline-none focus:ring-1 focus:ring-emerald-500 disabled:cursor-not-allowed disabled:opacity-50"
           >
             <option value="">Auto-detect from file format</option>
-            {accounts.map((a) => (
+            {(accountFilterAlias
+              ? accounts.filter((a) => a.ynab_budget === accountFilterAlias)
+              : accounts
+            ).map((a) => (
               <option key={a.key} value={a.key}>
                 {a.display_name || a.key}
               </option>
@@ -220,6 +294,18 @@ export default function Import() {
           {accountsError && (
             <p className="text-xs text-amber-400">
               Couldn't load accounts: {accountsError}
+            </p>
+          )}
+          {accountFilterAlias && (
+            <p className="text-xs text-slate-500">
+              Showing accounts in {accountFilterAlias} only (default budget
+              for the detected transformer) —{" "}
+              <button
+                onClick={() => setAccountFilterAlias(null)}
+                className="underline hover:text-slate-300"
+              >
+                Show all
+              </button>
             </p>
           )}
         </div>
@@ -376,5 +462,18 @@ export default function Import() {
         </div>
       )}
     </div>
+    {showTransformerSettings && (
+      <TransformerSettingsModal
+        transformers={transformers}
+        budgets={budgets}
+        onUpdate={(updated) =>
+          setTransformers((prev) =>
+            prev.map((t) => (t.name === updated.name ? updated : t)),
+          )
+        }
+        onClose={() => setShowTransformerSettings(false)}
+      />
+    )}
+    </>
   );
 }

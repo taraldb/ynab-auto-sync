@@ -21,6 +21,7 @@ from ynab_auto_sync.webapp.routes import (
     settings,
     status,
     sync_now,
+    transformers,
     ws,
 )
 from ynab_auto_sync.ynab.client import YnabAccountsCache
@@ -59,6 +60,7 @@ def create_app(
     app.include_router(providers.router)
     app.include_router(settings.router)
     app.include_router(sync_now.router)
+    app.include_router(transformers.router)
     app.include_router(ws.router)
 
     # Mounted last, at the root path, so it only ever catches requests that

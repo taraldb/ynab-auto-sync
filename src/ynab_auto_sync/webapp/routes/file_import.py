@@ -42,7 +42,10 @@ def _resolve_account(
     ]
     if len(matches) == 1:
         return matches[0]
-    raise HTTPException(status_code=422, detail=import_messages.no_account_resolved())
+    raise HTTPException(
+        status_code=422,
+        detail={"message": import_messages.no_account_resolved(), "transformer": transformer_name},
+    )
 
 
 @router.post("/api/import")

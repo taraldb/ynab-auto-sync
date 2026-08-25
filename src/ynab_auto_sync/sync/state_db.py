@@ -69,6 +69,12 @@ CREATE TABLE IF NOT EXISTS payee_mappings (
     UNIQUE(ynab_budget_id, raw_payee_name)
 );
 
+CREATE TABLE IF NOT EXISTS transformer_default_budgets (
+    transformer_name TEXT PRIMARY KEY,
+    ynab_budget_id TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS audit_events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     occurred_at TEXT NOT NULL,
@@ -1010,6 +1016,42 @@ class StateDB:
             )
             self._conn.commit()
             return cursor.rowcount
+
+    # -- transformer_default_budgets ----------------------------------
+    #
+    # Per-transformer default YNAB budget setting, settable via the GUI.
+
+    def list_transformer_default_budgets(self) -> dict[str, str]:
+        """transformer_name -> ynab_budget_id for every transformer that has a
+        configured default. Missing key means no default set."""
+        rows = self._conn.execute(
+            "SELECT transformer_name, ynab_budget_id FROM transformer_default_budgets"
+        ).fetchall()
+        return {row["transformer_name"]: row["ynab_budget_id"] for row in rows}
+
+    async def set_transformer_default_budget(
+        self, transformer_name: str, ynab_budget_id: str
+    ) -> None:
+        async with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO transformer_default_budgets (transformer_name, ynab_budget_id, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(transformer_name) DO UPDATE SET
+                    ynab_budget_id = excluded.ynab_budget_id,
+                    updated_at = excluded.updated_at
+                """,
+                (transformer_name, ynab_budget_id, datetime.now(UTC).isoformat()),
+            )
+            self._conn.commit()
+
+    async def clear_transformer_default_budget(self, transformer_name: str) -> None:
+        async with self._lock:
+            self._conn.execute(
+                "DELETE FROM transformer_default_budgets WHERE transformer_name = ?",
+                (transformer_name,),
+            )
+            self._conn.commit()
 
     # -- audit_events -------------------------------------------------
     #

@@ -506,7 +506,71 @@ def test_import_no_account_resolved_returns_sarcastic_422(tmp_path: Path):
     )
 
     assert response.status_code == 422
-    assert len(response.json()["detail"]) > 0
+    detail = response.json()["detail"]
+    assert isinstance(detail, dict)
+    assert len(detail["message"]) > 0
+    assert detail["transformer"] == "Norwegian Bank"
+
+
+def test_list_transformers_reports_no_default_initially(tmp_path: Path):
+    client, _db = make_client(tmp_path)
+
+    response = client.get("/api/transformers")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert {"name": "Norwegian Bank", "default_ynab_budget_id": None, "default_ynab_budget_alias": None} in body
+
+
+def test_update_transformer_default_budget_round_trips(tmp_path: Path):
+    client, _db = make_client(tmp_path)
+
+    patch_response = client.patch(
+        "/api/transformers/Norwegian%20Bank",
+        json={"default_ynab_budget_id": "budget-1"},
+    )
+    assert patch_response.status_code == 200
+    assert patch_response.json() == {
+        "name": "Norwegian Bank",
+        "default_ynab_budget_id": "budget-1",
+        "default_ynab_budget_alias": "personal",
+    }
+
+    list_response = client.get("/api/transformers")
+    assert {
+        "name": "Norwegian Bank",
+        "default_ynab_budget_id": "budget-1",
+        "default_ynab_budget_alias": "personal",
+    } in list_response.json()
+
+    clear_response = client.patch(
+        "/api/transformers/Norwegian%20Bank",
+        json={"default_ynab_budget_id": None},
+    )
+    assert clear_response.status_code == 200
+    assert clear_response.json()["default_ynab_budget_id"] is None
+
+
+def test_update_transformer_default_budget_unknown_name_returns_404(tmp_path: Path):
+    client, _db = make_client(tmp_path)
+
+    response = client.patch(
+        "/api/transformers/Not%20A%20Real%20Transformer",
+        json={"default_ynab_budget_id": "budget-1"},
+    )
+
+    assert response.status_code == 404
+
+
+def test_update_transformer_default_budget_unknown_budget_returns_422(tmp_path: Path):
+    client, _db = make_client(tmp_path)
+
+    response = client.patch(
+        "/api/transformers/Norwegian%20Bank",
+        json={"default_ynab_budget_id": "not-a-real-budget"},
+    )
+
+    assert response.status_code == 422
 
 
 def test_import_explicit_account_override_takes_precedence(tmp_path: Path):

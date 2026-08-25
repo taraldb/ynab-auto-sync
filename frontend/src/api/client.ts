@@ -83,32 +83,51 @@ export interface ImportResponse {
   committed: boolean;
 }
 
+export interface TransformerInfo {
+  name: string;
+  default_ynab_budget_id: string | null;
+  default_ynab_budget_alias: string | null;
+}
+
 export class ApiError extends Error {
   status: number;
   detail: string;
+  transformer?: string;
 
-  constructor(status: number, detail: string) {
+  constructor(status: number, detail: string, transformer?: string) {
     super(detail);
     this.status = status;
     this.detail = detail;
+    this.transformer = transformer;
   }
 }
 
-async function extractDetail(res: Response): Promise<string> {
+async function extractDetail(
+  res: Response,
+): Promise<{ message: string; transformer?: string }> {
   try {
     const body = await res.json();
     if (body && typeof body.detail === "string") {
-      return body.detail;
+      return { message: body.detail };
     }
-    return JSON.stringify(body);
+    if (
+      body &&
+      body.detail &&
+      typeof body.detail === "object" &&
+      typeof body.detail.message === "string"
+    ) {
+      return { message: body.detail.message, transformer: body.detail.transformer };
+    }
+    return { message: JSON.stringify(body) };
   } catch {
-    return res.statusText || `Request failed with status ${res.status}`;
+    return { message: res.statusText || `Request failed with status ${res.status}` };
   }
 }
 
 async function handleJson<T>(res: Response): Promise<T> {
   if (!res.ok) {
-    throw new ApiError(res.status, await extractDetail(res));
+    const { message, transformer } = await extractDetail(res);
+    throw new ApiError(res.status, message, transformer);
   }
   return (await res.json()) as T;
 }
@@ -147,6 +166,23 @@ export async function importFile(
     body: form,
   });
   return handleJson<ImportResponse>(res);
+}
+
+export async function listTransformers(): Promise<TransformerInfo[]> {
+  const res = await fetch("/api/transformers");
+  return handleJson<TransformerInfo[]>(res);
+}
+
+export async function updateTransformerDefaultBudget(
+  name: string,
+  budgetId: string | null,
+): Promise<TransformerInfo> {
+  const res = await fetch(`/api/transformers/${encodeURIComponent(name)}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ default_ynab_budget_id: budgetId }),
+  });
+  return handleJson<TransformerInfo>(res);
 }
 
 export interface Mapping {
@@ -257,7 +293,8 @@ export async function updateMapping(
 export async function deleteMapping(id: number): Promise<void> {
   const res = await fetch(`/api/mappings/${id}`, { method: "DELETE" });
   if (!res.ok) {
-    throw new ApiError(res.status, await extractDetail(res));
+    const { message, transformer } = await extractDetail(res);
+    throw new ApiError(res.status, message, transformer);
   }
 }
 

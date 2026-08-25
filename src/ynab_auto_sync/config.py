@@ -99,6 +99,23 @@ class SyncConfig(BaseModel):
     # design and its known false-positive risk (no account-number
     # cross-check exists for this case, unlike transfer-matching).
     manual_match_window_days: int = 0
+    # Opt-in (False = disabled, the default - identical behavior to today).
+    # When True, PENDING SpareBank1 transactions on CREDITCARD accounts are
+    # imported immediately (uncleared, at their whole-kroner preauth amount)
+    # and fuzzy-correlated with their later-booked self via
+    # sync/pending_match.py, since SpareBank1 confirmed live to NOT preserve
+    # a stable id across a credit card transaction's own PENDING->BOOKED
+    # transition. Scoped to credit cards only - see CLAUDE.md's
+    # "PENDING-transaction import" section; a PENDING bank transfer has no
+    # usable per-transaction id at all (a shared sentinel nonUniqueId) and
+    # is never imported regardless of this flag.
+    pending_import_enabled: bool = False
+    # Amount tolerance (whole kroner) and date window (in match_window_unit's
+    # terms, shared with transfer/manual matching above) for
+    # sync/pending_match.py's fuzzy correlation. Only consulted when
+    # pending_import_enabled is True.
+    pending_import_amount_tolerance_kroner: float = 2.0
+    pending_import_date_window_days: int = 5
     # A failed cycle (provider fetch error, or a YNAB create/update call
     # failing) is retried with exponential backoff: base * 2**attempt,
     # capped at retry_backoff_max_seconds. scheduler.py stops scheduling

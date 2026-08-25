@@ -21,6 +21,12 @@ from ynab_auto_sync.sync.date_window import days_between
 from ynab_auto_sync.sync.file_import import dedup as file_dedup
 from ynab_auto_sync.sync.file_import.base import ImportedTransactionRow
 from ynab_auto_sync.sync.import_ids import derive_import_id, prefix_of
+from ynab_auto_sync.sync.pending_match import (
+    BookedCandidate,
+    PendingCandidate,
+    find_manual_match_tolerant,
+    find_pending_match,
+)
 from ynab_auto_sync.sync.state_db import StateDB, compute_since
 from ynab_auto_sync.sync.ynab_payload import build_create_payload
 from ynab_auto_sync.ynab import client as ynab_client
@@ -142,6 +148,29 @@ class _PendingUpdate:
 
 
 @dataclass
+class _PendingFuzzyUpdate:
+    """Same real-world effect as _PendingUpdate (a pending->booked amount
+    correction + cleared PATCH), but reached via sync/pending_match.py's
+    fuzzy correlation instead of exact tracking-key equality - see
+    _classify()'s "transitioned_fuzzy" outcome. Unlike _PendingUpdate,
+    old_tracking_key and new_tracking_key genuinely differ: the booked
+    observation's tracking key is NOT the same string as the pending
+    placeholder's (confirmed live - a credit card's PENDING nonUniqueId
+    bears no relation to its own creditCardIdentifiers.nonUniqueId once
+    BOOKED), so submit() must rekey the tracked row's primary key, not just
+    update it in place - see StateDB.rekey_pending_to_booked.
+    """
+
+    old_tracking_key: str
+    new_tracking_key: str
+    ynab_transaction_id: str
+    new_amount_milliunits: int
+    ynab_budget_id: str
+    provider_type: str
+    account_key: str
+
+
+@dataclass
 class _PendingManualMatch:
     """A fresh bank transaction matched against a pre-existing, manually-
     typed YNAB transaction (same account, exact amount, within
@@ -180,14 +209,20 @@ class ClassifiedCycle:
     failure (e.g. one budget's create_transactions succeeded, another's
     raised): every write submit() makes is naturally idempotent on retry -
     YNAB's import_id dedup (invariant 1) makes a resubmitted create a no-op
-    duplicate, and update_transactions' PATCH payloads are idempotent by
-    construction - so resubmitting the whole thing is always safe, never a
-    double-book risk.
+    duplicate, update_transactions' PATCH payloads are idempotent by
+    construction, and StateDB.rekey_pending_to_booked (see
+    fuzzy_updates_by_budget below) has its own explicit idempotent-retry
+    return value (None on a resubmit whose rekey already landed) - so
+    resubmitting the whole thing is always safe, never a double-book risk.
     """
 
     creates_by_budget: dict[str, list[_PendingCreate]]
     updates_by_budget: dict[str, list[_PendingUpdate]]
     matches_by_budget: dict[str, list[_PendingManualMatch]]
+    # Pending->booked transitions resolved via sync/pending_match.py's fuzzy
+    # correlation rather than exact tracking-key equality - see
+    # _classify()'s "transitioned_fuzzy" outcome and _PendingFuzzyUpdate.
+    fuzzy_updates_by_budget: dict[str, list[_PendingFuzzyUpdate]]
     account_last_synced: dict[str, str]
     mappings_count: int
     fetched_count: int
@@ -345,7 +380,10 @@ class SyncEngine:
         ynab_account_id: str,
         ynab_budget_id: str,
         manual_candidates: list[dict[str, Any]] | None = None,
-    ) -> tuple[str, _PendingCreate | _PendingUpdate | _PendingManualMatch | None]:
+        pending_candidates: list[PendingCandidate] | None = None,
+    ) -> tuple[
+        str, _PendingCreate | _PendingUpdate | _PendingFuzzyUpdate | _PendingManualMatch | None
+    ]:
         """Decide what one already-normalized transaction needs, by looking
         it up in local tracking. THE shared decision point for every source
         - a live provider poll and a file import both come through here, so
@@ -358,14 +396,66 @@ class SyncEngine:
         its candidate from this list in place, so two incoming transactions
         in the same cycle can't both claim it.
 
+        pending_candidates, when given and non-empty, is this transaction's
+        provider account's own locally-tracked still-PENDING rows (see
+        StateDB.list_pending_candidates and CLAUDE.md's "PENDING-transaction
+        import" section) - only consulted for a BOOKED ntx, since a fuzzy
+        pending->booked correlation only ever needs to happen once, when the
+        real transaction settles. A match is popped from this list in place,
+        same "can't be double-claimed within one cycle" contract as
+        manual_candidates.
+
         Returns ("new", create) | ("transitioned", update) |
-        ("matched_manual", match) | ("unchanged", None).
+        ("transitioned_fuzzy", fuzzy_update) | ("matched_manual", match) |
+        ("unchanged", None).
         """
         tracked = self._db.get_tracked(ntx.tracking_key)
 
         if tracked is None:
+            if ntx.booking_status == BookingStatus.BOOKED and pending_candidates:
+                fuzzy_match = find_pending_match(
+                    BookedCandidate(
+                        account_key=ntx.provider_account_id,
+                        date=ntx.date,
+                        amount_milliunits=ntx.amount_milliunits,
+                        payee=ntx.payee_name,
+                    ),
+                    pending_candidates,
+                    amount_tolerance_kroner=self._config.sync.pending_import_amount_tolerance_kroner,
+                    date_window_days=self._config.sync.pending_import_date_window_days,
+                    unit=self._config.sync.match_window_unit,
+                )
+                if fuzzy_match is not None:
+                    pending_candidates.remove(fuzzy_match.candidate)
+                    return "transitioned_fuzzy", _PendingFuzzyUpdate(
+                        old_tracking_key=fuzzy_match.candidate.tracking_key,
+                        new_tracking_key=ntx.tracking_key,
+                        ynab_transaction_id=fuzzy_match.candidate.ynab_transaction_id,
+                        new_amount_milliunits=ntx.amount_milliunits,
+                        ynab_budget_id=fuzzy_match.candidate.ynab_budget_id,
+                        provider_type=provider_type,
+                        account_key=ntx.provider_account_id,
+                    )
+
             if manual_candidates:
-                match = self._find_manual_match(ntx, manual_candidates)
+                if ntx.booking_status == BookingStatus.PENDING:
+                    # A PENDING transaction's amount is always whole kroner
+                    # (a preauth hold), so it will almost never exactly
+                    # match a hand-typed final decimal amount - use the
+                    # tolerant sibling instead of the exact matcher below.
+                    match = find_manual_match_tolerant(
+                        ntx.amount_milliunits,
+                        ntx.date,
+                        manual_candidates,
+                        amount_tolerance_kroner=(
+                            self._config.sync.pending_import_amount_tolerance_kroner
+                        ),
+                        date_window_days=self._config.sync.pending_import_date_window_days,
+                        unit=self._config.sync.match_window_unit,
+                        pending_payee=ntx.payee_name,
+                    )
+                else:
+                    match = self._find_manual_match(ntx, manual_candidates)
                 if match is not None:
                     manual_candidates.remove(match)
                     cleared = (
@@ -470,12 +560,19 @@ class SyncEngine:
         creates_by_budget: dict[str, list[_PendingCreate]] = defaultdict(list)
         updates_by_budget: dict[str, list[_PendingUpdate]] = defaultdict(list)
         matches_by_budget: dict[str, list[_PendingManualMatch]] = defaultdict(list)
+        fuzzy_updates_by_budget: dict[str, list[_PendingFuzzyUpdate]] = defaultdict(list)
         # Per-ynab_account_id cache of "not yet imported" YNAB transactions
         # (see ynab_client.list_unimported_transactions), populated lazily -
         # only the first time an account is touched this cycle, and never at
         # all when manual_match_window_days is 0 (the default) - so the
         # disabled/no-manual-entries case costs zero extra API calls.
         manual_candidates_cache: dict[str, list[dict[str, Any]]] = {}
+        # Per-provider-account (NOT ynab_account_id - tracked_transactions.
+        # account_key is the provider's own id) cache of this account's
+        # still-PENDING tracked rows, populated lazily and only when
+        # pending_import_enabled - so the disabled case costs zero extra DB
+        # queries, mirroring _get_manual_candidates' own gate exactly.
+        pending_candidates_cache: dict[str, list[PendingCandidate]] = {}
 
         async def _get_manual_candidates(
             ynab_account_id: str, ynab_budget_id: str
@@ -492,6 +589,25 @@ class SyncEngine:
                     )
                 )
             return manual_candidates_cache[ynab_account_id]
+
+        def _get_pending_candidates(provider_account_id: str) -> list[PendingCandidate]:
+            if not self._config.sync.pending_import_enabled:
+                return []
+            if provider_account_id not in pending_candidates_cache:
+                pending_candidates_cache[provider_account_id] = [
+                    PendingCandidate(
+                        index=i,
+                        tracking_key=row["sb1_transaction_id"],
+                        ynab_transaction_id=row["ynab_transaction_id"],
+                        ynab_budget_id=row["ynab_budget_id"],
+                        account_key=provider_account_id,
+                        amount_milliunits=row["amount_milliunits"],
+                        date=datetime.fromisoformat(row["first_seen_at"]).date(),
+                        payee=row["payee_name"] or "",
+                    )
+                    for i, row in enumerate(self._db.list_pending_candidates(provider_account_id))
+                ]
+            return pending_candidates_cache[provider_account_id]
 
         mapping_by_account: dict[tuple[str, str], dict[str, Any]] = {
             (m["provider"], m["provider_account_id"]): m for m in mappings
@@ -589,17 +705,21 @@ class SyncEngine:
                 manual_candidates = await _get_manual_candidates(
                     mapping["ynab_account_id"], mapping["ynab_budget_id"]
                 )
+                pending_candidates = _get_pending_candidates(ntx.provider_account_id)
                 outcome, pending = self._classify(
                     ntx,
                     provider_type=provider_type,
                     ynab_account_id=mapping["ynab_account_id"],
                     ynab_budget_id=mapping["ynab_budget_id"],
                     manual_candidates=manual_candidates,
+                    pending_candidates=pending_candidates,
                 )
                 if outcome == "new":
                     creates_by_budget[mapping["ynab_budget_id"]].append(pending)
                 elif outcome == "transitioned":
                     updates_by_budget[pending.ynab_budget_id].append(pending)
+                elif outcome == "transitioned_fuzzy":
+                    fuzzy_updates_by_budget[pending.ynab_budget_id].append(pending)
                 elif outcome == "matched_manual":
                     matches_by_budget[mapping["ynab_budget_id"]].append(pending)
                 # else: already tracked, status unchanged - nothing to do
@@ -622,6 +742,7 @@ class SyncEngine:
             creates_by_budget=creates_by_budget,
             updates_by_budget=updates_by_budget,
             matches_by_budget=matches_by_budget,
+            fuzzy_updates_by_budget=fuzzy_updates_by_budget,
             account_last_synced=account_last_synced,
             mappings_count=len(mappings),
             fetched_count=fetched_count,
@@ -702,6 +823,62 @@ class SyncEngine:
                     detail="pending → booked transition",
                 )
             total_updated += len(pending_updates)
+
+        # Same phase as the plain updates loop above (PATCH-only, no
+        # create) - the only difference is StateDB.rekey_pending_to_booked
+        # instead of mark_booked, since this outcome's tracking key changed
+        # (see _PendingFuzzyUpdate's docstring). Folded into total_updated,
+        # same "indistinguishable from an ordinary update" reasoning
+        # matched_manual below already uses for total_created.
+        for budget_id, pending_fuzzy in classified.fuzzy_updates_by_budget.items():
+            await _report(
+                on_progress,
+                "submitting",
+                {"budget_id": budget_id, "fuzzy_updates": len(pending_fuzzy)},
+            )
+            fuzzy_updates = [
+                {
+                    "id": p.ynab_transaction_id,
+                    "cleared": "cleared",
+                    "amount": p.new_amount_milliunits,
+                }
+                for p in pending_fuzzy
+            ]
+            await ynab_client.update_transactions(
+                self._http_client,
+                self._config.ynab.personal_access_token,
+                budget_id,
+                fuzzy_updates,
+            )
+            for p in pending_fuzzy:
+                previous = await self._db.rekey_pending_to_booked(
+                    p.old_tracking_key, p.new_tracking_key, p.new_amount_milliunits
+                )
+                if previous is None:
+                    # Already applied by a prior submit() attempt on this
+                    # same cached ClassifiedCycle (see rekey_pending_to_
+                    # booked's own idempotent-retry docstring) - no
+                    # double-count, no double audit event.
+                    continue
+                detail = "pending → booked (fuzzy-matched, tracking key changed)"
+                if previous["amount_milliunits"] != p.new_amount_milliunits:
+                    detail += (
+                        f": {previous['amount_milliunits'] / 1000:.2f} kr → "
+                        f"{p.new_amount_milliunits / 1000:.2f} kr"
+                    )
+                await self._db.insert_audit_event(
+                    event_type="updated",
+                    source=p.provider_type,
+                    account_key=p.account_key,
+                    tracking_key=p.new_tracking_key,
+                    import_id=previous["import_id"],
+                    ynab_transaction_id=p.ynab_transaction_id,
+                    ynab_budget_id=p.ynab_budget_id,
+                    payee_name=previous["payee_name"],
+                    amount_milliunits=p.new_amount_milliunits,
+                    detail=detail,
+                )
+            total_updated += len(pending_fuzzy)
 
         # Folded into total_created (not a separate CycleResult field): a
         # matched-and-replaced manual transaction results in exactly one

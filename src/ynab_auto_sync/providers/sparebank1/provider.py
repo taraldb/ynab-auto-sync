@@ -148,10 +148,20 @@ class SpareBank1Provider(TransactionProvider):
     every structurally-parseable fetched row is normalized and returned.
     """
 
-    def __init__(self, http_client: httpx.AsyncClient, token_store: TokenStore, timezone: str):
+    def __init__(
+        self,
+        http_client: httpx.AsyncClient,
+        token_store: TokenStore,
+        timezone: str,
+        pending_import_enabled: bool = False,
+    ):
         self._http_client = http_client
         self._token_store = token_store
         self._timezone = timezone
+        # Opt-in, off by default - see fetch()'s PENDING branch and
+        # CLAUDE.md's "PENDING-transaction import" section for why this is
+        # scoped to CREDITCARD accounts only, never bank transfers.
+        self._pending_import_enabled = pending_import_enabled
         self._accounts_cache: list[ProviderAccount] | None = None
         self._accounts_cached_at: datetime | None = None
 
@@ -197,6 +207,15 @@ class SpareBank1Provider(TransactionProvider):
             return []
 
         access_token = await self._token_store.ensure_valid_access_token(self._http_client)
+
+        # Only fetched when the toggle is on (zero extra calls otherwise) -
+        # list_accounts() is already TTL-cached, so this is normally a cache
+        # hit. Needed to scope PENDING import to CREDITCARD accounts only -
+        # see the PENDING branch below and CLAUDE.md's "PENDING-transaction
+        # import" section for why an allowlist, not a blocklist.
+        account_types: dict[str, str] = {}
+        if self._pending_import_enabled:
+            account_types = {a.provider_account_id: a.account_type for a in await self.list_accounts()}
 
         # One combined request covering every requested account, using the
         # earliest of all accounts' `since` values - confirmed live
@@ -281,29 +300,46 @@ class SpareBank1Provider(TransactionProvider):
                 status = transform.get_booking_status(sb1_tx)
                 if status == transform.BOOKING_STATUS_PENDING:
                     # SpareBank1's `amount` field is unreliable while a
-                    # transaction is still PENDING (confirmed by the user
-                    # against real data - a pending authorization amount can
-                    # differ from what the transaction actually books at).
-                    # Rather than import a value known to sometimes be wrong
-                    # and rely on the pending->booked transition (engine.py's
-                    # _classify "transitioned" branch) to correct it later -
-                    # which itself depends on an unproven hypothesis about
-                    # nonUniqueId stability across that transition, see
-                    # CLAUDE.md's "Known open risk" - PENDING rows are
-                    # skipped entirely and only imported once BOOKED, mirroring
-                    # the sibling project's (../ynab-auto-bank) approach to the
-                    # same hazard. The "transitioned" branch in engine.py is
-                    # kept for any already-tracked PENDING rows from before
-                    # this change; no new PENDING row will ever reach it going
-                    # forward.
-                    logger.debug(
-                        "Skipping PENDING SpareBank1 transaction (amount not final "
-                        "yet, will be imported once booked): %r",
-                        sb1_tx,
-                    )
-                    continue
+                    # transaction is still PENDING (a preauth/hold value
+                    # that can differ from what it actually books at) - see
+                    # CLAUDE.md's "PENDING-transaction import" section for
+                    # the full design. Two independent reasons a PENDING row
+                    # is still skipped even with pending_import_enabled=True:
+                    #
+                    # 1. Every pending bank-transfer row reports this exact
+                    #    sentinel as its nonUniqueId, regardless of which
+                    #    real transfer it is - confirmed live, not a guess.
+                    #    Importing it would let two unrelated pending
+                    #    transfers collide on the same tracking key. This
+                    #    check is UNCONDITIONAL, never gated by the toggle.
+                    if sb1_tx.get("nonUniqueId") == transform.PENDING_TRANSFER_SENTINEL_NON_UNIQUE_ID:
+                        logger.debug(
+                            "Skipping PENDING SpareBank1 transaction with the shared "
+                            "transfer sentinel id (not a usable per-transaction "
+                            "identifier): %r",
+                            sb1_tx,
+                        )
+                        continue
 
-                booking_status = BookingStatus.BOOKED
+                    # 2. Deliberately an allowlist (CREDITCARD only), not a
+                    #    blocklist of just the sentinel above - only
+                    #    credit-card PENDING ids have been confirmed unique
+                    #    across real data; every other account type is
+                    #    untested and stays skipped by default even when the
+                    #    toggle is on. Same "don't trust an unconfirmed
+                    #    typeCode" lesson invariant 8 already learned the
+                    #    hard way for transfer-matching.
+                    if not self._pending_import_enabled or account_types.get(account_key) != "CREDITCARD":
+                        logger.debug(
+                            "Skipping PENDING SpareBank1 transaction (amount not final "
+                            "yet, will be imported once booked): %r",
+                            sb1_tx,
+                        )
+                        continue
+
+                    booking_status = BookingStatus.PENDING
+                else:
+                    booking_status = BookingStatus.BOOKED
                 payee_name = _extract_payee_name(sb1_tx)
 
                 results.append(

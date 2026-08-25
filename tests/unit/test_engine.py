@@ -2639,3 +2639,589 @@ async def test_run_cycle_manual_match_working_days_toggle(tmp_path: Path):
     tracked = db.get_tracked("acct-1:tx-mm-5")
     assert tracked is not None
     assert tracked["ynab_transaction_id"] == "ynab-tx-replacement-5"
+
+
+# --- PENDING-transaction import (see CLAUDE.md's "PENDING-transaction
+# import" section) --------------------------------------------------------
+
+
+def _mock_creditcard_account(account_key: str = "acct-1") -> None:
+    respx.get(sb1_client.ACCOUNTS_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json={"accounts": [{"accountKey": account_key, "name": "Card", "type": "CREDITCARD"}]},
+        )
+    )
+
+
+@respx.mock
+async def test_run_cycle_creates_pending_placeholder_when_enabled(tmp_path: Path):
+    config = make_config()
+    config.sync.pending_import_enabled = True
+    token_store = make_token_store(tmp_path)
+    db = make_db(tmp_path)
+    await seed_mappings(db, config)
+
+    _mock_creditcard_account()
+    respx.get(sb1_client.TRANSACTIONS_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "transactions": [
+                    {
+                        "nonUniqueId": "111111111",
+                        "accountKey": "acct-1",
+                        "date": "2026-08-20",
+                        "amount": -79,
+                        "description": "MERCHANT ONE, LOC-A",
+                        "bookingStatus": "PENDING",
+                    }
+                ]
+            },
+        )
+    )
+    import_id = derive_import_id("acct-1:111111111")
+    respx.post(f"{ynab_client.BASE_URL}/{ynab_client.RESOURCE_PATH}/budget-1/transactions").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "data": {
+                    "transaction_ids": ["ynab-pending-1"],
+                    "duplicate_import_ids": [],
+                    "transactions": [
+                        {"id": "ynab-pending-1", "import_id": import_id, "amount": -79000}
+                    ],
+                }
+            },
+        )
+    )
+
+    async with httpx.AsyncClient() as http_client:
+        engine = make_engine(config, http_client, token_store, db)
+        result, _ = await engine.run_cycle()
+
+    assert result.created == 1
+    tracked = db.get_tracked("acct-1:111111111")
+    assert tracked is not None
+    assert tracked["booking_status"] == "PENDING"
+    assert tracked["cleared"] == "uncleared"
+    assert tracked["amount_milliunits"] == -79000
+
+
+@respx.mock
+async def test_run_cycle_pending_import_disabled_by_default_regression(tmp_path: Path):
+    # Deliberately does NOT mock ACCOUNTS_URL - if fetch() wrongly called
+    # list_accounts() with the toggle off, this test would fail with a
+    # respx routing error, proving the zero-extra-calls claim.
+    config = make_config()
+    assert config.sync.pending_import_enabled is False
+    token_store = make_token_store(tmp_path)
+    db = make_db(tmp_path)
+    await seed_mappings(db, config)
+
+    respx.get(sb1_client.TRANSACTIONS_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "transactions": [
+                    {
+                        "nonUniqueId": "111111111",
+                        "accountKey": "acct-1",
+                        "date": "2026-08-20",
+                        "amount": -79,
+                        "description": "MERCHANT ONE, LOC-A",
+                        "bookingStatus": "PENDING",
+                    }
+                ]
+            },
+        )
+    )
+
+    async with httpx.AsyncClient() as http_client:
+        engine = make_engine(config, http_client, token_store, db)
+        result, _ = await engine.run_cycle()
+
+    assert result.created == 0
+    assert db.get_tracked("acct-1:111111111") is None
+
+
+@respx.mock
+async def test_run_cycle_fuzzy_matches_pending_to_booked_across_different_tracking_keys(
+    tmp_path: Path,
+):
+    config = make_config()
+    config.sync.pending_import_enabled = True
+    token_store = make_token_store(tmp_path)
+    db = make_db(tmp_path)
+    await seed_mappings(db, config)
+
+    _mock_creditcard_account()
+
+    call_count = {"n": 0}
+
+    def transactions_side_effect(request):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            return httpx.Response(
+                200,
+                json={
+                    "transactions": [
+                        {
+                            "nonUniqueId": "111111111",
+                            "accountKey": "acct-1",
+                            "date": "2026-08-20",
+                            "amount": -79,
+                            "description": "MERCHANT ONE, LOC-A",
+                            "bookingStatus": "PENDING",
+                        }
+                    ]
+                },
+            )
+        # A different real-world observation of the SAME purchase, now
+        # booked - a completely different tracking key (confirmed live
+        # behavior, see CLAUDE.md), a decimal amount within tolerance, and
+        # a slightly-drifted payee (a trailing country suffix appended).
+        return httpx.Response(
+            200,
+            json={
+                "transactions": [
+                    {
+                        "creditCardIdentifiers": {"nonUniqueId": "222222222"},
+                        "nonUniqueId": "unused-when-cc-identifiers-present",
+                        "accountKey": "acct-1",
+                        "date": "2026-08-20",
+                        "amount": -79.1,
+                        "description": "MERCHANT ONE, LOC-A, NOR",
+                        "bookingStatus": "BOOKED",
+                    }
+                ]
+            },
+        )
+
+    respx.get(sb1_client.TRANSACTIONS_URL).mock(side_effect=transactions_side_effect)
+
+    pending_import_id = derive_import_id("acct-1:111111111")
+    create_route = respx.post(
+        f"{ynab_client.BASE_URL}/{ynab_client.RESOURCE_PATH}/budget-1/transactions"
+    ).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "data": {
+                    "transaction_ids": ["ynab-pending-1"],
+                    "duplicate_import_ids": [],
+                    "transactions": [
+                        {"id": "ynab-pending-1", "import_id": pending_import_id, "amount": -79000}
+                    ],
+                }
+            },
+        )
+    )
+    patch_route = respx.patch(
+        f"{ynab_client.BASE_URL}/{ynab_client.RESOURCE_PATH}/budget-1/transactions"
+    ).mock(return_value=httpx.Response(200, json={"data": {"transaction_ids": ["ynab-pending-1"]}}))
+
+    async with httpx.AsyncClient() as http_client:
+        engine = make_engine(config, http_client, token_store, db)
+        first_result, _ = await engine.run_cycle()
+        second_result, _ = await engine.run_cycle()
+
+    assert first_result.created == 1
+    assert second_result.created == 0
+    assert second_result.updated == 1
+    assert create_route.call_count == 1
+
+    sent_body = json.loads(patch_route.calls.last.request.content)
+    assert sent_body["transactions"] == [
+        {"id": "ynab-pending-1", "cleared": "cleared", "amount": -79100}
+    ]
+
+    assert db.get_tracked("acct-1:111111111") is None
+    tracked = db.get_tracked("acct-1:222222222")
+    assert tracked is not None
+    assert tracked["booking_status"] == "BOOKED"
+    assert tracked["amount_milliunits"] == -79100
+    assert tracked["ynab_transaction_id"] == "ynab-pending-1"
+
+
+@respx.mock
+async def test_run_cycle_fuzzy_transition_retry_safe(tmp_path: Path):
+    config = make_config()
+    config.sync.pending_import_enabled = True
+    token_store = make_token_store(tmp_path)
+    db = make_db(tmp_path)
+    await seed_mappings(db, config)
+    await db.upsert_tracked(
+        "acct-1:111111111",
+        import_id=derive_import_id("acct-1:111111111"),
+        ynab_transaction_id="ynab-pending-1",
+        ynab_budget_id="budget-1",
+        account_key="acct-1",
+        booking_status="PENDING",
+        amount_milliunits=-79000,
+        payee_name="MERCHANT ONE, LOC-A",
+    )
+
+    _mock_creditcard_account()
+    respx.get(sb1_client.TRANSACTIONS_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "transactions": [
+                    {
+                        "creditCardIdentifiers": {"nonUniqueId": "222222222"},
+                        "accountKey": "acct-1",
+                        "date": "2026-08-20",
+                        "amount": -79.1,
+                        "description": "MERCHANT ONE, LOC-A, NOR",
+                        "bookingStatus": "BOOKED",
+                    }
+                ]
+            },
+        )
+    )
+    respx.patch(f"{ynab_client.BASE_URL}/{ynab_client.RESOURCE_PATH}/budget-1/transactions").mock(
+        return_value=httpx.Response(200, json={"data": {"transaction_ids": ["ynab-pending-1"]}})
+    )
+
+    async with httpx.AsyncClient() as http_client:
+        engine = make_engine(config, http_client, token_store, db)
+        classified = await engine.fetch_and_classify()
+        first_result, _ = await engine.submit(classified)
+        second_result, _ = await engine.submit(classified)  # simulated retry
+
+    assert first_result.updated == 1
+    assert second_result.updated == 1  # counted per-call, but rekey itself is a no-op the 2nd time
+
+    tracked = db.get_tracked("acct-1:222222222")
+    assert tracked is not None
+    assert tracked["booking_status"] == "BOOKED"
+    assert tracked["amount_milliunits"] == -79100
+
+    events, _total = db.list_audit_events()
+    updated_events = [e for e in events if e["event_type"] == "updated"]
+    assert len(updated_events) == 1  # not double-written on the retry
+
+
+@respx.mock
+async def test_run_cycle_tolerant_manual_match_replaces_with_pending_transaction(tmp_path: Path):
+    config = make_config()
+    config.sync.pending_import_enabled = True
+    config.sync.manual_match_window_days = 3
+    token_store = make_token_store(tmp_path)
+    db = make_db(tmp_path)
+    await seed_mappings(db, config)
+
+    _mock_creditcard_account()
+    respx.get(sb1_client.TRANSACTIONS_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "transactions": [
+                    {
+                        "nonUniqueId": "333333333",
+                        "accountKey": "acct-1",
+                        "date": "2026-08-20",
+                        "amount": -218,
+                        "description": "MERCHANT ONE, LOC-A",
+                        "bookingStatus": "PENDING",
+                    }
+                ]
+            },
+        )
+    )
+    # Hand-typed by the user with the real decimal amount - not an exact
+    # match to the pending preauth's whole-kroner amount, but within
+    # tolerance, which is exactly why the tolerant matcher exists.
+    respx.get(_unimported_url("budget-1", "ynab-acct-1")).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "data": {
+                    "transactions": [
+                        {
+                            "id": "manual-6",
+                            "date": "2026-08-19",
+                            "amount": -218300,
+                            "payee_id": "payee-manual-6",
+                            "payee_name": "Merchant One",
+                            "category_id": "cat-1",
+                            "memo": None,
+                            "cleared": "cleared",
+                            "approved": True,
+                            "flag_color": None,
+                            "import_id": None,
+                            "deleted": False,
+                            "subtransactions": [],
+                        }
+                    ]
+                }
+            },
+        )
+    )
+    import_id = derive_import_id("acct-1:333333333")
+    respx.post(f"{ynab_client.BASE_URL}/{ynab_client.RESOURCE_PATH}/budget-1/transactions").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "data": {
+                    "transaction_ids": ["ynab-replacement-6"],
+                    "duplicate_import_ids": [],
+                    "transactions": [
+                        {"id": "ynab-replacement-6", "import_id": import_id, "amount": -218000}
+                    ],
+                }
+            },
+        )
+    )
+    delete_route = respx.delete(
+        f"{ynab_client.BASE_URL}/{ynab_client.RESOURCE_PATH}/budget-1/transactions/manual-6"
+    ).mock(
+        return_value=httpx.Response(
+            200, json={"data": {"transaction": {"id": "manual-6", "deleted": True}}}
+        )
+    )
+
+    async with httpx.AsyncClient() as http_client:
+        engine = make_engine(config, http_client, token_store, db)
+        result, _ = await engine.run_cycle()
+
+    assert result.created == 1
+    assert delete_route.called
+    tracked = db.get_tracked("acct-1:333333333")
+    assert tracked is not None
+    assert tracked["booking_status"] == "PENDING"
+    assert tracked["cleared"] == "uncleared"
+    # The replacement carries the BANK's own amount (the pending preauth),
+    # not the manual entry's amount - it's corrected to the real final
+    # amount once booked, same as any other pending placeholder.
+    assert tracked["amount_milliunits"] == -218000
+
+
+@respx.mock
+async def test_run_cycle_pending_manual_match_row_later_fuzzy_resolves_when_booked(
+    tmp_path: Path,
+):
+    """Chains the previous test's scenario into a second cycle to prove the
+    scenario-1 (self-created placeholder) / scenario-2 (tolerant-manual-
+    match placeholder) convergence actually works end-to-end: both kinds of
+    PENDING placeholder are found by the exact same list_pending_candidates
+    query and resolved by the exact same fuzzy matcher.
+    """
+    config = make_config()
+    config.sync.pending_import_enabled = True
+    config.sync.manual_match_window_days = 3
+    token_store = make_token_store(tmp_path)
+    db = make_db(tmp_path)
+    await seed_mappings(db, config)
+
+    _mock_creditcard_account()
+
+    tx_call_count = {"n": 0}
+
+    def transactions_side_effect(request):
+        tx_call_count["n"] += 1
+        if tx_call_count["n"] == 1:
+            return httpx.Response(
+                200,
+                json={
+                    "transactions": [
+                        {
+                            "nonUniqueId": "444444444",
+                            "accountKey": "acct-1",
+                            "date": "2026-08-20",
+                            "amount": -218,
+                            "description": "MERCHANT ONE, LOC-A",
+                            "bookingStatus": "PENDING",
+                        }
+                    ]
+                },
+            )
+        return httpx.Response(
+            200,
+            json={
+                "transactions": [
+                    {
+                        "creditCardIdentifiers": {"nonUniqueId": "555555555"},
+                        "accountKey": "acct-1",
+                        "date": "2026-08-20",
+                        "amount": -218.3,
+                        "description": "MERCHANT ONE, LOC-A, NOR",
+                        "bookingStatus": "BOOKED",
+                    }
+                ]
+            },
+        )
+
+    respx.get(sb1_client.TRANSACTIONS_URL).mock(side_effect=transactions_side_effect)
+
+    manual_call_count = {"n": 0}
+
+    def manual_side_effect(request):
+        manual_call_count["n"] += 1
+        if manual_call_count["n"] == 1:
+            return httpx.Response(
+                200,
+                json={
+                    "data": {
+                        "transactions": [
+                            {
+                                "id": "manual-7",
+                                "date": "2026-08-19",
+                                "amount": -218300,
+                                "payee_id": "payee-manual-7",
+                                "payee_name": "Merchant One",
+                                "category_id": "cat-1",
+                                "memo": None,
+                                "cleared": "cleared",
+                                "approved": True,
+                                "flag_color": None,
+                                "import_id": None,
+                                "deleted": False,
+                                "subtransactions": [],
+                            }
+                        ]
+                    }
+                },
+            )
+        # Already deleted last cycle - a real second poll would see nothing.
+        return httpx.Response(200, json={"data": {"transactions": []}})
+
+    respx.get(_unimported_url("budget-1", "ynab-acct-1")).mock(side_effect=manual_side_effect)
+
+    import_id = derive_import_id("acct-1:444444444")
+    respx.post(f"{ynab_client.BASE_URL}/{ynab_client.RESOURCE_PATH}/budget-1/transactions").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "data": {
+                    "transaction_ids": ["ynab-replacement-7"],
+                    "duplicate_import_ids": [],
+                    "transactions": [
+                        {
+                            "id": "ynab-replacement-7",
+                            "import_id": import_id,
+                            "amount": -218000,
+                            # YNAB resolves the submitted payee_id and echoes
+                            # its name back - the tracked row's payee_name
+                            # comes from THIS, not the request payload (see
+                            # _record_matched). Needed for cycle 2's fuzzy
+                            # payee-similarity check to have anything to
+                            # compare against.
+                            "payee_name": "MERCHANT ONE, LOC-A",
+                        }
+                    ],
+                }
+            },
+        )
+    )
+    respx.delete(
+        f"{ynab_client.BASE_URL}/{ynab_client.RESOURCE_PATH}/budget-1/transactions/manual-7"
+    ).mock(
+        return_value=httpx.Response(
+            200, json={"data": {"transaction": {"id": "manual-7", "deleted": True}}}
+        )
+    )
+    respx.patch(f"{ynab_client.BASE_URL}/{ynab_client.RESOURCE_PATH}/budget-1/transactions").mock(
+        return_value=httpx.Response(
+            200, json={"data": {"transaction_ids": ["ynab-replacement-7"]}}
+        )
+    )
+
+    async with httpx.AsyncClient() as http_client:
+        engine = make_engine(config, http_client, token_store, db)
+        first_result, _ = await engine.run_cycle()
+        second_result, _ = await engine.run_cycle()
+
+    assert first_result.created == 1
+    assert second_result.updated == 1
+    assert second_result.created == 0
+
+    assert db.get_tracked("acct-1:444444444") is None
+    tracked = db.get_tracked("acct-1:555555555")
+    assert tracked is not None
+    assert tracked["booking_status"] == "BOOKED"
+    assert tracked["ynab_transaction_id"] == "ynab-replacement-7"
+    assert tracked["amount_milliunits"] == -218300
+
+
+@respx.mock
+async def test_run_cycle_ambiguous_fuzzy_match_falls_through_to_new_create(tmp_path: Path):
+    config = make_config()
+    config.sync.pending_import_enabled = True
+    token_store = make_token_store(tmp_path)
+    db = make_db(tmp_path)
+    await seed_mappings(db, config)
+    # Two pending placeholders, same account, identical (normalized) payee
+    # text - both plausible, and payee similarity can't break the tie
+    # (both score 1.0 against the booked payee) - must not guess, matching
+    # this project's established "don't guess on ambiguity" stance.
+    await db.upsert_tracked(
+        "acct-1:aaa",
+        import_id=derive_import_id("acct-1:aaa"),
+        ynab_transaction_id="ynab-aaa",
+        ynab_budget_id="budget-1",
+        account_key="acct-1",
+        booking_status="PENDING",
+        amount_milliunits=-100000,
+        payee_name="MERCHANT ONE, LOC-A",
+    )
+    await db.upsert_tracked(
+        "acct-1:bbb",
+        import_id=derive_import_id("acct-1:bbb"),
+        ynab_transaction_id="ynab-bbb",
+        ynab_budget_id="budget-1",
+        account_key="acct-1",
+        booking_status="PENDING",
+        amount_milliunits=-101000,
+        payee_name="MERCHANT ONE, LOC-A",
+    )
+
+    _mock_creditcard_account()
+    respx.get(sb1_client.TRANSACTIONS_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "transactions": [
+                    {
+                        "creditCardIdentifiers": {"nonUniqueId": "ccc"},
+                        "accountKey": "acct-1",
+                        "date": "2026-08-20",
+                        "amount": -100.5,
+                        "description": "MERCHANT ONE, LOC-A",
+                        "bookingStatus": "BOOKED",
+                    }
+                ]
+            },
+        )
+    )
+    import_id = derive_import_id("acct-1:ccc")
+    respx.post(f"{ynab_client.BASE_URL}/{ynab_client.RESOURCE_PATH}/budget-1/transactions").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "data": {
+                    "transaction_ids": ["ynab-new-amb"],
+                    "duplicate_import_ids": [],
+                    "transactions": [
+                        {"id": "ynab-new-amb", "import_id": import_id, "amount": -100500}
+                    ],
+                }
+            },
+        )
+    )
+
+    async with httpx.AsyncClient() as http_client:
+        engine = make_engine(config, http_client, token_store, db)
+        result, _ = await engine.run_cycle()
+
+    assert result.created == 1
+    assert result.updated == 0
+
+    # Neither stale placeholder was touched - a stuck, visually-obvious
+    # uncleared entry, not a silently-wrong resolution.
+    assert db.get_tracked("acct-1:aaa")["booking_status"] == "PENDING"
+    assert db.get_tracked("acct-1:bbb")["booking_status"] == "PENDING"
+    tracked = db.get_tracked("acct-1:ccc")
+    assert tracked is not None
+    assert tracked["booking_status"] == "BOOKED"

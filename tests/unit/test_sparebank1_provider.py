@@ -31,8 +31,23 @@ def make_token_store(tmp_path: Path) -> TokenStore:
     return TokenStore(store, config)
 
 
-def make_provider(tmp_path: Path, http_client: httpx.AsyncClient) -> SpareBank1Provider:
-    return SpareBank1Provider(http_client, make_token_store(tmp_path), "Europe/Oslo")
+def make_provider(
+    tmp_path: Path,
+    http_client: httpx.AsyncClient,
+    pending_import_enabled: bool = False,
+) -> SpareBank1Provider:
+    return SpareBank1Provider(
+        http_client,
+        make_token_store(tmp_path),
+        "Europe/Oslo",
+        pending_import_enabled=pending_import_enabled,
+    )
+
+
+def mock_accounts(accounts: list[dict]) -> None:
+    respx.get(sb1_client.ACCOUNTS_URL).mock(
+        return_value=httpx.Response(200, json={"accounts": accounts})
+    )
 
 
 def mock_transactions(txs: list[dict]) -> None:
@@ -148,6 +163,109 @@ async def test_pending_transactions_are_skipped(tmp_path: Path, caplog: pytest.L
     assert len(results) == 1
     assert results[0].tracking_key == "acct-1:nu-booked"
     assert any("Skipping PENDING" in record.message for record in caplog.records)
+
+
+@respx.mock
+async def test_pending_skipped_by_default_even_on_creditcard_account(tmp_path: Path):
+    # Regression: pending_import_enabled defaults to False, so a PENDING
+    # row on a CREDITCARD account must still be skipped exactly like today,
+    # with zero behavior change for an install that never touches the
+    # config field.
+    mock_transactions(
+        [
+            {
+                "accountKey": "acct-cc",
+                "nonUniqueId": "nu-pending-99",
+                "date": "2026-08-20",
+                "amount": -79,
+                "description": "Coffee shop",
+                "bookingStatus": "PENDING",
+            }
+        ]
+    )
+    async with httpx.AsyncClient() as http_client:
+        provider = make_provider(tmp_path, http_client, pending_import_enabled=False)
+        results = await provider.fetch({"acct-cc": datetime(2020, 1, 1, tzinfo=UTC)})
+
+    assert results == []
+
+
+@respx.mock
+async def test_pending_credit_card_imported_when_enabled_and_account_is_creditcard(
+    tmp_path: Path,
+):
+    mock_accounts([{"accountKey": "acct-cc", "name": "Card", "type": "CREDITCARD"}])
+    mock_transactions(
+        [
+            {
+                "accountKey": "acct-cc",
+                "nonUniqueId": "nu-pending-99",
+                "date": "2026-08-20",
+                "amount": -79,
+                "description": "Coffee shop",
+                "bookingStatus": "PENDING",
+            }
+        ]
+    )
+    async with httpx.AsyncClient() as http_client:
+        provider = make_provider(tmp_path, http_client, pending_import_enabled=True)
+        results = await provider.fetch({"acct-cc": datetime(2020, 1, 1, tzinfo=UTC)})
+
+    assert len(results) == 1
+    assert results[0].tracking_key == "acct-cc:nu-pending-99"
+    assert results[0].booking_status == BookingStatus.PENDING
+    assert results[0].amount_milliunits == -79000
+
+
+@respx.mock
+async def test_pending_on_non_creditcard_account_skipped_even_when_enabled(tmp_path: Path):
+    # The allowlist scoping - pending_import_enabled=True must not widen
+    # import beyond CREDITCARD accounts, the one category confirmed safe.
+    mock_accounts([{"accountKey": "acct-1", "name": "Checking", "type": "USER"}])
+    mock_transactions(
+        [
+            {
+                "accountKey": "acct-1",
+                "nonUniqueId": "nu-pending-1",
+                "date": "2026-08-20",
+                "amount": -50,
+                "description": "some purchase",
+                "bookingStatus": "PENDING",
+            }
+        ]
+    )
+    async with httpx.AsyncClient() as http_client:
+        provider = make_provider(tmp_path, http_client, pending_import_enabled=True)
+        results = await provider.fetch({"acct-1": datetime(2020, 1, 1, tzinfo=UTC)})
+
+    assert results == []
+
+
+@respx.mock
+async def test_pending_transfer_sentinel_always_skipped_even_when_enabled(tmp_path: Path):
+    # Every PENDING bank-transfer row shares this exact sentinel id - a
+    # hard, unconditional skip regardless of the toggle, since two
+    # unrelated pending transfers would otherwise collide on the same
+    # tracking key.
+    mock_accounts([{"accountKey": "acct-1", "name": "Checking", "type": "USER"}])
+    mock_transactions(
+        [
+            {
+                "accountKey": "acct-1",
+                "nonUniqueId": "000000000000000000",
+                "typeCode": "R_914",
+                "date": "2026-08-20",
+                "amount": -700,
+                "description": "Overførsel",
+                "bookingStatus": "PENDING",
+            }
+        ]
+    )
+    async with httpx.AsyncClient() as http_client:
+        provider = make_provider(tmp_path, http_client, pending_import_enabled=True)
+        results = await provider.fetch({"acct-1": datetime(2020, 1, 1, tzinfo=UTC)})
+
+    assert results == []
 
 
 @respx.mock

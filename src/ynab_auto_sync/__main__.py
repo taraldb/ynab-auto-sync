@@ -74,7 +74,12 @@ def _build_providers(
             token_store = TokenStore(
                 JsonStateStore(token_store_path(STATE_DIR, name)), provider_config
             )
-            providers[name] = SpareBank1Provider(http_client, token_store, config.sync.timezone)
+            providers[name] = SpareBank1Provider(
+                http_client,
+                token_store,
+                config.sync.timezone,
+                pending_import_enabled=config.sync.pending_import_enabled,
+            )
         else:  # pragma: no cover - unreachable while the union has one member
             raise ValueError(f"Unsupported provider type {provider_config.type!r} for {name!r}")
     return providers

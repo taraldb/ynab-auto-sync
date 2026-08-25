@@ -366,6 +366,22 @@ class StateDB:
         ).fetchone()
         return dict(row) if row is not None else None
 
+    def get_tracked_by_ynab_transaction_id(self, ynab_transaction_id: str) -> dict[str, Any] | None:
+        """Fallback lookup for a row whose primary key (sb1_transaction_id)
+        may have changed since an older audit_events row was written - see
+        rekey_pending_to_booked below, the one place a tracked row's PK
+        changes mid-lifecycle. ynab_transaction_id never changes across
+        that rekey, so it's the stable key to fall back to. Used by
+        webapp/routes/audit.py when db.get_tracked(event["tracking_key"])
+        misses on a pre-rekey tracking_key still referenced by an older
+        event.
+        """
+        row = self._conn.execute(
+            "SELECT * FROM tracked_transactions WHERE ynab_transaction_id = ? LIMIT 1",
+            (ynab_transaction_id,),
+        ).fetchone()
+        return dict(row) if row is not None else None
+
     async def upsert_tracked(
         self,
         sb1_transaction_id: str,
@@ -520,6 +536,85 @@ class StateDB:
                     f"no tracked transaction for sb1_transaction_id={sb1_transaction_id!r}"
                 )
             self._conn.commit()
+
+    def list_pending_candidates(self, account_key: str) -> list[dict[str, Any]]:
+        """Every still-PENDING tracked row for one account - the candidate
+        pool sync/pending_match.py::find_pending_match() correlates a
+        freshly-fetched BOOKED transaction against, since its tracking key
+        won't match a PENDING row's own key (see rekey_pending_to_booked
+        below for why). Scoped by account_key only, same as
+        get_earliest_pending_first_seen above - tracked_transactions has
+        never been provider-qualified beyond that.
+        """
+        rows = self._conn.execute(
+            """
+            SELECT sb1_transaction_id, ynab_transaction_id, ynab_budget_id,
+                   amount_milliunits, first_seen_at, payee_name
+            FROM tracked_transactions
+            WHERE account_key = ? AND booking_status = 'PENDING'
+            """,
+            (account_key,),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    async def rekey_pending_to_booked(
+        self, old_tracking_key: str, new_tracking_key: str, new_amount_milliunits: int
+    ) -> dict[str, Any] | None:
+        """Fuzzy-matched pending->booked transition (sync/pending_match.py).
+        Unlike mark_booked above (same primary key, updated in place), this
+        changes the PRIMARY KEY itself: a fuzzy-matched booked observation
+        has a DIFFERENT tracking key than its pending observation (confirmed
+        live - a credit card's bare nonUniqueId while PENDING bears no
+        relation to creditCardIdentifiers.nonUniqueId once BOOKED). Without
+        this rekey, every future poll of the same real transaction would
+        compute the new key, find nothing tracked under it, and eventually
+        create a genuine duplicate once it's no longer a pending-candidate
+        match either - see CLAUDE.md's "PENDING-transaction import" section.
+
+        No FK constraints reference sb1_transaction_id (confirmed - this
+        project doesn't use SQLite foreign keys at all), so a PK-value
+        UPDATE is schema-safe. ynab_transaction_id is deliberately never
+        touched here - it's the same already-created YNAB transaction,
+        just getting an amount PATCH, exactly like mark_booked's own path.
+
+        Returns the row's full pre-update state (for the caller's audit-log
+        detail message - old amount/import_id/payee_name), or None if
+        old_tracking_key no longer exists but new_tracking_key already
+        reflects a completed BOOKED transition - an idempotent retry
+        (submit() may be called twice with the same cached ClassifiedCycle
+        after a prior partial failure, per ClassifiedCycle's own
+        docstring). Raises ValueError if neither condition holds (a genuine
+        bug, not a retry), mirroring mark_booked's own convention.
+        """
+        async with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM tracked_transactions WHERE sb1_transaction_id = ?",
+                (old_tracking_key,),
+            ).fetchone()
+            if row is None:
+                already = self._conn.execute(
+                    "SELECT 1 FROM tracked_transactions "
+                    "WHERE sb1_transaction_id = ? AND booking_status = 'BOOKED'",
+                    (new_tracking_key,),
+                ).fetchone()
+                if already is not None:
+                    return None
+                raise ValueError(
+                    f"no tracked transaction for sb1_transaction_id={old_tracking_key!r}"
+                )
+            previous = dict(row)
+            now_iso = datetime.now(UTC).isoformat()
+            self._conn.execute(
+                """
+                UPDATE tracked_transactions
+                SET sb1_transaction_id = ?, booking_status = 'BOOKED',
+                    amount_milliunits = ?, cleared = 'cleared', last_checked_at = ?
+                WHERE sb1_transaction_id = ?
+                """,
+                (new_tracking_key, new_amount_milliunits, now_iso, old_tracking_key),
+            )
+            self._conn.commit()
+            return previous
 
     async def prune_booked_transactions(self, cutoff_date: date) -> int:
         """Delete BOOKED tracked_transactions rows older than cutoff_date.

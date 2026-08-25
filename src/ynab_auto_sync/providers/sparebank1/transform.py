@@ -65,6 +65,18 @@ MEMO_FIELD_CANDIDATES = ("cleanedDescription", *DESCRIPTION_FIELD_CANDIDATES)
 BOOKING_STATUS_PENDING = "PENDING"
 BOOKING_STATUS_BOOKED = "BOOKED"
 
+# Confirmed live: every PENDING bank-transfer row (typeCode "R_914") reports
+# this exact literal as its `nonUniqueId`, regardless of which real transfer
+# it is - not a placeholder for one specific transfer, a shared sentinel
+# across ALL of them. get_tracking_key() has no way to tell two different
+# pending transfers apart when this is the only id present, so a caller
+# considering importing a PENDING row (see providers/sparebank1/provider.py's
+# pending_import_enabled) must check for and reject this value explicitly -
+# never trust it as a real per-transaction identifier. Credit-card PENDING
+# rows do not exhibit this: their bare nonUniqueId has been confirmed unique
+# across 9+ real transactions.
+PENDING_TRANSFER_SENTINEL_NON_UNIQUE_ID = "000000000000000000"
+
 
 class MissingFieldError(Exception):
     """Raised when none of the candidate field names are present on a

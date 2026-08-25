@@ -43,6 +43,29 @@ sync:
   # it's eligible for pruning. Must stay past initial_backfill_days +
   # lookback_overlap_hours (enforced at config-load time).
   retention_days: 270
+  # Max date difference (either direction) between two candidate legs still
+  # considered the same account-to-account transfer.
+  transfer_match_window_days: 4
+  # Shared by transfer_match_window_days above and manual_match_window_days/
+  # pending_import_date_window_days below. "working_days" excludes weekends
+  # and Norwegian public holidays.
+  match_window_unit: "calendar_days"
+  # Opt-in (0 = disabled, the default): days of slack to look for a
+  # pre-existing, manually-typed YNAB transaction with the exact same
+  # amount as an incoming bank transaction, before creating a new one.
+  manual_match_window_days: 0
+  # Opt-in (false = disabled, the default): import PENDING SpareBank1
+  # transactions on CREDITCARD accounts immediately (uncleared, at their
+  # whole-kroner preauth amount), fuzzy-correlated with their later-booked
+  # self. See CLAUDE.md's "PENDING-transaction import" section - scoped to
+  # credit cards only, never bank transfers.
+  pending_import_enabled: false
+  pending_import_amount_tolerance_kroner: 2.0
+  pending_import_date_window_days: 5
+  # A failed cycle is retried with exponential backoff: base * 2**attempt,
+  # capped at retry_backoff_max_seconds.
+  retry_backoff_base_seconds: 60
+  retry_backoff_max_seconds: 1800
 
 gui:
   enabled: true

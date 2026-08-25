@@ -219,6 +219,110 @@ async def test_mark_booked_sets_cleared_so_a_later_readd_restores_booked_not_pen
     assert tracked["cleared"] == "cleared"
 
 
+async def test_rekey_pending_to_booked_changes_pk_and_status(tmp_path: Path):
+    db = StateDB(tmp_path / "state.db")
+    await db.upsert_tracked(
+        "sb1-old",
+        import_id="import-1",
+        ynab_transaction_id="ynab-1",
+        ynab_budget_id="budget-1",
+        account_key="acct-cc",
+        booking_status="PENDING",
+        amount_milliunits=-79000,
+    )
+    previous = await db.rekey_pending_to_booked("sb1-old", "sb1-new", -79100)
+
+    assert previous is not None
+    assert previous["amount_milliunits"] == -79000
+    assert db.get_tracked("sb1-old") is None
+    tracked = db.get_tracked("sb1-new")
+    assert tracked is not None
+    assert tracked["booking_status"] == "BOOKED"
+    assert tracked["amount_milliunits"] == -79100
+    assert tracked["cleared"] == "cleared"
+    assert tracked["ynab_transaction_id"] == "ynab-1"
+
+
+async def test_rekey_pending_to_booked_idempotent_retry(tmp_path: Path):
+    db = StateDB(tmp_path / "state.db")
+    await db.upsert_tracked(
+        "sb1-old",
+        import_id="import-1",
+        ynab_transaction_id="ynab-1",
+        ynab_budget_id="budget-1",
+        account_key="acct-cc",
+        booking_status="PENDING",
+        amount_milliunits=-79000,
+    )
+    await db.rekey_pending_to_booked("sb1-old", "sb1-new", -79100)
+
+    second = await db.rekey_pending_to_booked("sb1-old", "sb1-new", -79100)
+    assert second is None
+    tracked = db.get_tracked("sb1-new")
+    assert tracked["booking_status"] == "BOOKED"
+    assert tracked["amount_milliunits"] == -79100
+
+
+async def test_rekey_pending_to_booked_raises_on_genuine_missing_key(tmp_path: Path):
+    db = StateDB(tmp_path / "state.db")
+    with pytest.raises(ValueError, match="sb1-old"):
+        await db.rekey_pending_to_booked("sb1-old", "sb1-new", -100)
+
+
+async def test_list_pending_candidates_scoped_to_account_and_pending_status(tmp_path: Path):
+    db = StateDB(tmp_path / "state.db")
+    await db.upsert_tracked(
+        "sb1-a-pending",
+        import_id="import-1",
+        ynab_transaction_id="ynab-1",
+        ynab_budget_id="budget-1",
+        account_key="acct-a",
+        booking_status="PENDING",
+        amount_milliunits=-10000,
+        payee_name="Merchant A",
+    )
+    await db.upsert_tracked(
+        "sb1-a-booked",
+        import_id="import-2",
+        ynab_transaction_id="ynab-2",
+        ynab_budget_id="budget-1",
+        account_key="acct-a",
+        booking_status="BOOKED",
+        amount_milliunits=-20000,
+    )
+    await db.upsert_tracked(
+        "sb1-b-pending",
+        import_id="import-3",
+        ynab_transaction_id="ynab-3",
+        ynab_budget_id="budget-1",
+        account_key="acct-b",
+        booking_status="PENDING",
+        amount_milliunits=-30000,
+    )
+
+    candidates = db.list_pending_candidates("acct-a")
+    assert len(candidates) == 1
+    assert candidates[0]["sb1_transaction_id"] == "sb1-a-pending"
+    assert candidates[0]["payee_name"] == "Merchant A"
+
+
+async def test_get_tracked_by_ynab_transaction_id(tmp_path: Path):
+    db = StateDB(tmp_path / "state.db")
+    await db.upsert_tracked(
+        "sb1-1",
+        import_id="import-1",
+        ynab_transaction_id="ynab-1",
+        ynab_budget_id="budget-1",
+        account_key="acct-1",
+        booking_status="BOOKED",
+        amount_milliunits=-10000,
+    )
+    tracked = db.get_tracked_by_ynab_transaction_id("ynab-1")
+    assert tracked is not None
+    assert tracked["sb1_transaction_id"] == "sb1-1"
+    assert db.get_tracked_by_ynab_transaction_id("ynab-unknown") is None
+
+
 async def test_upsert_tracked_stores_reconstruction_fields(tmp_path: Path):
     db = StateDB(tmp_path / "state.db")
     await db.upsert_tracked(

@@ -53,4 +53,12 @@ async def get_audit_event(
     if event is None:
         raise HTTPException(status_code=404, detail="audit event not found")
     tracked = db.get_tracked(event["tracking_key"]) if event["tracking_key"] else None
+    if tracked is None and event["ynab_transaction_id"]:
+        # A fuzzy pending->booked transition (see StateDB.
+        # rekey_pending_to_booked) changes a tracked row's primary key -
+        # an OLDER event still referencing the pre-rekey tracking_key would
+        # otherwise wrongly report "not currently tracked" even though the
+        # transaction is still tracked, just under a new key.
+        # ynab_transaction_id never changes across that rekey.
+        tracked = db.get_tracked_by_ynab_transaction_id(event["ynab_transaction_id"])
     return {"event": event, "tracked": tracked}

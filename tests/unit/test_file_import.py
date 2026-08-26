@@ -15,6 +15,7 @@ from ynab_auto_sync.sync.file_import.transformers import norwegian_bank  # noqa:
 from ynab_auto_sync.sync.file_import.transformers.norwegian_bank import (
     NorwegianBankTransformer,
 )
+from ynab_auto_sync.sync.money import from_milliunits
 
 FIXTURE_PATH = Path(__file__).parent.parent / "fixtures" / "norwegian_bank_sample.xlsx"
 
@@ -83,9 +84,9 @@ def test_transform_produces_expected_row_values():
     assert result == [
         ImportedTransactionRow(
             date=date(2025, 10, 29),
-            amount_milliunits=-119900,
+            amount=from_milliunits(-119900),
             payee_name="PAYPAL JAGEX LTD",  # sanitized: '*' separator replaced with a space
-            memo="VIDEO GAME ARCADES/ESTABLISH",
+            memo=None,  # memo is no longer populated from Merchant Category
             row_index=2,
         )
     ]
@@ -100,7 +101,7 @@ def test_transform_handles_positive_amount_and_missing_merchant_category():
     )
     result = NorwegianBankTransformer().transform([row])
 
-    assert result[0].amount_milliunits == 20099920
+    assert result[0].amount == from_milliunits(20099920)
     assert result[0].memo is None
 
 
@@ -168,7 +169,7 @@ def test_parse_file_round_trips_real_xlsx_fixture():
     assert len(transformed) == 5
     # Row 3 (index 4, 0-based) is the serial-number-date pending row.
     assert transformed[3].date == date(2025, 11, 20)
-    assert transformed[3].amount_milliunits == -304300
+    assert transformed[3].amount == from_milliunits(-304300)
     # Row 2 has no Merchant Category value in the fixture.
     assert transformed[2].memo is None
 

@@ -6,6 +6,7 @@ from collections import defaultdict
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
+from decimal import Decimal
 from typing import Any
 
 import httpx
@@ -21,6 +22,7 @@ from ynab_auto_sync.sync.date_window import days_between
 from ynab_auto_sync.sync.file_import import dedup as file_dedup
 from ynab_auto_sync.sync.file_import.base import ImportedTransactionRow
 from ynab_auto_sync.sync.import_ids import derive_import_id, prefix_of
+from ynab_auto_sync.sync.money import from_milliunits, to_milliunits
 from ynab_auto_sync.sync.pending_match import (
     BookedCandidate,
     PendingCandidate,
@@ -132,7 +134,7 @@ class _PendingCreate:
 class _PendingUpdate:
     tracking_key: str
     ynab_transaction_id: str
-    new_amount_milliunits: int
+    new_amount: Decimal
     # The budget the already-tracked transaction lives in, which is not
     # necessarily the mapping's current budget (a mapping can be re-pointed
     # after a transaction was already imported).
@@ -164,7 +166,7 @@ class _PendingFuzzyUpdate:
     old_tracking_key: str
     new_tracking_key: str
     ynab_transaction_id: str
-    new_amount_milliunits: int
+    new_amount: Decimal
     ynab_budget_id: str
     provider_type: str
     account_key: str
@@ -243,6 +245,10 @@ class ClassifiedCycle:
 class FileImportRowResult:
     row_index: int
     date: str
+    # int milliunits deliberately, not Decimal - this is the webapp JSON
+    # response boundary (routes/file_import.py), which stays int milliunits
+    # regardless of the Decimal domain type used internally. Derived via
+    # sync.money.to_milliunits() from the row's Decimal amount.
     amount_milliunits: int
     payee_name: str
     memo: str | None
@@ -369,7 +375,7 @@ class SyncEngine:
             c
             for c in candidates
             if not c.get("subtransactions")
-            and c.get("amount") == ntx.amount_milliunits
+            and c.get("amount") == to_milliunits(ntx.amount)
             and days_between(date.fromisoformat(c["date"]), ntx.date, unit) <= window_days
         ]
         if len(matches) == 1:
@@ -428,7 +434,7 @@ class SyncEngine:
                     BookedCandidate(
                         account_key=ntx.provider_account_id,
                         date=ntx.date,
-                        amount_milliunits=ntx.amount_milliunits,
+                        amount=ntx.amount,
                         payee=ntx.payee_name,
                     ),
                     pending_candidates,
@@ -442,7 +448,7 @@ class SyncEngine:
                         old_tracking_key=fuzzy_match.candidate.tracking_key,
                         new_tracking_key=ntx.tracking_key,
                         ynab_transaction_id=fuzzy_match.candidate.ynab_transaction_id,
-                        new_amount_milliunits=ntx.amount_milliunits,
+                        new_amount=ntx.amount,
                         ynab_budget_id=fuzzy_match.candidate.ynab_budget_id,
                         provider_type=provider_type,
                         account_key=ntx.provider_account_id,
@@ -471,7 +477,7 @@ class SyncEngine:
                     # match a hand-typed final decimal amount - use the
                     # tolerant sibling instead of the exact matcher below.
                     match = find_manual_match_tolerant(
-                        ntx.amount_milliunits,
+                        ntx.amount,
                         ntx.date,
                         manual_candidates,
                         amount_tolerance_kroner=(
@@ -502,7 +508,11 @@ class SyncEngine:
                         # scripts/verify_ynab_native_match_amount_
                         # sensitivity.py - see _PendingManualMatch's
                         # docstring) - the one lever _record_matched()'s
-                        # native-match branch depends on.
+                        # native-match branch depends on. match["amount"] is
+                        # already int milliunits (a raw YNAB API dict field,
+                        # see ynab_client.list_unimported_transactions) - no
+                        # Decimal conversion needed, this never derives from
+                        # ntx.amount at all.
                         "amount": match["amount"],
                         "category_id": match.get("category_id"),
                         "memo": match.get("memo"),
@@ -536,7 +546,7 @@ class SyncEngine:
             ynab_tx = build_create_payload(
                 ynab_account_id=ynab_account_id,
                 tx_date=ntx.date,
-                amount_milliunits=ntx.amount_milliunits,
+                amount_milliunits=to_milliunits(ntx.amount),
                 payee_name=ntx.payee_name,
                 memo=ntx.memo,
                 cleared=(
@@ -565,7 +575,7 @@ class SyncEngine:
             return "transitioned", _PendingUpdate(
                 tracking_key=ntx.tracking_key,
                 ynab_transaction_id=tracked["ynab_transaction_id"],
-                new_amount_milliunits=ntx.amount_milliunits,
+                new_amount=ntx.amount,
                 # Update where the transaction actually lives, which may
                 # not be the mapping's current budget.
                 ynab_budget_id=tracked["ynab_budget_id"],
@@ -649,7 +659,7 @@ class SyncEngine:
                         ynab_transaction_id=row["ynab_transaction_id"],
                         ynab_budget_id=row["ynab_budget_id"],
                         account_key=provider_account_id,
-                        amount_milliunits=row["amount_milliunits"],
+                        amount=Decimal(row["amount_decimal"]),
                         date=datetime.fromisoformat(row["first_seen_at"]).date(),
                         payee=row["payee_name"] or "",
                     )
@@ -726,7 +736,7 @@ class SyncEngine:
                         payee_name=ntx.payee_name,
                         memo=ntx.memo,
                         transaction_date=ntx.date.isoformat(),
-                        amount_milliunits=ntx.amount_milliunits,
+                        amount=ntx.amount,
                         detail=f"unmapped account: {provider_type}/{ntx.provider_account_id}",
                     )
                     continue
@@ -745,7 +755,7 @@ class SyncEngine:
                         payee_name=ntx.payee_name,
                         memo=ntx.memo,
                         transaction_date=ntx.date.isoformat(),
-                        amount_milliunits=ntx.amount_milliunits,
+                        amount=ntx.amount,
                         detail="stale: transaction date before this account's fetch window",
                     )
                     continue
@@ -851,7 +861,7 @@ class SyncEngine:
                 {
                     "id": p.ynab_transaction_id,
                     "cleared": "cleared",
-                    "amount": p.new_amount_milliunits,
+                    "amount": to_milliunits(p.new_amount),
                 }
                 for p in pending_updates
             ]
@@ -859,7 +869,7 @@ class SyncEngine:
                 self._http_client, self._config.ynab.personal_access_token, budget_id, updates
             )
             for p in pending_updates:
-                await self._db.mark_booked(p.tracking_key, p.new_amount_milliunits)
+                await self._db.mark_booked(p.tracking_key, p.new_amount)
                 await self._db.insert_audit_event(
                     event_type="updated",
                     source=p.provider_type,
@@ -867,7 +877,7 @@ class SyncEngine:
                     tracking_key=p.tracking_key,
                     ynab_transaction_id=p.ynab_transaction_id,
                     ynab_budget_id=p.ynab_budget_id,
-                    amount_milliunits=p.new_amount_milliunits,
+                    amount=p.new_amount,
                     detail="pending → booked transition",
                 )
             total_updated += len(pending_updates)
@@ -888,7 +898,7 @@ class SyncEngine:
                 {
                     "id": p.ynab_transaction_id,
                     "cleared": "cleared",
-                    "amount": p.new_amount_milliunits,
+                    "amount": to_milliunits(p.new_amount),
                 }
                 for p in pending_fuzzy
             ]
@@ -900,7 +910,7 @@ class SyncEngine:
             )
             for p in pending_fuzzy:
                 previous = await self._db.rekey_pending_to_booked(
-                    p.old_tracking_key, p.new_tracking_key, p.new_amount_milliunits
+                    p.old_tracking_key, p.new_tracking_key, p.new_amount
                 )
                 if previous is None:
                     # Already applied by a prior submit() attempt on this
@@ -909,11 +919,9 @@ class SyncEngine:
                     # double-count, no double audit event.
                     continue
                 detail = "pending → booked (fuzzy-matched, tracking key changed)"
-                if previous["amount_milliunits"] != p.new_amount_milliunits:
-                    detail += (
-                        f": {previous['amount_milliunits'] / 1000:.2f} kr → "
-                        f"{p.new_amount_milliunits / 1000:.2f} kr"
-                    )
+                previous_amount = Decimal(previous["amount_decimal"])
+                if previous_amount != p.new_amount:
+                    detail += f": {previous_amount:.2f} kr → {p.new_amount:.2f} kr"
                 await self._db.insert_audit_event(
                     event_type="updated",
                     source=p.provider_type,
@@ -923,7 +931,7 @@ class SyncEngine:
                     ynab_transaction_id=p.ynab_transaction_id,
                     ynab_budget_id=p.ynab_budget_id,
                     payee_name=previous["payee_name"],
-                    amount_milliunits=p.new_amount_milliunits,
+                    amount=p.new_amount,
                     detail=detail,
                 )
             total_updated += len(pending_fuzzy)
@@ -1025,7 +1033,7 @@ class SyncEngine:
                 ynab_budget_id=budget_id,
                 account_key=p.provider_account_id,
                 booking_status=p.booking_status,
-                amount_milliunits=p.ynab_tx["amount"],
+                amount=from_milliunits(p.ynab_tx["amount"]),
                 payee_name=resolved_payee_name,
                 memo=p.ynab_tx["memo"],
                 transaction_date=p.ynab_tx["date"],
@@ -1044,7 +1052,7 @@ class SyncEngine:
                 payee_name=resolved_payee_name,
                 memo=p.ynab_tx["memo"],
                 transaction_date=p.ynab_tx["date"],
-                amount_milliunits=p.ynab_tx["amount"],
+                amount=from_milliunits(p.ynab_tx["amount"]),
                 detail="transfer primary leg" if p.transfer_secondary is not None else None,
             )
             tracked_count += 1
@@ -1128,7 +1136,7 @@ class SyncEngine:
             ynab_budget_id=budget_id,
             account_key=secondary.provider_account_id,
             booking_status=secondary.booking_status,
-            amount_milliunits=secondary.ynab_tx["amount"],
+            amount=from_milliunits(secondary.ynab_tx["amount"]),
             payee_name=created_primary.get("payee_name"),
             memo=secondary.ynab_tx["memo"],
             transaction_date=secondary.ynab_tx["date"],
@@ -1147,7 +1155,7 @@ class SyncEngine:
             payee_name=created_primary.get("payee_name"),
             memo=secondary.ynab_tx["memo"],
             transaction_date=secondary.ynab_tx["date"],
-            amount_milliunits=secondary.ynab_tx["amount"],
+            amount=from_milliunits(secondary.ynab_tx["amount"]),
             detail="transfer secondary leg (auto-created by YNAB)",
         )
 
@@ -1278,7 +1286,7 @@ class SyncEngine:
                 ynab_budget_id=budget_id,
                 account_key=p.provider_account_id,
                 booking_status=p.booking_status,
-                amount_milliunits=p.ynab_tx["amount"],
+                amount=from_milliunits(p.ynab_tx["amount"]),
                 payee_name=shadow.get("payee_name"),
                 memo=p.ynab_tx["memo"],
                 transaction_date=p.ynab_tx["date"],
@@ -1300,7 +1308,7 @@ class SyncEngine:
                 payee_name=shadow.get("payee_name"),
                 memo=p.ynab_tx["memo"],
                 transaction_date=p.ynab_tx["date"],
-                amount_milliunits=p.ynab_tx["amount"],
+                amount=from_milliunits(p.ynab_tx["amount"]),
                 detail=(
                     f"natively linked to pre-existing manual transaction "
                     f"{p.original_transaction_id} (import_id anchored on hidden "
@@ -1316,7 +1324,7 @@ class SyncEngine:
                 ynab_budget_id=budget_id,
                 account_key=p.provider_account_id,
                 booking_status=p.booking_status,
-                amount_milliunits=p.ynab_tx["amount"],
+                amount=from_milliunits(p.ynab_tx["amount"]),
                 payee_name=shadow.get("payee_name"),
                 memo=p.ynab_tx["memo"],
                 transaction_date=p.ynab_tx["date"],
@@ -1335,7 +1343,7 @@ class SyncEngine:
                 payee_name=shadow.get("payee_name"),
                 memo=p.ynab_tx["memo"],
                 transaction_date=p.ynab_tx["date"],
-                amount_milliunits=p.ynab_tx["amount"],
+                amount=from_milliunits(p.ynab_tx["amount"]),
                 detail=(
                     f"matched & replaced pre-existing manual transaction "
                     f"{p.original_transaction_id}"
@@ -1427,7 +1435,7 @@ class SyncEngine:
                     # like one account and silently suppress a real match.
                     account_key=f"{p.provider_type}:{p.provider_account_id}",
                     date=date.fromisoformat(p.ynab_tx["date"]),
-                    amount_milliunits=p.ynab_tx["amount"],
+                    amount=from_milliunits(p.ynab_tx["amount"]),
                     account_number=p.account_number,
                     remote_account_number=p.remote_account_number,
                 )
@@ -1663,7 +1671,7 @@ class SyncEngine:
                     payee_name=p.ynab_tx.get("payee_name"),
                     memo=p.ynab_tx["memo"],
                     transaction_date=p.ynab_tx["date"],
-                    amount_milliunits=p.ynab_tx["amount"],
+                    amount=from_milliunits(p.ynab_tx["amount"]),
                     detail="already tracked (retry within same cycle)",
                 )
                 continue  # already tracked (e.g. a retry within the same cycle)
@@ -1682,7 +1690,7 @@ class SyncEngine:
                     ynab_budget_id=budget_id,
                     account_key=p.provider_account_id,
                     booking_status=p.booking_status,
-                    amount_milliunits=existing.get("amount", p.ynab_tx["amount"]),
+                    amount=from_milliunits(existing.get("amount", p.ynab_tx["amount"])),
                     payee_name=p.ynab_tx.get("payee_name"),
                     memo=p.ynab_tx["memo"],
                     transaction_date=p.ynab_tx["date"],
@@ -1701,7 +1709,7 @@ class SyncEngine:
                     payee_name=p.ynab_tx.get("payee_name"),
                     memo=p.ynab_tx["memo"],
                     transaction_date=p.ynab_tx["date"],
-                    amount_milliunits=existing.get("amount", p.ynab_tx["amount"]),
+                    amount=from_milliunits(existing.get("amount", p.ynab_tx["amount"])),
                     detail="recovered via find_transaction_by_import_id (local state was reset)",
                 )
                 continue
@@ -1724,7 +1732,7 @@ class SyncEngine:
                     ynab_budget_id=budget_id,
                     account_key=p.provider_account_id,
                     booking_status="DELETED",
-                    amount_milliunits=p.ynab_tx["amount"],
+                    amount=from_milliunits(p.ynab_tx["amount"]),
                     payee_name=p.ynab_tx.get("payee_name"),
                     memo=p.ynab_tx["memo"],
                     transaction_date=p.ynab_tx["date"],
@@ -1743,7 +1751,7 @@ class SyncEngine:
                     payee_name=p.ynab_tx.get("payee_name"),
                     memo=p.ynab_tx["memo"],
                     transaction_date=p.ynab_tx["date"],
-                    amount_milliunits=p.ynab_tx["amount"],
+                    amount=from_milliunits(p.ynab_tx["amount"]),
                     detail="resolved as previously deleted in YNAB",
                 )
                 resolved_deleted += 1
@@ -1851,8 +1859,14 @@ class SyncEngine:
         duplicate_ntxs: list[NormalizedTransaction] = []
 
         for row in rows:
+            # compute_dedup_key's hash input must stay byte-identical to
+            # what it hashed before this Decimal refactor - see
+            # sync/file_import/dedup.py's docstring and CLAUDE.md invariant
+            # 7. to_milliunits() is proven equivalent to the old
+            # round(float(amount) * 1000) path (see the dedup-key stability
+            # verification script), so this is safe.
             dedup_key = file_dedup.compute_dedup_key(
-                row.date, row.amount_milliunits, row.payee_name, row.memo
+                row.date, to_milliunits(row.amount), row.payee_name, row.memo
             )
             tracking_key = file_dedup.get_tracking_key(ynab_account_id, dedup_key)
 
@@ -1861,7 +1875,7 @@ class SyncEngine:
                 import_id=file_dedup.derive_import_id(tracking_key),
                 provider_account_id=account_key,
                 date=row.date,
-                amount_milliunits=row.amount_milliunits,
+                amount=row.amount,
                 payee_name=row.payee_name,
                 memo=row.memo,
                 booking_status=BookingStatus.BOOKED,
@@ -1891,7 +1905,7 @@ class SyncEngine:
                 FileImportRowResult(
                     row_index=row.row_index,
                     date=row.date.isoformat(),
-                    amount_milliunits=row.amount_milliunits,
+                    amount_milliunits=to_milliunits(row.amount),
                     payee_name=row.payee_name,
                     memo=row.memo,
                     status="new" if outcome == "new" else "duplicate",
@@ -1917,7 +1931,7 @@ class SyncEngine:
                     payee_name=dup_ntx.payee_name,
                     memo=dup_ntx.memo,
                     transaction_date=dup_ntx.date.isoformat(),
-                    amount_milliunits=dup_ntx.amount_milliunits,
+                    amount=dup_ntx.amount,
                     detail="already tracked (re-imported file row)",
                 )
 

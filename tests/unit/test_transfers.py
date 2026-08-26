@@ -1,5 +1,6 @@
 from datetime import date
 
+from ynab_auto_sync.sync.money import from_milliunits
 from ynab_auto_sync.sync.transfers import TransferCandidate, find_transfer_pairs
 
 
@@ -8,7 +9,7 @@ def c(index, account_key, day, amount, account_number=None, remote_account_numbe
         index=index,
         account_key=account_key,
         date=date(2026, 8, day),
-        amount_milliunits=amount,
+        amount=from_milliunits(amount),
         account_number=account_number,
         remote_account_number=remote_account_number,
     )

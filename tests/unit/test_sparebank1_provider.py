@@ -12,6 +12,7 @@ from ynab_auto_sync.providers.sparebank1 import client as sb1_client
 from ynab_auto_sync.providers.sparebank1.auth import TokenStore
 from ynab_auto_sync.providers.sparebank1.provider import SpareBank1Provider
 from ynab_auto_sync.state import JsonStateStore
+from ynab_auto_sync.sync.money import from_milliunits
 
 
 def make_token_store(tmp_path: Path) -> TokenStore:
@@ -214,7 +215,7 @@ async def test_pending_credit_card_imported_when_enabled_and_account_is_creditca
     assert len(results) == 1
     assert results[0].tracking_key == "acct-cc:nu-pending-99"
     assert results[0].booking_status == BookingStatus.PENDING
-    assert results[0].amount_milliunits == -79000
+    assert results[0].amount == from_milliunits(-79000)
 
 
 @respx.mock

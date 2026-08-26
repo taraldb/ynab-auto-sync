@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from decimal import Decimal
 from pathlib import Path
 from typing import Annotated, Literal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -114,8 +115,17 @@ class SyncConfig(BaseModel):
     # terms, shared with transfer/manual matching above) for
     # sync/pending_match.py's fuzzy correlation. Only consulted when
     # pending_import_enabled is True.
-    pending_import_amount_tolerance_kroner: float = 2.0
+    pending_import_amount_tolerance_kroner: Decimal = Decimal("2.0")
     pending_import_date_window_days: int = 5
+    # Decimal places this deployment's bank data uses (2 for NOK øre) - used
+    # only when parsing a provider's raw amount into an exact Decimal (see
+    # sync/money.py's parse_provider_amount). Does NOT change internal
+    # storage precision, which is always 3 decimal places to match YNAB's own
+    # milliunits granularity regardless of currency. A single global knob,
+    # not per-provider - there's no second-currency provider today to
+    # justify more (see CLAUDE.md's "No currency-mismatch handling"
+    # non-goal); a future non-NOK provider can set this per-deployment.
+    currency_decimal_places: int = 2
     # A failed cycle (provider fetch error, or a YNAB create/update call
     # failing) is retried with exponential backoff: base * 2**attempt,
     # capped at retry_backoff_max_seconds. scheduler.py stops scheduling

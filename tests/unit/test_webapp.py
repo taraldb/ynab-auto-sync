@@ -22,6 +22,7 @@ from ynab_auto_sync.providers.base import (
 from ynab_auto_sync.providers.sparebank1.auth import TokenStore
 from ynab_auto_sync.providers.sparebank1.transform import derive_import_id
 from ynab_auto_sync.state import JsonStateStore
+from ynab_auto_sync.sync.money import from_milliunits
 from ynab_auto_sync.sync.state_db import StateDB
 from ynab_auto_sync.webapp.app import create_app
 from ynab_auto_sync.ynab import client as ynab_client
@@ -149,7 +150,7 @@ async def test_list_deleted_transactions_returns_rows(tmp_path: Path):
         ynab_budget_id="budget-1",
         account_key="acct-1",
         booking_status="DELETED",
-        amount_milliunits=-1000,
+        amount=from_milliunits(-1000),
         payee_name="Some Shop",
     )
 
@@ -172,7 +173,7 @@ async def test_readd_deleted_transaction_success(tmp_path: Path):
         ynab_budget_id="budget-1",
         account_key="acct-1",
         booking_status="DELETED",
-        amount_milliunits=-1000,
+        amount=from_milliunits(-1000),
         payee_name="Some Shop",
         transaction_date="2026-08-20",
         ynab_account_id="ynab-acct-1",
@@ -330,7 +331,7 @@ async def test_get_audit_event_with_tracked_join(tmp_path: Path):
         tracking_key=tracking_key,
         account_key="acct-1",
         payee_name="Test Shop",
-        amount_milliunits=-5000,
+        amount=from_milliunits(-5000),
     )
     await db.upsert_tracked(
         tracking_key,
@@ -339,7 +340,7 @@ async def test_get_audit_event_with_tracked_join(tmp_path: Path):
         ynab_budget_id="budget-1",
         account_key="acct-1",
         booking_status="BOOKED",
-        amount_milliunits=-5000,
+        amount=from_milliunits(-5000),
         payee_name="Test Shop",
     )
 
@@ -777,7 +778,7 @@ async def test_list_mappings_reports_tracked_count(tmp_path: Path):
         ynab_budget_id="budget-1",
         account_key="acct-1",
         booking_status="BOOKED",
-        amount_milliunits=-1000,
+        amount=from_milliunits(-1000),
     )
 
     response = client.get("/api/mappings")

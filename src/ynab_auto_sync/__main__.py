@@ -79,6 +79,7 @@ def _build_providers(
                 token_store,
                 config.sync.timezone,
                 pending_import_enabled=config.sync.pending_import_enabled,
+                decimal_places=config.sync.currency_decimal_places,
             )
         else:  # pragma: no cover - unreachable while the union has one member
             raise ValueError(f"Unsupported provider type {provider_config.type!r} for {name!r}")

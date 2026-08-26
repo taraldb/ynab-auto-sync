@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 
+from ynab_auto_sync.sync.money import from_milliunits
 from ynab_auto_sync.sync.state_db import MappingValidationError, StateDB, compute_since
 
 
@@ -133,7 +134,7 @@ async def test_upsert_tracked_then_get_tracked(tmp_path: Path):
         ynab_budget_id="budget-1",
         account_key="acct-1",
         booking_status="PENDING",
-        amount_milliunits=-15000,
+        amount=from_milliunits(-15000),
     )
     tracked = db.get_tracked("sb1-1")
     assert tracked is not None
@@ -157,7 +158,7 @@ async def test_upsert_tracked_twice_preserves_first_seen_at(tmp_path: Path):
         ynab_budget_id="budget-1",
         account_key="acct-1",
         booking_status="PENDING",
-        amount_milliunits=-15000,
+        amount=from_milliunits(-15000),
     )
     first = db.get_tracked("sb1-1")
 
@@ -168,7 +169,7 @@ async def test_upsert_tracked_twice_preserves_first_seen_at(tmp_path: Path):
         ynab_budget_id="budget-1",
         account_key="acct-1",
         booking_status="BOOKED",
-        amount_milliunits=-15500,
+        amount=from_milliunits(-15500),
     )
     second = db.get_tracked("sb1-1")
 
@@ -186,9 +187,9 @@ async def test_mark_booked_flips_status_and_amount(tmp_path: Path):
         ynab_budget_id="budget-1",
         account_key="acct-1",
         booking_status="PENDING",
-        amount_milliunits=-15000,
+        amount=from_milliunits(-15000),
     )
-    await db.mark_booked("sb1-1", -15250)
+    await db.mark_booked("sb1-1", from_milliunits(-15250))
     tracked = db.get_tracked("sb1-1")
     assert tracked["booking_status"] == "BOOKED"
     assert tracked["amount_milliunits"] == -15250
@@ -197,7 +198,7 @@ async def test_mark_booked_flips_status_and_amount(tmp_path: Path):
 async def test_mark_booked_raises_on_unknown_id(tmp_path: Path):
     db = StateDB(tmp_path / "state.db")
     with pytest.raises(ValueError, match="sb1-unknown"):
-        await db.mark_booked("sb1-unknown", -100)
+        await db.mark_booked("sb1-unknown", from_milliunits(-100))
 
 
 async def test_mark_booked_sets_cleared_so_a_later_readd_restores_booked_not_pending(
@@ -211,10 +212,10 @@ async def test_mark_booked_sets_cleared_so_a_later_readd_restores_booked_not_pen
         ynab_budget_id="budget-1",
         account_key="acct-1",
         booking_status="PENDING",
-        amount_milliunits=-15000,
+        amount=from_milliunits(-15000),
         cleared="uncleared",
     )
-    await db.mark_booked("sb1-1", -15250)
+    await db.mark_booked("sb1-1", from_milliunits(-15250))
     tracked = db.get_tracked("sb1-1")
     assert tracked["cleared"] == "cleared"
 
@@ -228,9 +229,9 @@ async def test_rekey_pending_to_booked_changes_pk_and_status(tmp_path: Path):
         ynab_budget_id="budget-1",
         account_key="acct-cc",
         booking_status="PENDING",
-        amount_milliunits=-79000,
+        amount=from_milliunits(-79000),
     )
-    previous = await db.rekey_pending_to_booked("sb1-old", "sb1-new", -79100)
+    previous = await db.rekey_pending_to_booked("sb1-old", "sb1-new", from_milliunits(-79100))
 
     assert previous is not None
     assert previous["amount_milliunits"] == -79000
@@ -252,11 +253,11 @@ async def test_rekey_pending_to_booked_idempotent_retry(tmp_path: Path):
         ynab_budget_id="budget-1",
         account_key="acct-cc",
         booking_status="PENDING",
-        amount_milliunits=-79000,
+        amount=from_milliunits(-79000),
     )
-    await db.rekey_pending_to_booked("sb1-old", "sb1-new", -79100)
+    await db.rekey_pending_to_booked("sb1-old", "sb1-new", from_milliunits(-79100))
 
-    second = await db.rekey_pending_to_booked("sb1-old", "sb1-new", -79100)
+    second = await db.rekey_pending_to_booked("sb1-old", "sb1-new", from_milliunits(-79100))
     assert second is None
     tracked = db.get_tracked("sb1-new")
     assert tracked["booking_status"] == "BOOKED"
@@ -266,7 +267,7 @@ async def test_rekey_pending_to_booked_idempotent_retry(tmp_path: Path):
 async def test_rekey_pending_to_booked_raises_on_genuine_missing_key(tmp_path: Path):
     db = StateDB(tmp_path / "state.db")
     with pytest.raises(ValueError, match="sb1-old"):
-        await db.rekey_pending_to_booked("sb1-old", "sb1-new", -100)
+        await db.rekey_pending_to_booked("sb1-old", "sb1-new", from_milliunits(-100))
 
 
 async def test_list_pending_candidates_scoped_to_account_and_pending_status(tmp_path: Path):
@@ -278,7 +279,7 @@ async def test_list_pending_candidates_scoped_to_account_and_pending_status(tmp_
         ynab_budget_id="budget-1",
         account_key="acct-a",
         booking_status="PENDING",
-        amount_milliunits=-10000,
+        amount=from_milliunits(-10000),
         payee_name="Merchant A",
     )
     await db.upsert_tracked(
@@ -288,7 +289,7 @@ async def test_list_pending_candidates_scoped_to_account_and_pending_status(tmp_
         ynab_budget_id="budget-1",
         account_key="acct-a",
         booking_status="BOOKED",
-        amount_milliunits=-20000,
+        amount=from_milliunits(-20000),
     )
     await db.upsert_tracked(
         "sb1-b-pending",
@@ -297,7 +298,7 @@ async def test_list_pending_candidates_scoped_to_account_and_pending_status(tmp_
         ynab_budget_id="budget-1",
         account_key="acct-b",
         booking_status="PENDING",
-        amount_milliunits=-30000,
+        amount=from_milliunits(-30000),
     )
 
     candidates = db.list_pending_candidates("acct-a")
@@ -315,7 +316,7 @@ async def test_get_tracked_by_ynab_transaction_id(tmp_path: Path):
         ynab_budget_id="budget-1",
         account_key="acct-1",
         booking_status="BOOKED",
-        amount_milliunits=-10000,
+        amount=from_milliunits(-10000),
     )
     tracked = db.get_tracked_by_ynab_transaction_id("ynab-1")
     assert tracked is not None
@@ -332,7 +333,7 @@ async def test_upsert_tracked_stores_reconstruction_fields(tmp_path: Path):
         ynab_budget_id="budget-1",
         account_key="acct-1",
         booking_status="BOOKED",
-        amount_milliunits=-15000,
+        amount=from_milliunits(-15000),
         payee_name="Micro Kaffi AS",
         memo="Zettle_*Micro Kaffi AS",
         transaction_date="2026-08-20",
@@ -357,7 +358,7 @@ async def test_list_deleted_transactions_only_returns_deleted_status(tmp_path: P
         ynab_budget_id="budget-1",
         account_key="acct-1",
         booking_status="BOOKED",
-        amount_milliunits=-1000,
+        amount=from_milliunits(-1000),
     )
     await db.upsert_tracked(
         "sb1-deleted",
@@ -366,7 +367,7 @@ async def test_list_deleted_transactions_only_returns_deleted_status(tmp_path: P
         ynab_budget_id="budget-1",
         account_key="acct-1",
         booking_status="DELETED",
-        amount_milliunits=-2000,
+        amount=from_milliunits(-2000),
         payee_name="Some Shop",
     )
     deleted = db.list_deleted_transactions()
@@ -383,7 +384,7 @@ async def test_mark_readded_restores_pending_when_cleared_was_uncleared(tmp_path
         ynab_budget_id="budget-1",
         account_key="acct-1",
         booking_status="DELETED",
-        amount_milliunits=-1000,
+        amount=from_milliunits(-1000),
         cleared="uncleared",
     )
     await db.mark_readded("sb1-1", new_ynab_transaction_id="ynab-new", new_import_id="import-new")
@@ -403,7 +404,7 @@ async def test_mark_readded_restores_booked_when_cleared_was_cleared(tmp_path: P
         ynab_budget_id="budget-1",
         account_key="acct-1",
         booking_status="DELETED",
-        amount_milliunits=-1000,
+        amount=from_milliunits(-1000),
         cleared="cleared",
     )
     await db.mark_readded("sb1-1", new_ynab_transaction_id="ynab-new", new_import_id="import-new")
@@ -425,7 +426,7 @@ async def test_prune_booked_transactions_deletes_only_past_cutoff(tmp_path: Path
         ynab_budget_id="budget-1",
         account_key="acct-1",
         booking_status="BOOKED",
-        amount_milliunits=-1000,
+        amount=from_milliunits(-1000),
         transaction_date="2020-01-01",
     )
     await db.upsert_tracked(
@@ -435,7 +436,7 @@ async def test_prune_booked_transactions_deletes_only_past_cutoff(tmp_path: Path
         ynab_budget_id="budget-1",
         account_key="acct-1",
         booking_status="BOOKED",
-        amount_milliunits=-2000,
+        amount=from_milliunits(-2000),
         transaction_date=datetime.now(UTC).date().isoformat(),
     )
 
@@ -455,7 +456,7 @@ async def test_prune_booked_transactions_never_prunes_pending(tmp_path: Path):
         ynab_budget_id="budget-1",
         account_key="acct-1",
         booking_status="PENDING",
-        amount_milliunits=-1000,
+        amount=from_milliunits(-1000),
         transaction_date="2020-01-01",
     )
 
@@ -551,7 +552,7 @@ async def test_opens_and_migrates_and_new_functionality_works(tmp_path: Path):
         ynab_budget_id="budget-1",
         account_key="acct-1",
         booking_status="DELETED",
-        amount_milliunits=-1000,
+        amount=from_milliunits(-1000),
         payee_name="New Shop",
     )
     assert db.list_deleted_transactions()[0]["payee_name"] == "New Shop"
@@ -895,7 +896,7 @@ async def test_count_tracked_for_account_counts_matching_rows(tmp_path: Path):
         ynab_budget_id="budget-1",
         account_key="acct-1",
         booking_status="BOOKED",
-        amount_milliunits=-1000,
+        amount=from_milliunits(-1000),
     )
     await db.upsert_tracked(
         "acct-1:tx-2",
@@ -904,7 +905,7 @@ async def test_count_tracked_for_account_counts_matching_rows(tmp_path: Path):
         ynab_budget_id="budget-1",
         account_key="acct-1",
         booking_status="BOOKED",
-        amount_milliunits=-2000,
+        amount=from_milliunits(-2000),
     )
     await db.upsert_tracked(
         "acct-2:tx-1",
@@ -913,7 +914,7 @@ async def test_count_tracked_for_account_counts_matching_rows(tmp_path: Path):
         ynab_budget_id="budget-1",
         account_key="acct-2",
         booking_status="BOOKED",
-        amount_milliunits=-3000,
+        amount=from_milliunits(-3000),
     )
 
     assert db.count_tracked_for_account("acct-1") == 2

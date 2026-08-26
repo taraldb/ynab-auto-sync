@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 from datetime import date, datetime
+from decimal import Decimal
 from typing import Any
 from zoneinfo import ZoneInfo
 
 from ynab_auto_sync.sync.import_ids import derive_import_id as shared_derive_import_id
+from ynab_auto_sync.sync.money import parse_provider_amount, to_milliunits
 from ynab_auto_sync.sync.sanitize import clean_bank_text
 from ynab_auto_sync.sync.ynab_payload import (
     YNAB_MEMO_MAX_LEN,
@@ -229,11 +231,14 @@ def derive_import_id(sb1_transaction_id: str) -> str:
     return shared_derive_import_id(IMPORT_ID_PREFIX, sb1_transaction_id)
 
 
-def _to_milliunits(amount: Any) -> int:
+def _to_amount(amount: Any, decimal_places: int) -> Decimal:
     # SpareBank1 amounts are assumed to be plain NOK (e.g. -125.50), not
     # minor units - verify against scripts/probe_transactions.py output
-    # before trusting the sign/scale on real money.
-    return round(float(amount) * 1000)
+    # before trusting the sign/scale on real money. parse_provider_amount
+    # goes through str(amount) for a float input rather than Decimal(amount)
+    # directly, avoiding float binary-representation noise - see
+    # sync/money.py's own docstring.
+    return parse_provider_amount(amount, decimal_places)
 
 
 def _extract_payee_name(sb1_tx: dict[str, Any]) -> str:
@@ -246,17 +251,21 @@ def _extract_payee_name(sb1_tx: dict[str, Any]) -> str:
     return cleaned or "SpareBank1 transaction"
 
 
-def get_amount_milliunits(sb1_tx: dict[str, Any]) -> int:
+def get_amount(sb1_tx: dict[str, Any], decimal_places: int = 2) -> Decimal:
     amount = _get_first(sb1_tx, *AMOUNT_FIELD_CANDIDATES)
     if amount is None:
         raise MissingFieldError(
             f"No amount field found among {AMOUNT_FIELD_CANDIDATES} in transaction: {sb1_tx!r}"
         )
-    return _to_milliunits(amount)
+    return _to_amount(amount, decimal_places)
 
 
 def transform_transaction(
-    sb1_tx: dict[str, Any], ynab_account_id: str, account_key: str, timezone: str
+    sb1_tx: dict[str, Any],
+    ynab_account_id: str,
+    account_key: str,
+    timezone: str,
+    decimal_places: int = 2,
 ) -> dict[str, Any]:
     """Map one SpareBank1 transaction dict to a YNAB transaction payload,
     including the deterministic import_id that is the primary no-duplicates
@@ -264,7 +273,7 @@ def transform_transaction(
     """
     sb1_id = get_tracking_key(sb1_tx, account_key)
     tx_date = get_transaction_date(sb1_tx, timezone)
-    amount_milliunits = get_amount_milliunits(sb1_tx)
+    amount_milliunits = to_milliunits(get_amount(sb1_tx, decimal_places))
     payee_name = _extract_payee_name(sb1_tx)
     # Confirmed live against 25 real booked transactions: memo never once
     # carried information payee didn't already say - see provider.py's

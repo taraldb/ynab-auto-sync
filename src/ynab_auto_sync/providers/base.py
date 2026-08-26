@@ -5,6 +5,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import date, datetime
+from decimal import Decimal
 from enum import StrEnum
 from typing import Any
 
@@ -121,7 +122,12 @@ class NormalizedTransaction:
 
     provider_account_id: str
     date: date
-    amount_milliunits: int
+    # Major-unit currency amount (e.g. Decimal("158.48") kr), not milliunits -
+    # exact to 3 decimal places (sync/money.py's internal quantum), matching
+    # YNAB's own milliunits granularity. Converted to int milliunits only at
+    # the YNAB-payload boundary (sync/ynab_payload.py) via
+    # sync/money.py::to_milliunits().
+    amount: Decimal
     payee_name: str
     memo: str | None
     booking_status: BookingStatus

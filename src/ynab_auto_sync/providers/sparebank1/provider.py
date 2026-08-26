@@ -154,6 +154,7 @@ class SpareBank1Provider(TransactionProvider):
         token_store: TokenStore,
         timezone: str,
         pending_import_enabled: bool = False,
+        decimal_places: int = 2,
     ):
         self._http_client = http_client
         self._token_store = token_store
@@ -162,6 +163,10 @@ class SpareBank1Provider(TransactionProvider):
         # CLAUDE.md's "PENDING-transaction import" section for why this is
         # scoped to CREDITCARD accounts only, never bank transfers.
         self._pending_import_enabled = pending_import_enabled
+        # Threaded from config.sync.currency_decimal_places, mirroring how
+        # timezone above is threaded from config.sync.timezone - see
+        # sync/money.py::parse_provider_amount.
+        self._decimal_places = decimal_places
         self._accounts_cache: list[ProviderAccount] | None = None
         self._accounts_cached_at: datetime | None = None
 
@@ -284,7 +289,7 @@ class SpareBank1Provider(TransactionProvider):
                     continue
 
                 try:
-                    amount_milliunits = transform.get_amount_milliunits(sb1_tx)
+                    amount = transform.get_amount(sb1_tx, self._decimal_places)
                 except MissingFieldError:
                     logger.error(
                         "Skipping SpareBank1 transaction missing required fields: %r",
@@ -348,7 +353,7 @@ class SpareBank1Provider(TransactionProvider):
                         import_id=transform.derive_import_id(tracking_key),
                         provider_account_id=account_key,
                         date=tx_date,
-                        amount_milliunits=amount_milliunits,
+                        amount=amount,
                         payee_name=payee_name,
                         memo=_extract_memo(sb1_tx, payee_name),
                         booking_status=booking_status,

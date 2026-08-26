@@ -22,6 +22,7 @@ from ynab_auto_sync.providers.base import (
     TransactionProvider,
 )
 from ynab_auto_sync.sync.engine import SyncEngine
+from ynab_auto_sync.sync.money import from_milliunits
 from ynab_auto_sync.sync.state_db import StateDB
 from ynab_auto_sync.ynab import client as ynab_client
 
@@ -64,7 +65,7 @@ def ntx(tracking_key: str, account_id: str, import_id: str, amount: int, day: in
         import_id=import_id,
         provider_account_id=account_id,
         date=date(2026, 8, day),
-        amount_milliunits=amount,
+        amount=from_milliunits(amount),
         payee_name="Somewhere",
         memo=None,
         booking_status=BookingStatus.BOOKED,
@@ -306,7 +307,7 @@ async def test_run_cycle_does_not_record_audit_event_for_unchanged_transaction(t
         ynab_budget_id="budget-1",
         account_key="a-1",
         booking_status="BOOKED",
-        amount_milliunits=-1000,
+        amount=from_milliunits(-1000),
     )
 
     a = FakeProvider("bank_a", [ntx("a-1:tx1", "a-1", "AAA:1111", -1000)])

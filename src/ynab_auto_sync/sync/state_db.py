@@ -3,8 +3,11 @@ from __future__ import annotations
 import asyncio
 import sqlite3
 from datetime import UTC, date, datetime, timedelta
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
+
+from ynab_auto_sync.sync.money import from_milliunits, to_milliunits
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS account_cursors (
@@ -36,6 +39,7 @@ CREATE TABLE IF NOT EXISTS tracked_transactions (
     account_key TEXT NOT NULL,
     booking_status TEXT NOT NULL,
     amount_milliunits INTEGER NOT NULL,
+    amount_decimal TEXT NOT NULL,
     first_seen_at TEXT NOT NULL,
     last_checked_at TEXT NOT NULL,
     payee_name TEXT,
@@ -91,6 +95,7 @@ CREATE TABLE IF NOT EXISTS audit_events (
     memo TEXT,
     transaction_date TEXT,
     amount_milliunits INTEGER,
+    amount_decimal TEXT,
     detail TEXT
 );
 
@@ -117,7 +122,25 @@ _TRACKED_TRANSACTIONS_MIGRATED_COLUMNS = (
     ("ynab_account_id", "TEXT"),
     ("cleared", "TEXT"),
     ("readd_count", "INTEGER NOT NULL DEFAULT 0"),
+    # Preserves a Decimal amount exactly (not just its milliunits-int
+    # derivation) for an already-existing DB. NOT NULL DEFAULT '' only to
+    # satisfy SQLite's ALTER TABLE requirement for a NOT NULL column on a
+    # table that may already have rows - _migrate() immediately backfills
+    # every row's real value from amount_milliunits right after adding this
+    # column (see _backfill_amount_decimal below), so '' never persists in
+    # practice. amount_milliunits itself is NEVER dropped or stopped being
+    # written - it remains the numeric source list_audit_events' ORDER BY
+    # needs (a TEXT-stored Decimal string sorts lexicographically wrong for
+    # negative/mixed-magnitude values), written in lockstep with
+    # amount_decimal from the same in-memory Decimal at write time so the
+    # two columns can never drift from each other by construction.
+    ("amount_decimal", "TEXT NOT NULL DEFAULT ''"),
 )
+
+# audit_events' own migrated-column list, mirroring the tracked_transactions
+# one above - nullable like its existing amount_milliunits column (not every
+# audit event has an amount, e.g. some "skipped" rows).
+_AUDIT_EVENTS_MIGRATED_COLUMNS = (("amount_decimal", "TEXT"),)
 
 # last_vacuum_at tracks when prune_booked_transactions last ran a VACUUM, so
 # maybe_vacuum() can rate-limit it (DELETEs alone don't shrink the on-disk
@@ -246,11 +269,44 @@ class StateDB:
         tracked_columns = {
             row["name"] for row in self._conn.execute("PRAGMA table_info(tracked_transactions)")
         }
+        tracked_needs_decimal_backfill = "amount_decimal" not in tracked_columns
         for name, sql_type in _TRACKED_TRANSACTIONS_MIGRATED_COLUMNS:
             if name not in tracked_columns:
                 self._conn.execute(
                     f"ALTER TABLE tracked_transactions ADD COLUMN {name} {sql_type}"
                 )
+        if tracked_needs_decimal_backfill:
+            self._backfill_amount_decimal("tracked_transactions", "sb1_transaction_id")
+
+        audit_columns = {
+            row["name"] for row in self._conn.execute("PRAGMA table_info(audit_events)")
+        }
+        audit_needs_decimal_backfill = "amount_decimal" not in audit_columns
+        for name, sql_type in _AUDIT_EVENTS_MIGRATED_COLUMNS:
+            if name not in audit_columns:
+                self._conn.execute(f"ALTER TABLE audit_events ADD COLUMN {name} {sql_type}")
+        if audit_needs_decimal_backfill:
+            self._backfill_amount_decimal("audit_events", "id")
+
+    def _backfill_amount_decimal(self, table: str, pk_column: str) -> None:
+        """One-time backfill for an existing DB gaining amount_decimal for
+        the first time - the first migration in this file that backfills a
+        value rather than just adding a column with a static default (see
+        _TRACKED_TRANSACTIONS_MIGRATED_COLUMNS' own comment). Derives each
+        row's exact Decimal from its existing amount_milliunits via
+        money.from_milliunits() - always exact, since 1000 is a power of
+        ten - so no precision is invented or lost in this migration. A
+        brand-new DB never reaches this: _SCHEMA already creates both
+        columns together, so there's nothing to backfill.
+        """
+        rows = self._conn.execute(f"SELECT {pk_column}, amount_milliunits FROM {table}").fetchall()
+        for row in rows:
+            milliunits = row["amount_milliunits"]
+            amount_decimal = str(from_milliunits(milliunits)) if milliunits is not None else None
+            self._conn.execute(
+                f"UPDATE {table} SET amount_decimal = ? WHERE {pk_column} = ?",
+                (amount_decimal, row[pk_column]),
+            )
 
         transformer_columns = {
             row["name"] for row in self._conn.execute("PRAGMA table_info(transformer_default_budgets)")
@@ -411,7 +467,7 @@ class StateDB:
         ynab_budget_id: str,
         account_key: str,
         booking_status: str,
-        amount_milliunits: int,
+        amount: Decimal,
         payee_name: str | None = None,
         memo: str | None = None,
         transaction_date: str | None = None,
@@ -425,18 +481,25 @@ class StateDB:
         the data (i.e. from the same transform_transaction() payload just
         submitted to YNAB), even for non-deleted rows, since it's free at
         write time and gives every tracked row the same reconstructibility.
+
+        amount_milliunits and amount_decimal are both derived from the same
+        `amount` Decimal here, in one write, so the two columns can never
+        drift from each other by construction - see
+        _TRACKED_TRANSACTIONS_MIGRATED_COLUMNS' comment for why both exist.
         """
         async with self._lock:
             now_iso = datetime.now(UTC).isoformat()
+            amount_milliunits = to_milliunits(amount)
+            amount_decimal = str(amount)
             self._conn.execute(
                 """
                 INSERT INTO tracked_transactions (
                     sb1_transaction_id, import_id, ynab_transaction_id, ynab_budget_id,
-                    account_key, booking_status, amount_milliunits, first_seen_at,
-                    last_checked_at, payee_name, memo, transaction_date, ynab_account_id,
-                    cleared
+                    account_key, booking_status, amount_milliunits, amount_decimal,
+                    first_seen_at, last_checked_at, payee_name, memo, transaction_date,
+                    ynab_account_id, cleared
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(sb1_transaction_id) DO UPDATE SET
                     import_id = excluded.import_id,
                     ynab_transaction_id = excluded.ynab_transaction_id,
@@ -444,6 +507,7 @@ class StateDB:
                     account_key = excluded.account_key,
                     booking_status = excluded.booking_status,
                     amount_milliunits = excluded.amount_milliunits,
+                    amount_decimal = excluded.amount_decimal,
                     last_checked_at = excluded.last_checked_at,
                     payee_name = excluded.payee_name,
                     memo = excluded.memo,
@@ -459,6 +523,7 @@ class StateDB:
                     account_key,
                     booking_status,
                     amount_milliunits,
+                    amount_decimal,
                     now_iso,
                     now_iso,
                     payee_name,
@@ -539,17 +604,17 @@ class StateDB:
         ).fetchone()
         return row["earliest"] if row else None
 
-    async def mark_booked(self, sb1_transaction_id: str, new_amount_milliunits: int) -> None:
+    async def mark_booked(self, sb1_transaction_id: str, new_amount: Decimal) -> None:
         async with self._lock:
             now_iso = datetime.now(UTC).isoformat()
             cursor = self._conn.execute(
                 """
                 UPDATE tracked_transactions
-                SET booking_status = 'BOOKED', amount_milliunits = ?, cleared = 'cleared',
-                    last_checked_at = ?
+                SET booking_status = 'BOOKED', amount_milliunits = ?, amount_decimal = ?,
+                    cleared = 'cleared', last_checked_at = ?
                 WHERE sb1_transaction_id = ?
                 """,
-                (new_amount_milliunits, now_iso, sb1_transaction_id),
+                (to_milliunits(new_amount), str(new_amount), now_iso, sb1_transaction_id),
             )
             if cursor.rowcount == 0:
                 raise ValueError(
@@ -569,7 +634,7 @@ class StateDB:
         rows = self._conn.execute(
             """
             SELECT sb1_transaction_id, ynab_transaction_id, ynab_budget_id,
-                   amount_milliunits, first_seen_at, payee_name
+                   amount_decimal, first_seen_at, payee_name
             FROM tracked_transactions
             WHERE account_key = ? AND booking_status = 'PENDING'
             """,
@@ -578,7 +643,7 @@ class StateDB:
         return [dict(row) for row in rows]
 
     async def rekey_pending_to_booked(
-        self, old_tracking_key: str, new_tracking_key: str, new_amount_milliunits: int
+        self, old_tracking_key: str, new_tracking_key: str, new_amount: Decimal
     ) -> dict[str, Any] | None:
         """Fuzzy-matched pending->booked transition (sync/pending_match.py).
         Unlike mark_booked above (same primary key, updated in place), this
@@ -628,10 +693,17 @@ class StateDB:
                 """
                 UPDATE tracked_transactions
                 SET sb1_transaction_id = ?, booking_status = 'BOOKED',
-                    amount_milliunits = ?, cleared = 'cleared', last_checked_at = ?
+                    amount_milliunits = ?, amount_decimal = ?, cleared = 'cleared',
+                    last_checked_at = ?
                 WHERE sb1_transaction_id = ?
                 """,
-                (new_tracking_key, new_amount_milliunits, now_iso, old_tracking_key),
+                (
+                    new_tracking_key,
+                    to_milliunits(new_amount),
+                    str(new_amount),
+                    now_iso,
+                    old_tracking_key,
+                ),
             )
             self._conn.commit()
             return previous
@@ -1119,18 +1191,21 @@ class StateDB:
         payee_name: str | None = None,
         memo: str | None = None,
         transaction_date: str | None = None,
-        amount_milliunits: int | None = None,
+        amount: Decimal | None = None,
         detail: str | None = None,
     ) -> None:
         async with self._lock:
+            amount_milliunits = to_milliunits(amount) if amount is not None else None
+            amount_decimal = str(amount) if amount is not None else None
             self._conn.execute(
                 """
                 INSERT INTO audit_events (
                     occurred_at, event_type, source, account_key, tracking_key,
                     import_id, ynab_transaction_id, ynab_budget_id, ynab_account_id,
-                    payee_name, memo, transaction_date, amount_milliunits, detail
+                    payee_name, memo, transaction_date, amount_milliunits, amount_decimal,
+                    detail
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     datetime.now(UTC).isoformat(),
@@ -1146,6 +1221,7 @@ class StateDB:
                     memo,
                     transaction_date,
                     amount_milliunits,
+                    amount_decimal,
                     detail,
                 ),
             )

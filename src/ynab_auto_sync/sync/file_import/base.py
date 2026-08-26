@@ -3,12 +3,16 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from datetime import date
+from decimal import Decimal
 
 
 @dataclass
 class ImportedTransactionRow:
     date: date
-    amount_milliunits: int
+    # Major-unit currency amount (e.g. Decimal("158.48") kr), not milliunits -
+    # see sync/money.py. Converted to int milliunits only at the dedup-key/
+    # YNAB-payload boundary.
+    amount: Decimal
     payee_name: str
     memo: str | None
     row_index: int  # 1-based, including the header row, for error reporting

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date
+from decimal import Decimal
 
 from ynab_auto_sync.sync.date_window import MatchWindowUnit, days_between
 
@@ -19,7 +20,7 @@ class TransferCandidate:
     index: int
     account_key: str
     date: date
-    amount_milliunits: int
+    amount: Decimal
     # Real account-number cross-reference (see providers/base.py's
     # NormalizedTransaction docstring) - None when the source doesn't
     # populate it, in which case this candidate can never satisfy the
@@ -82,7 +83,7 @@ def find_transfer_pairs(
             if other.index not in exclude
             and other.index != c.index
             and other.account_key != c.account_key
-            and other.amount_milliunits == -c.amount_milliunits
+            and other.amount == -c.amount
             and days_between(c.date, other.date, unit) <= match_window_days
             and (
                 (c.remote_account_number is not None

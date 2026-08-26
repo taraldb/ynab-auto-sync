@@ -71,6 +71,11 @@ sync:
   pending_import_enabled: false
   pending_import_amount_tolerance_kroner: 2.0
   pending_import_date_window_days: 5
+  # Optional, default 2. Decimal places this deployment's bank data uses (2
+  # for NOK øre) - used only when parsing a provider's raw amount into an
+  # exact internal Decimal. A future non-NOK provider can set this
+  # per-deployment; true per-provider multi-currency is out of scope.
+  currency_decimal_places: 2
   # A failed cycle is retried with exponential backoff: base * 2**attempt,
   # capped at retry_backoff_max_seconds.
   retry_backoff_base_seconds: 60

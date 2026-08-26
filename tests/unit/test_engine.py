@@ -22,6 +22,7 @@ from ynab_auto_sync.state import JsonStateStore
 from ynab_auto_sync.sync.file_import.base import ImportedTransactionRow
 from ynab_auto_sync.sync.file_import.dedup import derive_import_id as derive_file_import_id
 from ynab_auto_sync.sync.file_import.dedup import get_tracking_key as get_file_tracking_key
+from ynab_auto_sync.sync.money import from_milliunits, to_milliunits
 from ynab_auto_sync.sync.state_db import StateDB
 from ynab_auto_sync.ynab import client as ynab_client
 
@@ -478,7 +479,7 @@ async def test_run_cycle_skips_already_tracked_unchanged_status(tmp_path: Path):
         ynab_budget_id="budget-1",
         account_key="acct-1",
         booking_status="BOOKED",
-        amount_milliunits=-50000,
+        amount=from_milliunits(-50000),
     )
 
     respx.get(sb1_client.TRANSACTIONS_URL).mock(
@@ -526,7 +527,7 @@ async def test_run_cycle_updates_when_pending_transitions_to_booked(tmp_path: Pa
         ynab_budget_id="budget-1",
         account_key="acct-1",
         booking_status="PENDING",
-        amount_milliunits=-130000,
+        amount=from_milliunits(-130000),
     )
 
     respx.get(sb1_client.TRANSACTIONS_URL).mock(
@@ -748,8 +749,9 @@ async def test_run_cycle_widens_fetch_window_for_stale_pending_transaction(tmp_p
         """
         INSERT INTO tracked_transactions (
             sb1_transaction_id, import_id, ynab_transaction_id, ynab_budget_id,
-            account_key, booking_status, amount_milliunits, first_seen_at, last_checked_at
-        ) VALUES (?, ?, ?, ?, ?, 'PENDING', -1000, ?, ?)
+            account_key, booking_status, amount_milliunits, amount_decimal,
+            first_seen_at, last_checked_at
+        ) VALUES (?, ?, ?, ?, ?, 'PENDING', -1000, '-1.000', ?, ?)
         """,
         ("tx-stale-pending", derive_import_id("tx-stale-pending"), "ynab-stale", "budget-1", "acct-1", ancient, ancient),
     )
@@ -1006,7 +1008,7 @@ async def test_readd_deleted_transaction_recreates_with_fresh_import_id(tmp_path
         ynab_budget_id="budget-1",
         account_key="acct-1",
         booking_status="DELETED",
-        amount_milliunits=-13000,
+        amount=from_milliunits(-13000),
         payee_name="Micro Kaffi AS",
         memo="Zettle_*Micro Kaffi AS",
         transaction_date="2026-08-20",
@@ -1073,7 +1075,7 @@ async def test_readd_deleted_transaction_raises_when_not_deleted(tmp_path: Path)
         ynab_budget_id="budget-1",
         account_key="acct-1",
         booking_status="BOOKED",
-        amount_milliunits=-1000,
+        amount=from_milliunits(-1000),
     )
 
     async with httpx.AsyncClient() as http_client:
@@ -1694,7 +1696,7 @@ def make_row(row_index: int, day: int, amount_milliunits: int, payee: str, memo=
 
     return ImportedTransactionRow(
         date=date_cls(2026, 8, day),
-        amount_milliunits=amount_milliunits,
+        amount=from_milliunits(amount_milliunits),
         payee_name=payee,
         memo=memo,
         row_index=row_index,
@@ -1738,7 +1740,7 @@ async def test_import_file_rows_commits_and_tracks_new_rows(tmp_path: Path):
 
     from ynab_auto_sync.sync.file_import import dedup as file_dedup
 
-    dedup_key = file_dedup.compute_dedup_key(row.date, row.amount_milliunits, row.payee_name, row.memo)
+    dedup_key = file_dedup.compute_dedup_key(row.date, to_milliunits(row.amount), row.payee_name, row.memo)
     tracking_key = get_file_tracking_key("ynab-acct-1", dedup_key)
     import_id = derive_file_import_id(tracking_key)
 
@@ -1788,7 +1790,7 @@ async def test_import_file_rows_classifies_already_tracked_row_as_duplicate(tmp_
 
     from ynab_auto_sync.sync.file_import import dedup as file_dedup
 
-    dedup_key = file_dedup.compute_dedup_key(row.date, row.amount_milliunits, row.payee_name, row.memo)
+    dedup_key = file_dedup.compute_dedup_key(row.date, to_milliunits(row.amount), row.payee_name, row.memo)
     tracking_key = get_file_tracking_key("ynab-acct-1", dedup_key)
     await db.upsert_tracked(
         tracking_key,
@@ -1797,7 +1799,7 @@ async def test_import_file_rows_classifies_already_tracked_row_as_duplicate(tmp_
         ynab_budget_id="budget-1",
         account_key="acct-1",
         booking_status="BOOKED",
-        amount_milliunits=-12500,
+        amount=from_milliunits(-12500),
     )
     create_route_mock = create_route("budget-1")
 
@@ -1837,7 +1839,7 @@ async def test_import_file_rows_dedup_key_never_collides_with_sparebank1_domain(
         ynab_budget_id="budget-1",
         account_key="acct-1",
         booking_status="BOOKED",
-        amount_milliunits=-12500,
+        amount=from_milliunits(-12500),
     )
 
     row = make_row(2, 1, -12500, "Kiwi")
@@ -1937,7 +1939,7 @@ async def test_run_cycle_records_audit_event_for_updated_transaction(tmp_path: P
         ynab_budget_id="budget-1",
         account_key="acct-1",
         booking_status="PENDING",
-        amount_milliunits=-130000,
+        amount=from_milliunits(-130000),
     )
 
     respx.get(sb1_client.TRANSACTIONS_URL).mock(
@@ -2235,7 +2237,7 @@ async def test_import_file_rows_records_audit_event_for_duplicate_on_commit(tmp_
 
     from ynab_auto_sync.sync.file_import import dedup as file_dedup
 
-    dedup_key = file_dedup.compute_dedup_key(row.date, row.amount_milliunits, row.payee_name, row.memo)
+    dedup_key = file_dedup.compute_dedup_key(row.date, to_milliunits(row.amount), row.payee_name, row.memo)
     tracking_key = get_file_tracking_key("ynab-acct-1", dedup_key)
     await db.upsert_tracked(
         tracking_key,
@@ -2244,7 +2246,7 @@ async def test_import_file_rows_records_audit_event_for_duplicate_on_commit(tmp_
         ynab_budget_id="budget-1",
         account_key="acct-1",
         booking_status="BOOKED",
-        amount_milliunits=-12500,
+        amount=from_milliunits(-12500),
     )
 
     async with httpx.AsyncClient() as http_client:
@@ -2274,7 +2276,7 @@ async def test_import_file_rows_dry_run_does_not_record_audit_events(tmp_path: P
 
     from ynab_auto_sync.sync.file_import import dedup as file_dedup
 
-    dedup_key = file_dedup.compute_dedup_key(row.date, row.amount_milliunits, row.payee_name, row.memo)
+    dedup_key = file_dedup.compute_dedup_key(row.date, to_milliunits(row.amount), row.payee_name, row.memo)
     tracking_key = get_file_tracking_key("ynab-acct-1", dedup_key)
     await db.upsert_tracked(
         tracking_key,
@@ -2283,7 +2285,7 @@ async def test_import_file_rows_dry_run_does_not_record_audit_events(tmp_path: P
         ynab_budget_id="budget-1",
         account_key="acct-1",
         booking_status="BOOKED",
-        amount_milliunits=-12500,
+        amount=from_milliunits(-12500),
     )
 
     async with httpx.AsyncClient() as http_client:
@@ -3082,7 +3084,7 @@ async def test_run_cycle_fuzzy_transition_retry_safe(tmp_path: Path):
         ynab_budget_id="budget-1",
         account_key="acct-1",
         booking_status="PENDING",
-        amount_milliunits=-79000,
+        amount=from_milliunits(-79000),
         payee_name="MERCHANT ONE, LOC-A",
     )
 
@@ -3707,7 +3709,7 @@ async def test_run_cycle_ambiguous_fuzzy_match_falls_through_to_new_create(tmp_p
         ynab_budget_id="budget-1",
         account_key="acct-1",
         booking_status="PENDING",
-        amount_milliunits=-100000,
+        amount=from_milliunits(-100000),
         payee_name="MERCHANT ONE, LOC-A",
     )
     await db.upsert_tracked(
@@ -3717,7 +3719,7 @@ async def test_run_cycle_ambiguous_fuzzy_match_falls_through_to_new_create(tmp_p
         ynab_budget_id="budget-1",
         account_key="acct-1",
         booking_status="PENDING",
-        amount_milliunits=-101000,
+        amount=from_milliunits(-101000),
         payee_name="MERCHANT ONE, LOC-A",
     )
 

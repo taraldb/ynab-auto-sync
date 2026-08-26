@@ -49,16 +49,18 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date
+from decimal import Decimal
 from typing import Any
 
 from ynab_auto_sync.sync.date_window import MatchWindowUnit, days_between
+from ynab_auto_sync.sync.money import from_milliunits
 from ynab_auto_sync.sync.sanitize import (
     normalize_payee_for_fuzzy_match,
     payee_similarity,
     payees_plausibly_match,
 )
 
-DEFAULT_AMOUNT_TOLERANCE_KRONER = 2.0
+DEFAULT_AMOUNT_TOLERANCE_KRONER = Decimal("2.0")
 DEFAULT_DATE_WINDOW_DAYS = 5
 DEFAULT_MIN_PAYEE_PREFIX_LEN = 6
 # Levenshtein-based similarity floor a top-ranked candidate must clear
@@ -86,9 +88,9 @@ class PendingCandidate:
     tracked_transactions.first_seen_at / StateDB.get_earliest_pending_first_seen
     precedent already in this codebase for exactly this reason.
 
-    `amount_milliunits` is always a whole-kroner value (a multiple of 1000)
-    - SpareBank1's PENDING amount has no fractional-kroner component,
-    confirmed live. `payee` is expected to already have been run through
+    `amount` is always a whole-kroner value while PENDING - SpareBank1's
+    PENDING amount has no fractional-kroner component, confirmed live.
+    `payee` is expected to already have been run through
     sanitize.clean_bank_text, matching every other payee value in this
     codebase.
 
@@ -103,7 +105,7 @@ class PendingCandidate:
     ynab_transaction_id: str
     ynab_budget_id: str
     account_key: str
-    amount_milliunits: int
+    amount: Decimal
     date: date
     payee: str
 
@@ -115,7 +117,7 @@ class BookedCandidate:
     NormalizedTransaction (same reasoning as TransferCandidate)."""
 
     account_key: str
-    amount_milliunits: int
+    amount: Decimal
     date: date
     payee: str
 
@@ -127,7 +129,7 @@ class PendingMatch:
     is ever wired into a live path."""
 
     candidate: PendingCandidate
-    amount_diff_milliunits: int
+    amount_diff: Decimal
     date_diff_days: int
     payee_matched: bool
     # Levenshtein-based score that decided it; 1.0 when there was only one
@@ -136,15 +138,15 @@ class PendingMatch:
     payee_similarity: float
 
 
-def _amount_within_tolerance(a: int, b: int, tolerance_kroner: float) -> bool:
-    return abs(a - b) <= round(tolerance_kroner * 1000)
+def _amount_within_tolerance(a: Decimal, b: Decimal, tolerance_kroner: Decimal) -> bool:
+    return abs(a - b) <= tolerance_kroner
 
 
 def find_pending_match(
     booked: BookedCandidate,
     candidates: list[PendingCandidate],
     *,
-    amount_tolerance_kroner: float = DEFAULT_AMOUNT_TOLERANCE_KRONER,
+    amount_tolerance_kroner: Decimal = DEFAULT_AMOUNT_TOLERANCE_KRONER,
     date_window_days: int = DEFAULT_DATE_WINDOW_DAYS,
     unit: MatchWindowUnit = "calendar_days",
     require_payee_match: bool = True,
@@ -177,7 +179,7 @@ def find_pending_match(
         c
         for c in candidates
         if c.account_key == booked.account_key
-        and _amount_within_tolerance(c.amount_milliunits, booked.amount_milliunits, amount_tolerance_kroner)
+        and _amount_within_tolerance(c.amount, booked.amount, amount_tolerance_kroner)
         and days_between(c.date, booked.date, unit) <= date_window_days
     ]
     if require_payee_match:
@@ -193,7 +195,7 @@ def find_pending_match(
     def _build_match(candidate: PendingCandidate, similarity: float) -> PendingMatch:
         return PendingMatch(
             candidate=candidate,
-            amount_diff_milliunits=booked.amount_milliunits - candidate.amount_milliunits,
+            amount_diff=booked.amount - candidate.amount,
             date_diff_days=days_between(candidate.date, booked.date, unit),
             payee_matched=payees_plausibly_match(candidate.payee, booked.payee, min_prefix_len=min_payee_prefix_len),
             payee_similarity=similarity,
@@ -219,11 +221,11 @@ def find_pending_match(
 
 
 def find_manual_match_tolerant(
-    pending_amount_milliunits: int,
+    pending_amount: Decimal,
     pending_date: date,
     candidates: list[dict[str, Any]],
     *,
-    amount_tolerance_kroner: float = DEFAULT_AMOUNT_TOLERANCE_KRONER,
+    amount_tolerance_kroner: Decimal = DEFAULT_AMOUNT_TOLERANCE_KRONER,
     date_window_days: int,
     unit: MatchWindowUnit = "calendar_days",
     pending_payee: str | None = None,
@@ -254,7 +256,7 @@ def find_manual_match_tolerant(
         c
         for c in candidates
         if not c.get("subtransactions")
-        and _amount_within_tolerance(c["amount"], pending_amount_milliunits, amount_tolerance_kroner)
+        and _amount_within_tolerance(from_milliunits(c["amount"]), pending_amount, amount_tolerance_kroner)
         and days_between(date.fromisoformat(c["date"]), pending_date, unit) <= date_window_days
     ]
 

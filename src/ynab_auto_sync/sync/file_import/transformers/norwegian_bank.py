@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+from ynab_auto_sync.sync.money import parse_provider_amount
 from ynab_auto_sync.sync.sanitize import clean_bank_text
 
 from ..base import ImportedTransactionRow, RowTransformError, TransformerBase
@@ -74,10 +75,16 @@ class NorwegianBankTransformer(TransformerBase):
         if amount is None:
             raise RowTransformError(f"Row {row_index}: missing Amount value: {row!r}")
         try:
-            # Matches this project's existing SpareBank1 float-NOK-to-
-            # milliunits convention (transform.py's _to_milliunits).
-            amount_milliunits = round(float(amount) * 1000)
-        except (TypeError, ValueError) as exc:
+            # decimal_places=2 hardcoded (not threaded from
+            # config.sync.currency_decimal_places) - this transformer is
+            # already Norwegian-bank-specific by name and column layout, so
+            # assuming NOK's 2 decimal places here is no more source-
+            # specific than everything else in this file. Matches this
+            # project's SpareBank1 float-NOK-to-Decimal convention
+            # (sync/money.py's parse_provider_amount, used the same way by
+            # providers/sparebank1/transform.py).
+            amount = parse_provider_amount(amount, decimal_places=2)
+        except (TypeError, ValueError, ArithmeticError) as exc:
             raise RowTransformError(
                 f"Row {row_index}: Amount value {amount!r} is not numeric: {row!r}"
             ) from exc
@@ -95,7 +102,7 @@ class NorwegianBankTransformer(TransformerBase):
 
         return ImportedTransactionRow(
             date=tx_date,
-            amount_milliunits=amount_milliunits,
+            amount=amount,
             payee_name=payee_name,
             memo=None,
             row_index=row_index,

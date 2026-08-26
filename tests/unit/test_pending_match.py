@@ -16,6 +16,7 @@ merchant ambiguity, and the branch-disambiguation case).
 from datetime import date
 
 from ynab_auto_sync.providers.sparebank1 import transform
+from ynab_auto_sync.sync.money import from_milliunits
 from ynab_auto_sync.sync.pending_match import (
     BookedCandidate,
     PendingCandidate,
@@ -40,14 +41,14 @@ def p(
         ynab_transaction_id=ynab_transaction_id,
         ynab_budget_id=ynab_budget_id,
         account_key=account_key,
-        amount_milliunits=amount,
+        amount=from_milliunits(amount),
         date=date(2026, 8, day),
         payee=payee,
     )
 
 
 def b(account_key, day, amount, payee):
-    return BookedCandidate(account_key=account_key, date=date(2026, 8, day), amount_milliunits=amount, payee=payee)
+    return BookedCandidate(account_key=account_key, date=date(2026, 8, day), amount=from_milliunits(amount), payee=payee)
 
 
 # --- Regression tests locking in the real-data findings (via unmodified transform.py) ---
@@ -87,7 +88,7 @@ def test_matches_despite_tracking_key_irrelevance():
     match = find_pending_match(booked, candidates)
     assert match is not None
     assert match.candidate.index == 0
-    assert match.amount_diff_milliunits == 0
+    assert match.amount_diff == from_milliunits(0)
 
 
 def test_tolerates_rounding_drift_within_tolerance():
@@ -95,7 +96,7 @@ def test_tolerates_rounding_drift_within_tolerance():
     booked = b("acct-cc", 20, -521100, "MERCHANT ONE, LOC-A")
     match = find_pending_match(booked, candidates)
     assert match is not None
-    assert match.amount_diff_milliunits == -100
+    assert match.amount_diff == from_milliunits(-100)
 
 
 def test_tolerates_rounding_drift_the_other_direction():
@@ -103,7 +104,7 @@ def test_tolerates_rounding_drift_the_other_direction():
     booked = b("acct-cc", 20, -218300, "MERCHANT ONE, LOC-A")
     match = find_pending_match(booked, candidates)
     assert match is not None
-    assert match.amount_diff_milliunits == -300
+    assert match.amount_diff == from_milliunits(-300)
 
 
 def test_rejects_amount_outside_tolerance():
@@ -218,7 +219,8 @@ def _manual_candidate(amount, day, payee_name="MERCHANT ONE, LOC-A", subtransact
 
 def test_matches_within_amount_tolerance():
     candidates = [_manual_candidate(-521100, 20)]
-    match = find_manual_match_tolerant(-521000, date(2026, 8, 20), candidates, date_window_days=3)
+    match = find_manual_match_tolerant(
+        from_milliunits(-521000), date(2026, 8, 20), candidates, date_window_days=3)
     assert match is not None
     assert match["id"] == "manual-1"
 
@@ -228,17 +230,20 @@ def test_ambiguous_candidates_return_none():
         _manual_candidate(-521100, 20, tx_id="manual-1"),
         _manual_candidate(-521200, 20, tx_id="manual-2"),
     ]
-    assert find_manual_match_tolerant(-521000, date(2026, 8, 20), candidates, date_window_days=3) is None
+    assert find_manual_match_tolerant(
+        from_milliunits(-521000), date(2026, 8, 20), candidates, date_window_days=3) is None
 
 
 def test_manual_match_rejects_amount_outside_tolerance():
     candidates = [_manual_candidate(-999000, 20)]
-    assert find_manual_match_tolerant(-521000, date(2026, 8, 20), candidates, date_window_days=3) is None
+    assert find_manual_match_tolerant(
+        from_milliunits(-521000), date(2026, 8, 20), candidates, date_window_days=3) is None
 
 
 def test_excludes_split_transactions():
     candidates = [_manual_candidate(-521100, 20, subtransactions=[{"amount": -521100}])]
-    assert find_manual_match_tolerant(-521000, date(2026, 8, 20), candidates, date_window_days=3) is None
+    assert find_manual_match_tolerant(
+        from_milliunits(-521000), date(2026, 8, 20), candidates, date_window_days=3) is None
 
 
 def test_disambiguates_multiple_amount_matches_via_levenshtein_when_pending_payee_given():
@@ -247,7 +252,7 @@ def test_disambiguates_multiple_amount_matches_via_levenshtein_when_pending_paye
         _manual_candidate(-100000, 20, payee_name="MERCHANT ONE, AIRPORT BRANCH", tx_id="manual-b"),
     ]
     match = find_manual_match_tolerant(
-        -100000,
+        from_milliunits(-100000),
         date(2026, 8, 20),
         candidates,
         date_window_days=3,
@@ -263,6 +268,7 @@ def test_ambiguous_manual_candidates_without_pending_payee_falls_through_to_none
         _manual_candidate(-100000, 20, tx_id="manual-b"),
     ]
     assert (
-        find_manual_match_tolerant(-100000, date(2026, 8, 20), candidates, date_window_days=3, pending_payee=None)
+        find_manual_match_tolerant(
+        from_milliunits(-100000), date(2026, 8, 20), candidates, date_window_days=3, pending_payee=None)
         is None
     )

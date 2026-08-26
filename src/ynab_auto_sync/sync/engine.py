@@ -851,24 +851,89 @@ class SyncEngine:
             )
 
         total_updated = 0
-        for budget_id, pending_updates in updates_by_budget.items():
+        for budget_id in {*updates_by_budget, *classified.fuzzy_updates_by_budget}:
+            pending_updates = updates_by_budget.get(budget_id, [])
+            pending_fuzzy = classified.fuzzy_updates_by_budget.get(budget_id, [])
             await _report(
                 on_progress,
                 "submitting",
-                {"budget_id": budget_id, "updates": len(pending_updates)},
-            )
-            updates = [
                 {
-                    "id": p.ynab_transaction_id,
-                    "cleared": "cleared",
-                    "amount": to_milliunits(p.new_amount),
-                }
-                for p in pending_updates
-            ]
-            await ynab_client.update_transactions(
-                self._http_client, self._config.ynab.personal_access_token, budget_id, updates
+                    "budget_id": budget_id,
+                    "updates": len(pending_updates),
+                    "fuzzy_updates": len(pending_fuzzy),
+                },
             )
+
+            # Bulk pre-check, once per budget, BEFORE any PATCH is
+            # attempted - see CLAUDE.md's "Resolved: update PATCH could
+            # permanently wedge the sync cycle". A batched blind PATCH
+            # used to 400 the WHOLE batch (including otherwise-fine rows)
+            # the moment a single target had been deleted directly in
+            # YNAB, and since submit() raising here aborts the entire
+            # cycle, one stale row could wedge every budget's sync
+            # forever (the same cached ClassifiedCycle gets resubmitted
+            # unchanged on every backoff retry). Confirmed live is exactly
+            # 2 states either flavor of update ever needs an existence
+            # check against.
+            live_by_id = {
+                t["id"]: t
+                for t in await ynab_client.list_transactions_including_deleted(
+                    self._http_client, self._config.ynab.personal_access_token, budget_id
+                )
+            }
+
+            async def _recover(
+                *,
+                tracking_key: str,
+                ynab_transaction_id: str,
+                new_amount: Decimal,
+                provider_type: str,
+                account_key: str,
+                new_tracking_key: str | None = None,
+                _budget_id: str = budget_id,
+            ) -> None:
+                # Mirrors the two other places these same outcomes are
+                # counted: a match found here creates a real YNAB
+                # transaction, same as matches_by_budget's own
+                # total_created accounting below; no match found is the
+                # exact same "resolved as deleted, nothing created or
+                # updated" event _backfill_duplicates already counts via
+                # total_resolved_deleted, not total_updated - these are
+                # NOT ordinary updates, so they must not share that
+                # counter just because they started life as one.
+                nonlocal total_created, total_resolved_deleted
+                created, resolved_deleted = await self._recover_missing_pending_update(
+                    _budget_id,
+                    tracking_key=tracking_key,
+                    ynab_transaction_id=ynab_transaction_id,
+                    new_amount=new_amount,
+                    provider_type=provider_type,
+                    account_key=account_key,
+                    new_tracking_key=new_tracking_key,
+                )
+                total_created += created
+                total_resolved_deleted += resolved_deleted
+
             for p in pending_updates:
+                live = live_by_id.get(p.ynab_transaction_id)
+                if live is None or live.get("deleted"):
+                    await _recover(
+                        tracking_key=p.tracking_key,
+                        ynab_transaction_id=p.ynab_transaction_id,
+                        new_amount=p.new_amount,
+                        provider_type=p.provider_type,
+                        account_key=p.account_key,
+                    )
+                    continue
+                if not await self._patch_single_update(budget_id, p.ynab_transaction_id, p.new_amount):
+                    await _recover(
+                        tracking_key=p.tracking_key,
+                        ynab_transaction_id=p.ynab_transaction_id,
+                        new_amount=p.new_amount,
+                        provider_type=p.provider_type,
+                        account_key=p.account_key,
+                    )
+                    continue
                 await self._db.mark_booked(p.tracking_key, p.new_amount)
                 await self._db.insert_audit_event(
                     event_type="updated",
@@ -880,43 +945,45 @@ class SyncEngine:
                     amount=p.new_amount,
                     detail="pending → booked transition",
                 )
-            total_updated += len(pending_updates)
+                total_updated += 1
 
-        # Same phase as the plain updates loop above (PATCH-only, no
-        # create) - the only difference is StateDB.rekey_pending_to_booked
-        # instead of mark_booked, since this outcome's tracking key changed
-        # (see _PendingFuzzyUpdate's docstring). Folded into total_updated,
-        # same "indistinguishable from an ordinary update" reasoning
-        # matched_manual below already uses for total_created.
-        for budget_id, pending_fuzzy in classified.fuzzy_updates_by_budget.items():
-            await _report(
-                on_progress,
-                "submitting",
-                {"budget_id": budget_id, "fuzzy_updates": len(pending_fuzzy)},
-            )
-            fuzzy_updates = [
-                {
-                    "id": p.ynab_transaction_id,
-                    "cleared": "cleared",
-                    "amount": to_milliunits(p.new_amount),
-                }
-                for p in pending_fuzzy
-            ]
-            await ynab_client.update_transactions(
-                self._http_client,
-                self._config.ynab.personal_access_token,
-                budget_id,
-                fuzzy_updates,
-            )
+            # Same phase as the plain updates loop above (PATCH-only, no
+            # create) - the only difference is StateDB.rekey_pending_to_
+            # booked instead of mark_booked, since this outcome's tracking
+            # key changed (see _PendingFuzzyUpdate's docstring).
             for p in pending_fuzzy:
+                live = live_by_id.get(p.ynab_transaction_id)
+                if live is None or live.get("deleted"):
+                    await _recover(
+                        tracking_key=p.old_tracking_key,
+                        ynab_transaction_id=p.ynab_transaction_id,
+                        new_amount=p.new_amount,
+                        provider_type=p.provider_type,
+                        account_key=p.account_key,
+                        new_tracking_key=p.new_tracking_key,
+                    )
+                    continue
+                if not await self._patch_single_update(budget_id, p.ynab_transaction_id, p.new_amount):
+                    await _recover(
+                        tracking_key=p.old_tracking_key,
+                        ynab_transaction_id=p.ynab_transaction_id,
+                        new_amount=p.new_amount,
+                        provider_type=p.provider_type,
+                        account_key=p.account_key,
+                        new_tracking_key=p.new_tracking_key,
+                    )
+                    continue
                 previous = await self._db.rekey_pending_to_booked(
                     p.old_tracking_key, p.new_tracking_key, p.new_amount
                 )
                 if previous is None:
                     # Already applied by a prior submit() attempt on this
                     # same cached ClassifiedCycle (see rekey_pending_to_
-                    # booked's own idempotent-retry docstring) - no
-                    # double-count, no double audit event.
+                    # booked's own idempotent-retry docstring) - counted
+                    # per-call same as a fresh apply (matches this
+                    # method's pre-existing counting granularity), just
+                    # no double audit event.
+                    total_updated += 1
                     continue
                 detail = "pending → booked (fuzzy-matched, tracking key changed)"
                 previous_amount = Decimal(previous["amount_decimal"])
@@ -934,7 +1001,7 @@ class SyncEngine:
                     amount=p.new_amount,
                     detail=detail,
                 )
-            total_updated += len(pending_fuzzy)
+                total_updated += 1
 
         # Folded into total_created (not a separate CycleResult field): a
         # matched-and-replaced manual transaction results in exactly one
@@ -973,6 +1040,188 @@ class SyncEngine:
             fetched=classified.fetched_count,
         )
         return result, account_last_synced
+
+    async def _patch_single_update(
+        self, budget_id: str, ynab_transaction_id: str, new_amount: Decimal
+    ) -> bool:
+        """Issue one pending->booked correction PATCH for a single
+        transaction - always individual, never batched, since the bulk
+        pre-check in submit() has already screened out anything expected
+        to fail. Returns False (rather than raising) on a 400, since the
+        pre-check and this call observed the live state a moment apart -
+        e.g. deleted in that gap - which the caller treats identically to
+        a pre-check-detected deletion (see _recover_missing_pending_
+        update). Any other status code still propagates, unchanged - a
+        genuine transient failure the existing retry/backoff handles.
+        """
+        try:
+            await ynab_client.update_transactions(
+                self._http_client,
+                self._config.ynab.personal_access_token,
+                budget_id,
+                [
+                    {
+                        "id": ynab_transaction_id,
+                        "cleared": "cleared",
+                        "amount": to_milliunits(new_amount),
+                    }
+                ],
+            )
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 400:
+                return False
+            raise
+        return True
+
+    async def _recover_missing_pending_update(
+        self,
+        budget_id: str,
+        *,
+        tracking_key: str,
+        ynab_transaction_id: str,
+        new_amount: Decimal,
+        provider_type: str,
+        account_key: str,
+        new_tracking_key: str | None = None,
+    ) -> tuple[int, int]:
+        """A pending->booked correction's target transaction no longer
+        exists in YNAB - deleted directly in the YNAB app, e.g. because
+        the user found the uncleared preauth placeholder confusing and
+        replaced it by hand with the correct final amount (confirmed
+        live, 2026-08-26 - see CLAUDE.md's "Resolved: update PATCH could
+        permanently wedge the sync cycle"). Before giving up, look for
+        exactly that kind of live manual replacement - same account,
+        exact amount, within pending_import_date_window_days - using the
+        SAME candidate pool and create/native-match-or-replace flow
+        _classify()'s "matched_manual" outcome already uses
+        (list_unimported_transactions + _record_matched), rather than
+        inventing a second mechanism. Only marks the row DELETED
+        (permanent, human re-add via the DeletedTransactions GUI tab)
+        when no plausible replacement can be found - mirroring invariant
+        6's "never silently resurrect a possibly-intentional deletion"
+        stance: never blindly re-create when the money might already be
+        tracked under someone else's manual entry.
+
+        new_tracking_key, when given, means this came from the fuzzy
+        (transitioned_fuzzy) outcome - both endings below key the result
+        under new_tracking_key instead of the original PENDING
+        placeholder's, same "rekey, don't just update in place" reasoning
+        StateDB.rekey_pending_to_booked already documents.
+
+        Returns (created, resolved_deleted) - exactly one of the two is 1
+        and the other 0, mirroring how the SAME two outcomes are counted
+        everywhere else in submit(): a match found here creates a real
+        YNAB transaction via _record_matched(), same as matches_by_budget's
+        own total_created accounting; no match found marks the row
+        DELETED, the identical "resolved, but nothing created or
+        updated" event _backfill_duplicates already counts as
+        total_resolved_deleted. Both are 0 only in the (logged) error
+        case where there's no local tracked row left to recover from.
+        """
+        resolved_key = new_tracking_key or tracking_key
+        tracked = self._db.get_tracked(tracking_key)
+        if tracked is None:
+            logger.error(
+                "Pending update target %s for %r vanished from YNAB but no "
+                "local tracked row exists to recover from - skipping",
+                ynab_transaction_id,
+                tracking_key,
+            )
+            return 0, 0
+
+        candidates = await ynab_client.list_unimported_transactions(
+            self._http_client,
+            self._config.ynab.personal_access_token,
+            budget_id,
+            tracked["ynab_account_id"],
+        )
+        window_days = self._config.sync.pending_import_date_window_days
+        unit = self._config.sync.match_window_unit
+        target_amount_milliunits = to_milliunits(new_amount)
+        tracked_date = date.fromisoformat(tracked["transaction_date"])
+        matches = [
+            c
+            for c in candidates
+            if not c.get("subtransactions")
+            and c.get("amount") == target_amount_milliunits
+            and days_between(date.fromisoformat(c["date"]), tracked_date, unit) <= window_days
+        ]
+
+        if len(matches) != 1:
+            if len(matches) > 1:
+                logger.warning(
+                    "Ambiguous replacement for deleted pending-update target %r "
+                    "(%d same-amount, in-window candidates) - marking deleted "
+                    "instead of guessing.",
+                    tracking_key,
+                    len(matches),
+                )
+            await self._db.upsert_tracked(
+                tracking_key,
+                import_id=tracked["import_id"],
+                ynab_transaction_id=ynab_transaction_id,
+                ynab_budget_id=budget_id,
+                account_key=account_key,
+                booking_status="DELETED",
+                amount=new_amount,
+                payee_name=tracked["payee_name"],
+                memo=tracked["memo"],
+                transaction_date=tracked["transaction_date"],
+                ynab_account_id=tracked["ynab_account_id"],
+                cleared=tracked["cleared"],
+            )
+            await self._db.insert_audit_event(
+                event_type="duplicate",
+                source=provider_type,
+                account_key=account_key,
+                tracking_key=tracking_key,
+                ynab_transaction_id=ynab_transaction_id,
+                ynab_budget_id=budget_id,
+                payee_name=tracked["payee_name"],
+                amount=new_amount,
+                detail=(
+                    "marked deleted - update rejected, no replacement found, "
+                    "transaction no longer exists in YNAB"
+                ),
+            )
+            return 0, 1
+
+        match = matches[0]
+        replacement_tx: dict[str, Any] = {
+            "account_id": tracked["ynab_account_id"],
+            "date": match["date"],
+            "amount": match["amount"],
+            "category_id": match.get("category_id"),
+            "memo": match.get("memo"),
+            "cleared": "cleared",
+            "approved": match.get("approved", False),
+            "flag_color": match.get("flag_color"),
+            "import_id": derive_import_id(
+                prefix_of(tracked["import_id"]), f"{resolved_key}:reeval:{ynab_transaction_id}"
+            ),
+        }
+        if match.get("payee_id"):
+            replacement_tx["payee_id"] = match["payee_id"]
+        elif match.get("payee_name"):
+            replacement_tx["payee_name"] = match["payee_name"]
+
+        pending_match = _PendingManualMatch(
+            tracking_key=resolved_key,
+            ynab_tx=replacement_tx,
+            original_transaction_id=match["id"],
+            booking_status="BOOKED",
+            provider_account_id=account_key,
+            provider_type=provider_type,
+            raw_payee_name=tracked["payee_name"] or "",
+        )
+        response = await ynab_client.create_transactions(
+            self._http_client,
+            self._config.ynab.personal_access_token,
+            budget_id,
+            [pending_match.ynab_tx],
+        )
+        created = await self._record_matched(budget_id, [pending_match], response)
+        return created, 0
 
     async def run_cycle(
         self, on_progress: ProgressCallback | None = None
@@ -1068,12 +1317,29 @@ class SyncEngine:
                     created["id"],
                 )
                 await self._db.delete_payee_mappings_for_ids(budget_id, {stale_id})
-                await ynab_client.update_transactions(
-                    self._http_client,
-                    self._config.ynab.personal_access_token,
-                    budget_id,
-                    [{"id": created["id"], "payee_name": p.payee_name}],
-                )
+                try:
+                    await ynab_client.update_transactions(
+                        self._http_client,
+                        self._config.ynab.personal_access_token,
+                        budget_id,
+                        [{"id": created["id"], "payee_name": p.payee_name}],
+                    )
+                except httpx.HTTPStatusError as e:
+                    if e.response.status_code != 400:
+                        raise
+                    # The transaction we JUST created above is somehow
+                    # already gone - vanishingly rare (nothing else in
+                    # this same submit() call could have deleted it) but
+                    # not worth crashing the whole cycle over: log and
+                    # move on, the payee_name correction is cosmetic
+                    # (the transaction itself was already tracked above).
+                    logger.error(
+                        "Payee-name correction PATCH for just-created transaction "
+                        "%s (%r) got a 400 - transaction may already be gone. "
+                        "Skipping the correction, not the cycle.",
+                        created["id"],
+                        p.tracking_key,
+                    )
             # Only anchor a NEW payee_mappings entry when this create was
             # actually submitted with payee_name (no "payee_id" key at all
             # in the payload) - a transfer's primary leg already carries
@@ -1165,18 +1431,35 @@ class SyncEngine:
         # immediately via the same PATCH a normal pending->booked
         # transition uses, rather than waiting for a future poll.
         if secondary.booking_status == "BOOKED":
-            await ynab_client.update_transactions(
-                self._http_client,
-                self._config.ynab.personal_access_token,
-                budget_id,
-                [
-                    {
-                        "id": transfer_transaction_id,
-                        "cleared": "cleared",
-                        "amount": secondary.ynab_tx["amount"],
-                    }
-                ],
-            )
+            try:
+                await ynab_client.update_transactions(
+                    self._http_client,
+                    self._config.ynab.personal_access_token,
+                    budget_id,
+                    [
+                        {
+                            "id": transfer_transaction_id,
+                            "cleared": "cleared",
+                            "amount": secondary.ynab_tx["amount"],
+                        }
+                    ],
+                )
+            except httpx.HTTPStatusError as e:
+                if e.response.status_code != 400:
+                    raise
+                # YNAB auto-created this leg moments ago as part of the
+                # SAME create_transactions call above - somehow already
+                # gone is vanishingly rare, but not worth crashing the
+                # whole cycle over: the leg is already tracked (just
+                # potentially left uncleared until a future poll's
+                # normal pending->booked transition catches up).
+                logger.error(
+                    "Cleared/amount correction PATCH for transfer secondary leg "
+                    "%s (%r) got a 400 - leg may already be gone. Skipping the "
+                    "correction, not the cycle.",
+                    transfer_transaction_id,
+                    secondary.tracking_key,
+                )
         return 1
 
     async def _record_matched(

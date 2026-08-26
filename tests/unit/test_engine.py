@@ -547,6 +547,15 @@ async def test_run_cycle_updates_when_pending_transitions_to_booked(tmp_path: Pa
             },
         )
     )
+    # Bulk pre-check (submit()) confirms the target still exists before
+    # attempting the PATCH - see CLAUDE.md's "Resolved: update PATCH could
+    # permanently wedge the sync cycle".
+    respx.get(f"{ynab_client.BASE_URL}/{ynab_client.RESOURCE_PATH}/budget-1/transactions").mock(
+        return_value=httpx.Response(
+            200,
+            json={"data": {"transactions": [{"id": "ynab-transition", "deleted": False}]}},
+        )
+    )
     patch_route = respx.patch(
         f"{ynab_client.BASE_URL}/{ynab_client.RESOURCE_PATH}/budget-1/transactions"
     ).mock(return_value=httpx.Response(200, json={"data": {"transaction_ids": ["ynab-transition"]}}))
@@ -565,6 +574,274 @@ async def test_run_cycle_updates_when_pending_transitions_to_booked(tmp_path: Pa
     tracked = db.get_tracked("acct-1:tx-transition")
     assert tracked["booking_status"] == "BOOKED"
     assert tracked["amount_milliunits"] == -142500
+
+
+@respx.mock
+async def test_run_cycle_pending_update_target_deleted_no_replacement_marks_deleted(
+    tmp_path: Path,
+):
+    """The pending->booked PATCH target was deleted directly in YNAB (e.g.
+    by hand) and no plausible manually-typed replacement exists - see
+    CLAUDE.md's "Resolved: update PATCH could permanently wedge the sync
+    cycle". Must resolve to DELETED (for GUI re-add) rather than raising
+    and wedging the whole cycle, and must NOT attempt the doomed PATCH at
+    all (no patch route mocked - a PATCH attempt would fail this test with
+    a routing error).
+    """
+    config = make_config()
+    token_store = make_token_store(tmp_path)
+    db = make_db(tmp_path)
+    await seed_mappings(db, config)
+    await db.upsert_tracked(
+        "acct-1:tx-transition",
+        import_id=derive_import_id("acct-1:tx-transition"),
+        ynab_transaction_id="ynab-transition",
+        ynab_budget_id="budget-1",
+        account_key="acct-1",
+        booking_status="PENDING",
+        amount=from_milliunits(-130000),
+        payee_name="Merchant One",
+        transaction_date="2026-08-20",
+        ynab_account_id="ynab-acct-1",
+    )
+
+    respx.get(sb1_client.TRANSACTIONS_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "transactions": [
+                    {
+                        "id": "tx-transition",
+                        "nonUniqueId": "tx-transition",
+                        "accountKey": "acct-1",
+                        "date": "2026-08-20",
+                        "amount": -142.5,
+                        "bookingStatus": "BOOKED",
+                    }
+                ]
+            },
+        )
+    )
+    # Bulk pre-check confirms the target is gone.
+    respx.get(f"{ynab_client.BASE_URL}/{ynab_client.RESOURCE_PATH}/budget-1/transactions").mock(
+        return_value=httpx.Response(
+            200,
+            json={"data": {"transactions": [{"id": "ynab-transition", "deleted": True}]}},
+        )
+    )
+    # No manually-typed replacement candidate exists.
+    respx.get(_unimported_url("budget-1", "ynab-acct-1")).mock(
+        return_value=httpx.Response(200, json={"data": {"transactions": []}})
+    )
+
+    async with httpx.AsyncClient() as http_client:
+        engine = make_engine(config, http_client, token_store, db)
+        result, _ = await engine.run_cycle()
+
+    assert result.updated == 0
+    assert result.created == 0
+    assert result.resolved_deleted == 1
+
+    tracked = db.get_tracked("acct-1:tx-transition")
+    assert tracked["booking_status"] == "DELETED"
+    assert tracked["ynab_transaction_id"] == "ynab-transition"
+
+    events, _total = db.list_audit_events()
+    matching = [e for e in events if e["tracking_key"] == "acct-1:tx-transition"]
+    assert any("no replacement found" in (e["detail"] or "") for e in matching)
+
+
+@respx.mock
+async def test_run_cycle_pending_update_target_deleted_with_manual_replacement_resolves(
+    tmp_path: Path,
+):
+    """Same starting point as the test above, but this time the user's
+    live YNAB register already has a manually-typed replacement at the
+    exact final amount (e.g. they deleted the confusing uncleared preauth
+    placeholder and typed the correct one in themselves - confirmed live,
+    2026-08-26). The fix must find and adopt it (via the same create +
+    native-match-or-replace flow the "matched_manual" classify() outcome
+    already uses) instead of blindly marking the row DELETED, which would
+    have caused a real duplicate if a human later re-added it via the
+    GUI.
+    """
+    config = make_config()
+    token_store = make_token_store(tmp_path)
+    db = make_db(tmp_path)
+    await seed_mappings(db, config)
+    await db.upsert_tracked(
+        "acct-1:tx-transition",
+        import_id=derive_import_id("acct-1:tx-transition"),
+        ynab_transaction_id="ynab-transition",
+        ynab_budget_id="budget-1",
+        account_key="acct-1",
+        booking_status="PENDING",
+        amount=from_milliunits(-130000),
+        payee_name="Merchant One",
+        transaction_date="2026-08-20",
+        ynab_account_id="ynab-acct-1",
+    )
+
+    respx.get(sb1_client.TRANSACTIONS_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "transactions": [
+                    {
+                        "id": "tx-transition",
+                        "nonUniqueId": "tx-transition",
+                        "accountKey": "acct-1",
+                        "date": "2026-08-20",
+                        "amount": -142.5,
+                        "bookingStatus": "BOOKED",
+                    }
+                ]
+            },
+        )
+    )
+    respx.get(f"{ynab_client.BASE_URL}/{ynab_client.RESOURCE_PATH}/budget-1/transactions").mock(
+        return_value=httpx.Response(
+            200,
+            json={"data": {"transactions": [{"id": "ynab-transition", "deleted": True}]}},
+        )
+    )
+    respx.get(_unimported_url("budget-1", "ynab-acct-1")).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "data": {
+                    "transactions": [
+                        {
+                            "id": "manual-99",
+                            "date": "2026-08-20",
+                            "amount": -142500,
+                            "payee_name": "Merchant One",
+                            "category_id": "cat-1",
+                            "memo": None,
+                            "cleared": "cleared",
+                            "approved": True,
+                            "flag_color": None,
+                            "import_id": None,
+                            "deleted": False,
+                            "subtransactions": [],
+                        }
+                    ]
+                }
+            },
+        )
+    )
+    # Native matching does NOT fire in this mocked response (no
+    # matched_transaction_id) - exercises the create-then-delete fallback
+    # ending, the more consequential of the two to get right. The shadow's
+    # import_id is derived dynamically (from the tracked row's own hash),
+    # so echo back whatever was actually submitted rather than
+    # hardcoding a value - _record_matched() looks up its row by this
+    # exact echoed import_id.
+    def _create_side_effect(request):
+        submitted = json.loads(request.content)["transactions"][0]
+        return httpx.Response(
+            200,
+            json={
+                "data": {
+                    "transaction_ids": ["ynab-shadow-1"],
+                    "duplicate_import_ids": [],
+                    "transactions": [
+                        {
+                            "id": "ynab-shadow-1",
+                            "amount": -142500,
+                            "import_id": submitted["import_id"],
+                        }
+                    ],
+                }
+            },
+        )
+
+    create_route = respx.post(
+        f"{ynab_client.BASE_URL}/{ynab_client.RESOURCE_PATH}/budget-1/transactions"
+    ).mock(side_effect=_create_side_effect)
+    delete_route = respx.delete(
+        f"{ynab_client.BASE_URL}/{ynab_client.RESOURCE_PATH}/budget-1/transactions/manual-99"
+    ).mock(return_value=httpx.Response(200, json={"data": {"transaction": {"deleted": True}}}))
+
+    async with httpx.AsyncClient() as http_client:
+        engine = make_engine(config, http_client, token_store, db)
+        result, _ = await engine.run_cycle()
+
+    assert result.created == 1
+    assert result.updated == 0
+    assert result.resolved_deleted == 0
+    assert create_route.called
+    assert delete_route.called
+
+    tracked = db.get_tracked("acct-1:tx-transition")
+    assert tracked["booking_status"] == "BOOKED"
+    assert tracked["ynab_transaction_id"] == "ynab-shadow-1"
+    assert tracked["amount_milliunits"] == -142500
+
+
+@respx.mock
+async def test_run_cycle_pending_update_patch_unexpectedly_400s_recovers(tmp_path: Path):
+    """The bulk pre-check reports the target as alive, but the individual
+    PATCH itself still gets a 400 (e.g. deleted in the split second
+    between the two calls). Must fall into the same recover-or-mark-
+    deleted path rather than raising and aborting the whole cycle.
+    """
+    config = make_config()
+    token_store = make_token_store(tmp_path)
+    db = make_db(tmp_path)
+    await seed_mappings(db, config)
+    await db.upsert_tracked(
+        "acct-1:tx-transition",
+        import_id=derive_import_id("acct-1:tx-transition"),
+        ynab_transaction_id="ynab-transition",
+        ynab_budget_id="budget-1",
+        account_key="acct-1",
+        booking_status="PENDING",
+        amount=from_milliunits(-130000),
+        payee_name="Merchant One",
+        transaction_date="2026-08-20",
+        ynab_account_id="ynab-acct-1",
+    )
+
+    respx.get(sb1_client.TRANSACTIONS_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "transactions": [
+                    {
+                        "id": "tx-transition",
+                        "nonUniqueId": "tx-transition",
+                        "accountKey": "acct-1",
+                        "date": "2026-08-20",
+                        "amount": -142.5,
+                        "bookingStatus": "BOOKED",
+                    }
+                ]
+            },
+        )
+    )
+    respx.get(f"{ynab_client.BASE_URL}/{ynab_client.RESOURCE_PATH}/budget-1/transactions").mock(
+        return_value=httpx.Response(
+            200,
+            json={"data": {"transactions": [{"id": "ynab-transition", "deleted": False}]}},
+        )
+    )
+    respx.get(_unimported_url("budget-1", "ynab-acct-1")).mock(
+        return_value=httpx.Response(200, json={"data": {"transactions": []}})
+    )
+    respx.patch(f"{ynab_client.BASE_URL}/{ynab_client.RESOURCE_PATH}/budget-1/transactions").mock(
+        return_value=httpx.Response(
+            400, json={"error": {"id": "400", "name": "bad_request", "detail": "gone"}}
+        )
+    )
+
+    async with httpx.AsyncClient() as http_client:
+        engine = make_engine(config, http_client, token_store, db)
+        result, _ = await engine.run_cycle()
+
+    assert result.resolved_deleted == 1
+    tracked = db.get_tracked("acct-1:tx-transition")
+    assert tracked["booking_status"] == "DELETED"
 
 
 @respx.mock
@@ -1959,6 +2236,12 @@ async def test_run_cycle_records_audit_event_for_updated_transaction(tmp_path: P
             },
         )
     )
+    respx.get(f"{ynab_client.BASE_URL}/{ynab_client.RESOURCE_PATH}/budget-1/transactions").mock(
+        return_value=httpx.Response(
+            200,
+            json={"data": {"transactions": [{"id": "ynab-transition", "deleted": False}]}},
+        )
+    )
     respx.patch(
         f"{ynab_client.BASE_URL}/{ynab_client.RESOURCE_PATH}/budget-1/transactions"
     ).mock(return_value=httpx.Response(200, json={"data": {"transaction_ids": ["ynab-transition"]}}))
@@ -3043,6 +3326,12 @@ async def test_run_cycle_fuzzy_matches_pending_to_booked_across_different_tracki
             },
         )
     )
+    respx.get(f"{ynab_client.BASE_URL}/{ynab_client.RESOURCE_PATH}/budget-1/transactions").mock(
+        return_value=httpx.Response(
+            200,
+            json={"data": {"transactions": [{"id": "ynab-pending-1", "deleted": False}]}},
+        )
+    )
     patch_route = respx.patch(
         f"{ynab_client.BASE_URL}/{ynab_client.RESOURCE_PATH}/budget-1/transactions"
     ).mock(return_value=httpx.Response(200, json={"data": {"transaction_ids": ["ynab-pending-1"]}}))
@@ -3111,6 +3400,12 @@ async def test_run_cycle_fuzzy_transition_retry_safe(tmp_path: Path):
                     }
                 ]
             },
+        )
+    )
+    respx.get(f"{ynab_client.BASE_URL}/{ynab_client.RESOURCE_PATH}/budget-1/transactions").mock(
+        return_value=httpx.Response(
+            200,
+            json={"data": {"transactions": [{"id": "ynab-pending-1", "deleted": False}]}},
         )
     )
     respx.patch(f"{ynab_client.BASE_URL}/{ynab_client.RESOURCE_PATH}/budget-1/transactions").mock(
@@ -3666,6 +3961,12 @@ async def test_run_cycle_pending_manual_match_row_later_fuzzy_resolves_when_book
     ).mock(
         return_value=httpx.Response(
             200, json={"data": {"transaction": {"id": "manual-7", "deleted": True}}}
+        )
+    )
+    respx.get(f"{ynab_client.BASE_URL}/{ynab_client.RESOURCE_PATH}/budget-1/transactions").mock(
+        return_value=httpx.Response(
+            200,
+            json={"data": {"transactions": [{"id": "ynab-replacement-7", "deleted": False}]}},
         )
     )
     respx.patch(f"{ynab_client.BASE_URL}/{ynab_client.RESOURCE_PATH}/budget-1/transactions").mock(

@@ -330,6 +330,39 @@ async def find_transaction_by_import_id(
 
 
 @retry_get
+async def list_transactions_including_deleted(
+    http_client: httpx.AsyncClient,
+    personal_access_token: str,
+    budget_id: str,
+) -> list[dict[str, Any]]:
+    """The full budget-wide transaction history, including deleted ones -
+    each row carries a `deleted` boolean field.
+
+    Confirmed live: YNAB's plain (non-delta) transaction listing silently
+    excludes deleted transactions - passing last_knowledge_of_server=0 to
+    the budget-wide endpoint is the only way to see them, which is what
+    lets a caller distinguish "really gone/lost local state, transaction
+    is still active" from "this transaction was intentionally deleted,
+    stop retrying it." See find_transaction_including_deleted (searches
+    this same list for one import_id) and engine.py's submit(), which uses
+    this directly to bulk-check a whole batch of pending->booked update
+    targets before ever attempting a PATCH (see CLAUDE.md's "Resolved:
+    update PATCH could permanently wedge the sync cycle").
+
+    Budget-wide rather than account-scoped, and heavier than
+    list_unimported_transactions/find_transaction_by_import_id - don't
+    call this routinely, only when deleted-transaction visibility is
+    actually needed.
+    """
+    response = await http_client.get(
+        f"{BASE_URL}/{RESOURCE_PATH}/{budget_id}/transactions",
+        headers=_headers(personal_access_token),
+        params={"last_knowledge_of_server": 0},
+    )
+    response.raise_for_status()
+    return response.json()["data"]["transactions"]
+
+
 async def find_transaction_including_deleted(
     http_client: httpx.AsyncClient,
     personal_access_token: str,
@@ -344,23 +377,15 @@ async def find_transaction_including_deleted(
     create attempt with that import_id as a duplicate forever - but
     find_transaction_by_import_id's plain (non-delta) listing silently
     excludes deleted transactions, so it can never find the reason why.
-    Passing last_knowledge_of_server=0 to the budget-wide transactions
-    endpoint returns the full history including deleted ones (each with a
-    `deleted` boolean field), which is the only way to distinguish "really
-    lost local state, transaction is still active" from "this import_id's
-    transaction was intentionally deleted, stop retrying it."
 
-    Budget-wide rather than account-scoped, and heavier than
-    find_transaction_by_import_id - only call this as a second-line check
-    after that cheaper lookup fails, not routinely.
+    Only call this as a second-line check after that cheaper lookup fails,
+    not routinely - see list_transactions_including_deleted (the retried
+    GET this wraps) for why.
     """
-    response = await http_client.get(
-        f"{BASE_URL}/{RESOURCE_PATH}/{budget_id}/transactions",
-        headers=_headers(personal_access_token),
-        params={"last_knowledge_of_server": 0},
+    transactions = await list_transactions_including_deleted(
+        http_client, personal_access_token, budget_id
     )
-    response.raise_for_status()
-    for transaction in response.json()["data"]["transactions"]:
+    for transaction in transactions:
         if transaction.get("import_id") == import_id:
             return transaction
     return None

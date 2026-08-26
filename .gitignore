@@ -22,3 +22,7 @@ venv/
 
 # IDE
 .idea/
+
+# Personal Claude Code assets — local to this machine, never shared/committed
+.claude/skills/bobk-production-debug/
+.claude/settings.local.json

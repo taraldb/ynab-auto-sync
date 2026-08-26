@@ -93,28 +93,11 @@ class NorwegianBankTransformer(TransformerBase):
         cleaned_payee = clean_bank_text(str(text))
         payee_name = (cleaned_payee or str(text))[:YNAB_PAYEE_NAME_MAX_LEN]
 
-        # Judgment call: Merchant Category (col 8) carries real,
-        # payee-distinct information in actual exports - e.g. Text=
-        # "PAYPAL *JAGEX LTD" alongside Merchant Category=
-        # "VIDEO GAME ARCADES/ESTABLISH", or Text="KIWI 766 FARSUND"
-        # alongside "GROCERY STORES/SUPERMARKETS" - confirmed by inspecting
-        # ynab-converter's real sample file. That's more useful as a memo
-        # than always leaving memo empty (the sibling CLI project's own
-        # choice, made when its output format had no memo-worthy use for
-        # it). Blank for the one observed row type without a merchant (an
-        # incoming transfer, "Innbetaling"), where the raw value is "".
-        memo = None
-        if len(row) > COL_MERCHANT_CATEGORY:
-            merchant_category = row[COL_MERCHANT_CATEGORY]
-            if merchant_category:
-                cleaned_memo = clean_bank_text(str(merchant_category))
-                memo = (cleaned_memo or str(merchant_category))[:YNAB_MEMO_MAX_LEN]
-
         return ImportedTransactionRow(
             date=tx_date,
             amount_milliunits=amount_milliunits,
             payee_name=payee_name,
-            memo=memo,
+            memo=None,
             row_index=row_index,
         )
 

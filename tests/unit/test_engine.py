@@ -2349,6 +2349,131 @@ def _unimported_url(budget_id: str, ynab_account_id: str) -> str:
 
 @respx.mock
 async def test_run_cycle_matches_unambiguous_manual_transaction(tmp_path: Path):
+    """Exact-amount manual match: YNAB's own native transaction-matching
+    fires (matched_transaction_id set on the newly-created shadow),
+    confirmed live via scripts/verify_ynab_native_match_amount_sensitivity.py.
+    The original stays fully visible, untouched, holding the user's own
+    categorization - the code must NOT delete it. No delete route is
+    mocked at all here (same "prove it's never called" pattern the
+    ambiguous-match test below already uses) - a wrongful delete attempt
+    would fail this test with a routing error.
+    """
+    config = make_config()
+    config.sync.manual_match_window_days = 3
+    token_store = make_token_store(tmp_path)
+    db = make_db(tmp_path)
+    await seed_mappings(db, config)
+
+    respx.get(sb1_client.TRANSACTIONS_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "transactions": [
+                    {
+                        "id": "tx-mm-1",
+                        "nonUniqueId": "tx-mm-1",
+                        "accountKey": "acct-1",
+                        "date": "2026-08-20",
+                        "amount": -463.54,
+                        "description": "TELIA NORGE AS,TELIA",
+                        "bookingStatus": "BOOKED",
+                    }
+                ]
+            },
+        )
+    )
+    respx.get(_unimported_url("budget-1", "ynab-acct-1")).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "data": {
+                    "transactions": [
+                        {
+                            "id": "manual-1",
+                            "date": "2026-08-19",
+                            "amount": -463540,
+                            "payee_id": "payee-manual-1",
+                            "payee_name": "Telia",
+                            "category_id": "cat-1",
+                            "memo": "user's own note",
+                            "cleared": "cleared",
+                            "approved": True,
+                            "flag_color": "blue",
+                            "import_id": None,
+                            "deleted": False,
+                            "subtransactions": [],
+                        }
+                    ]
+                }
+            },
+        )
+    )
+    import_id = derive_import_id("acct-1:tx-mm-1")
+    respx.post(f"{ynab_client.BASE_URL}/{ynab_client.RESOURCE_PATH}/budget-1/transactions").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "data": {
+                    "transaction_ids": ["ynab-tx-replacement", "manual-1"],
+                    "duplicate_import_ids": [],
+                    "transactions": [
+                        {
+                            "id": "ynab-tx-replacement",
+                            "import_id": import_id,
+                            "payee_name": "Telia",
+                            "amount": -463540,
+                            "matched_transaction_id": "manual-1",
+                        },
+                        {
+                            # YNAB's native matching echoes the still-live
+                            # original back in the same response too -
+                            # approved flipped to false, matched_
+                            # transaction_id set on both sides - confirmed
+                            # live via scripts/verify_ynab_native_match_
+                            # amount_sensitivity.py.
+                            "id": "manual-1",
+                            "import_id": None,
+                            "payee_name": "Telia",
+                            "amount": -463540,
+                            "matched_transaction_id": "ynab-tx-replacement",
+                            "approved": False,
+                        },
+                    ],
+                }
+            },
+        )
+    )
+
+    async with httpx.AsyncClient() as http_client:
+        engine = make_engine(config, http_client, token_store, db)
+        result, _ = await engine.run_cycle()
+
+    assert result.created == 1
+
+    tracked = db.get_tracked("acct-1:tx-mm-1")
+    assert tracked is not None
+    # The VISIBLE original's id, not the shadow's - see _record_matched().
+    assert tracked["ynab_transaction_id"] == "manual-1"
+    assert tracked["import_id"] == import_id
+    assert tracked["booking_status"] == "BOOKED"
+    # Payee preference learned from the matched candidate's own payee_id,
+    # so a future "Telia" transaction with no manual match resolves to the
+    # same payee (invariant 12).
+    assert db.get_payee_id("budget-1", "TELIA NORGE AS,TELIA") == "payee-manual-1"
+
+
+@respx.mock
+async def test_run_cycle_manual_match_falls_back_to_delete_recreate_when_native_match_fails(
+    tmp_path: Path,
+):
+    """When YNAB's native transaction-matching does NOT fire (its date-gap
+    sensitivity is confirmed non-monotonic/undocumented - see invariant 8's
+    native-matching caveat), the code must fall back to the older
+    create-then-delete behavior so a visible duplicate is never left
+    behind. Same setup as test_run_cycle_matches_unambiguous_manual_
+    transaction, but the mocked create response carries no
+    matched_transaction_id at all.
+    """
     config = make_config()
     config.sync.manual_match_window_days = 3
     token_store = make_token_store(tmp_path)
@@ -3004,6 +3129,14 @@ async def test_run_cycle_fuzzy_transition_retry_safe(tmp_path: Path):
 
 @respx.mock
 async def test_run_cycle_tolerant_manual_match_replaces_with_pending_transaction(tmp_path: Path):
+    """Tolerant (PENDING) manual match: the submitted amount is now the
+    matched candidate's own exact amount (not the bank's rounded preauth
+    amount) specifically so YNAB's native transaction-matching fires -
+    confirmed live via scripts/verify_ynab_native_match_amount_sensitivity.py
+    that even a 0.42 kr difference suppresses it. Same "leave both alone,
+    original stays visible" outcome as the exact/BOOKED matcher - no delete
+    route mocked at all, proving the original is never touched.
+    """
     config = make_config()
     config.sync.pending_import_enabled = True
     config.sync.manual_match_window_days = 3
@@ -3064,10 +3197,120 @@ async def test_run_cycle_tolerant_manual_match_replaces_with_pending_transaction
             200,
             json={
                 "data": {
+                    "transaction_ids": ["ynab-replacement-6", "manual-6"],
+                    "duplicate_import_ids": [],
+                    "transactions": [
+                        {
+                            "id": "ynab-replacement-6",
+                            "import_id": import_id,
+                            "amount": -218300,
+                            "matched_transaction_id": "manual-6",
+                        },
+                        {
+                            "id": "manual-6",
+                            "import_id": None,
+                            "payee_name": "Merchant One",
+                            "amount": -218300,
+                            "matched_transaction_id": "ynab-replacement-6",
+                            "approved": False,
+                        },
+                    ],
+                }
+            },
+        )
+    )
+
+    async with httpx.AsyncClient() as http_client:
+        engine = make_engine(config, http_client, token_store, db)
+        result, _ = await engine.run_cycle()
+
+    assert result.created == 1
+    tracked = db.get_tracked("acct-1:333333333")
+    assert tracked is not None
+    # The VISIBLE original's id, not the shadow's - see _record_matched().
+    assert tracked["ynab_transaction_id"] == "manual-6"
+    assert tracked["booking_status"] == "PENDING"
+    assert tracked["cleared"] == "uncleared"
+    # The submitted (and now tracked) amount is the matched candidate's own
+    # exact amount, not the bank's rounded preauth - required for native
+    # matching to fire at all. Any tiny remaining difference from the real
+    # settled amount self-corrects once BOOKED via the existing fuzzy
+    # pending->booked pipeline (unchanged - see the tests above).
+    assert tracked["amount_milliunits"] == -218300
+    assert db.get_payee_id("budget-1", "MERCHANT ONE, LOC-A") == "payee-manual-6"
+
+
+@respx.mock
+async def test_run_cycle_tolerant_manual_match_falls_back_when_native_match_fails(
+    tmp_path: Path,
+):
+    """Same scenario as test_run_cycle_tolerant_manual_match_replaces_with_
+    pending_transaction, but the mocked create response carries no
+    matched_transaction_id - proving the code falls back to delete-then-
+    recreate (today's pre-native-match behavior) rather than leaving a
+    visible duplicate when YNAB's native matching doesn't cooperate.
+    """
+    config = make_config()
+    config.sync.pending_import_enabled = True
+    config.sync.manual_match_window_days = 3
+    token_store = make_token_store(tmp_path)
+    db = make_db(tmp_path)
+    await seed_mappings(db, config)
+
+    _mock_creditcard_account()
+    respx.get(sb1_client.TRANSACTIONS_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "transactions": [
+                    {
+                        "nonUniqueId": "333333333",
+                        "accountKey": "acct-1",
+                        "date": "2026-08-20",
+                        "amount": -218,
+                        "description": "MERCHANT ONE, LOC-A",
+                        "bookingStatus": "PENDING",
+                    }
+                ]
+            },
+        )
+    )
+    respx.get(_unimported_url("budget-1", "ynab-acct-1")).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "data": {
+                    "transactions": [
+                        {
+                            "id": "manual-6",
+                            "date": "2026-08-19",
+                            "amount": -218300,
+                            "payee_id": "payee-manual-6",
+                            "payee_name": "Merchant One",
+                            "category_id": "cat-1",
+                            "memo": None,
+                            "cleared": "cleared",
+                            "approved": True,
+                            "flag_color": None,
+                            "import_id": None,
+                            "deleted": False,
+                            "subtransactions": [],
+                        }
+                    ]
+                }
+            },
+        )
+    )
+    import_id = derive_import_id("acct-1:333333333")
+    respx.post(f"{ynab_client.BASE_URL}/{ynab_client.RESOURCE_PATH}/budget-1/transactions").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "data": {
                     "transaction_ids": ["ynab-replacement-6"],
                     "duplicate_import_ids": [],
                     "transactions": [
-                        {"id": "ynab-replacement-6", "import_id": import_id, "amount": -218000}
+                        {"id": "ynab-replacement-6", "import_id": import_id, "amount": -218300}
                     ],
                 }
             },
@@ -3089,12 +3332,10 @@ async def test_run_cycle_tolerant_manual_match_replaces_with_pending_transaction
     assert delete_route.called
     tracked = db.get_tracked("acct-1:333333333")
     assert tracked is not None
+    assert tracked["ynab_transaction_id"] == "ynab-replacement-6"
     assert tracked["booking_status"] == "PENDING"
     assert tracked["cleared"] == "uncleared"
-    # The replacement carries the BANK's own amount (the pending preauth),
-    # not the manual entry's amount - it's corrected to the real final
-    # amount once booked, same as any other pending placeholder.
-    assert tracked["amount_milliunits"] == -218000
+    assert tracked["amount_milliunits"] == -218300
 
 
 @respx.mock

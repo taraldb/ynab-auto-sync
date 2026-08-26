@@ -180,12 +180,22 @@ class _PendingManualMatch:
     Confirmed live (scripts/verify_ynab_import_id_patch.py) that YNAB
     silently ignores import_id in a PATCH payload - there is no way to
     retroactively grant an existing transaction real import_id-dedup
-    protection. The only way is create-then-delete: submit ynab_tx (which
-    carries a fresh, real import_id plus the original's own payee_id/
-    category_id/approved/flag_color/memo, and the REAL bank date/amount) as
-    a brand new transaction, and only once that succeeds, delete
-    original_transaction_id. Never the other order - see submit()'s
-    _record_matched for why.
+    protection. Also confirmed live (scripts/verify_ynab_native_match_
+    amount_sensitivity.py): submitting ynab_tx (a fresh, real import_id at
+    the SAME exact amount as original_transaction_id) triggers YNAB's own
+    native transaction-matching - the new transaction becomes permanently
+    excluded from the normal account register while original_transaction_id
+    stays fully visible, untouched, with the user's own categorization
+    intact. submit()'s _record_matched() prefers this outcome (leaving both
+    transactions alone - see CLAUDE.md's "Manual-transaction matching"
+    section for the full design) and only falls back to the older
+    create-then-delete behavior when native matching doesn't fire (its
+    date-gap sensitivity is undocumented and confirmed non-monotonic - see
+    invariant 8's own native-matching caveat). ynab_tx's amount is always
+    the matched candidate's own (already-accurate) amount now, not the
+    bank ntx's - this is deliberate, see _classify()'s manual-match branch -
+    so the SAME payload works correctly for either outcome without a second
+    API call.
     """
 
     tracking_key: str
@@ -194,6 +204,7 @@ class _PendingManualMatch:
     booking_status: str
     provider_account_id: str
     provider_type: str
+    raw_payee_name: str
 
 
 @dataclass
@@ -480,7 +491,19 @@ class SyncEngine:
                     replacement_tx: dict[str, Any] = {
                         "account_id": ynab_account_id,
                         "date": ntx.date.isoformat(),
-                        "amount": ntx.amount_milliunits,
+                        # The MATCHED CANDIDATE's own amount, not ntx's - for
+                        # the exact/BOOKED matcher these are already
+                        # identical by construction, but for the tolerant/
+                        # PENDING matcher ntx's amount is a rounded preauth
+                        # value that would never exactly equal an existing
+                        # transaction's amount. Submitting the candidate's
+                        # own exact amount is what makes YNAB's native
+                        # transaction-matching fire (confirmed live via
+                        # scripts/verify_ynab_native_match_amount_
+                        # sensitivity.py - see _PendingManualMatch's
+                        # docstring) - the one lever _record_matched()'s
+                        # native-match branch depends on.
+                        "amount": match["amount"],
                         "category_id": match.get("category_id"),
                         "memo": match.get("memo"),
                         "cleared": cleared,
@@ -499,6 +522,7 @@ class SyncEngine:
                         booking_status=str(ntx.booking_status),
                         provider_account_id=ntx.provider_account_id,
                         provider_type=provider_type,
+                        raw_payee_name=ntx.payee_name,
                     )
 
             # Anchor to a previously-cached YNAB payee_id when this exact
@@ -1153,38 +1177,62 @@ class SyncEngine:
         pending_matches: list[_PendingManualMatch],
         response: dict[str, Any],
     ) -> int:
-        """Finishes a "matched_manual" outcome (see _classify()): tracks the
-        just-created replacement transaction, then deletes the original
-        manual transaction it replaces. Returns the number of replacement
-        rows tracked (== new transactions in YNAB), for submit()'s
-        total_created.
+        """Finishes a "matched_manual" outcome (see _classify()). Two
+        possible endings, decided per-row by whether YNAB's native
+        transaction-matching actually fired on the just-created shadow
+        transaction (created.get("matched_transaction_id")):
+
+        - Native match fired (the common case, confirmed live via
+          scripts/verify_ynab_native_match_amount_sensitivity.py): leave
+          BOTH transactions alone - original_transaction_id stays fully
+          visible with the user's own categorization untouched, the new
+          shadow transaction becomes YNAB's permanently-invisible-from-the-
+          register import_id anchor. tracked_transactions.ynab_transaction_id
+          is set to original_transaction_id (the visible one), not the
+          shadow's id, so every existing consumer of that column (audit UI,
+          readd-deleted-transaction, the pending->booked fuzzy-transition
+          PATCH target) keeps its "this id is fetchable" assumption true.
+          Also learns payee_mappings from the matched candidate's own
+          payee_id (see _classify()'s manual-match branch) so a FUTURE bank
+          transaction for this same raw merchant text resolves to the same
+          payee the user already established here (invariant 12).
+        - Native match did NOT fire (its date-gap sensitivity is
+          undocumented and confirmed non-monotonic - see invariant 8's own
+          native-matching caveat): fall back to the older create-then-
+          delete behavior - the shadow (already fully-formed with the
+          matched candidate's own category/payee/memo, per _classify())
+          becomes the sole surviving, visible transaction, and
+          original_transaction_id is deleted. Deliberately create-then-
+          delete, never the other order: if the create fails, the original
+          manual transaction is left completely untouched (safe). If the
+          create succeeds but the delete fails, both transactions remain
+          visible in YNAB - a manually-resolvable duplicate, not lost data,
+          the safer of the two possible failure modes.
 
         Never indexes response["transactions"] positionally. YNAB's
         create_transactions has its own native, undocumented transaction-
         matching: when a submitted transaction carries an import_id and an
-        existing transaction on the same account/amount is still present
-        (which it always is here, since the original isn't deleted until
-        AFTER this call), YNAB echoes that still-live original back in this
-        SAME response too (with its own approved flipped to false and
-        matched_transaction_id set on both sides) - confirmed live via
-        scripts/verify_ynab_delete_recreate.py. Harmless for this flow
-        (the original is deleted unconditionally below regardless), but
-        picking transactions[0] would sometimes grab the wrong row - the
-        replacement is found by its own submitted import_id instead, same
-        pattern _record_created already uses.
+        existing transaction on the same account/amount is still present,
+        YNAB echoes that still-live original back in this SAME response too
+        (with its own approved flipped to false and matched_transaction_id
+        set on both sides) - confirmed live via
+        scripts/verify_ynab_delete_recreate.py. The shadow row is found by
+        its own submitted import_id instead, same pattern _record_created
+        already uses.
 
-        Deliberately create-then-delete, never the other order: if the
-        create fails, the original manual transaction is left completely
-        untouched (safe). If the create succeeds but the delete fails, both
-        transactions remain visible in YNAB - a manually-resolvable
-        duplicate, not lost data, which is the safer of the two possible
-        failure modes.
+        Returns the number of shadow transactions created (== new
+        transactions in YNAB, one per matched row regardless of which
+        ending above applies), for submit()'s total_created.
 
         Retry-safe: submit() may be called again with the same
         ClassifiedCycle after a prior partial failure (see its docstring).
         A resubmitted match comes back in duplicate_import_ids rather than
-        transactions - handled below by re-attempting only the delete
-        (idempotent: a 404 means a prior attempt's delete already
+        transactions - handled below by re-looking-up the shadow via
+        find_transaction_by_import_id (a duplicate_import_ids response
+        carries no transaction body to inspect) and finishing whichever
+        ending its current matched_transaction_id state implies (idempotent
+        either way: upsert_tracked/upsert_payee_mapping tolerate repeats,
+        and a 404 on delete means a prior attempt's delete already
         succeeded, confirmed live, not an error).
         """
         by_import_id = {p.ynab_tx["import_id"]: p for p in pending_matches}
@@ -1222,19 +1270,54 @@ class SyncEngine:
                     ),
                 )
 
-        for created in response.get("transactions", []):
-            p = by_import_id.get(created.get("import_id"))
-            if p is None:
-                continue  # YNAB's native matching echoing back the original - not ours
+        async def _finish_native_match(p: _PendingManualMatch, shadow: dict[str, Any]) -> None:
             await self._db.upsert_tracked(
                 p.tracking_key,
                 import_id=p.ynab_tx["import_id"],
-                ynab_transaction_id=created["id"],
+                ynab_transaction_id=p.original_transaction_id,
                 ynab_budget_id=budget_id,
                 account_key=p.provider_account_id,
                 booking_status=p.booking_status,
                 amount_milliunits=p.ynab_tx["amount"],
-                payee_name=created.get("payee_name"),
+                payee_name=shadow.get("payee_name"),
+                memo=p.ynab_tx["memo"],
+                transaction_date=p.ynab_tx["date"],
+                ynab_account_id=p.ynab_tx["account_id"],
+                cleared=p.ynab_tx["cleared"],
+            )
+            payee_id = p.ynab_tx.get("payee_id")
+            if payee_id:
+                await self._db.upsert_payee_mapping(budget_id, p.raw_payee_name, payee_id)
+            await self._db.insert_audit_event(
+                event_type="created",
+                source=p.provider_type,
+                account_key=p.provider_account_id,
+                tracking_key=p.tracking_key,
+                import_id=p.ynab_tx["import_id"],
+                ynab_transaction_id=p.original_transaction_id,
+                ynab_budget_id=budget_id,
+                ynab_account_id=p.ynab_tx["account_id"],
+                payee_name=shadow.get("payee_name"),
+                memo=p.ynab_tx["memo"],
+                transaction_date=p.ynab_tx["date"],
+                amount_milliunits=p.ynab_tx["amount"],
+                detail=(
+                    f"natively linked to pre-existing manual transaction "
+                    f"{p.original_transaction_id} (import_id anchored on hidden "
+                    f"transaction {shadow['id']})"
+                ),
+            )
+
+        async def _finish_fallback(p: _PendingManualMatch, shadow: dict[str, Any]) -> None:
+            await self._db.upsert_tracked(
+                p.tracking_key,
+                import_id=p.ynab_tx["import_id"],
+                ynab_transaction_id=shadow["id"],
+                ynab_budget_id=budget_id,
+                account_key=p.provider_account_id,
+                booking_status=p.booking_status,
+                amount_milliunits=p.ynab_tx["amount"],
+                payee_name=shadow.get("payee_name"),
                 memo=p.ynab_tx["memo"],
                 transaction_date=p.ynab_tx["date"],
                 ynab_account_id=p.ynab_tx["account_id"],
@@ -1246,10 +1329,10 @@ class SyncEngine:
                 account_key=p.provider_account_id,
                 tracking_key=p.tracking_key,
                 import_id=p.ynab_tx["import_id"],
-                ynab_transaction_id=created["id"],
+                ynab_transaction_id=shadow["id"],
                 ynab_budget_id=budget_id,
                 ynab_account_id=p.ynab_tx["account_id"],
-                payee_name=created.get("payee_name"),
+                payee_name=shadow.get("payee_name"),
                 memo=p.ynab_tx["memo"],
                 transaction_date=p.ynab_tx["date"],
                 amount_milliunits=p.ynab_tx["amount"],
@@ -1258,8 +1341,17 @@ class SyncEngine:
                     f"{p.original_transaction_id}"
                 ),
             )
+            await _delete_original(p, shadow["id"])
+
+        for created in response.get("transactions", []):
+            p = by_import_id.get(created.get("import_id"))
+            if p is None:
+                continue  # YNAB's native matching echoing back the original - not ours
+            if created.get("matched_transaction_id"):
+                await _finish_native_match(p, created)
+            else:
+                await _finish_fallback(p, created)
             tracked_count += 1
-            await _delete_original(p, created["id"])
 
         for import_id in response.get("duplicate_import_ids", []):
             p = by_import_id.get(import_id)
@@ -1267,17 +1359,36 @@ class SyncEngine:
                 continue
             tracked = self._db.get_tracked(p.tracking_key)
             if tracked is not None:
-                # Already created and tracked by a prior submit() attempt -
-                # only the delete of the original might still be pending.
+                if tracked["ynab_transaction_id"] == p.original_transaction_id:
+                    continue  # native-match ending already fully applied
+                # Fallback ending was chosen on a prior attempt - only the
+                # delete of the original might still be pending.
                 await _delete_original(p, tracked["ynab_transaction_id"])
-            # else: reported as a duplicate but no local tracking row - the
-            # same rare "local state reset" case _backfill_duplicates
-            # handles for ordinary creates. Not re-derived here (would need
-            # find_transaction_by_import_id plus locating which original,
-            # if any, still needs deleting) - low-stakes, since the
-            # replacement is still fully protected by YNAB's own import_id
-            # dedup either way, and worth documenting as a known
-            # simplification rather than solving now.
+                continue
+            # Not yet tracked locally (prior attempt died between the
+            # create succeeding and the local DB write) - re-derive which
+            # ending applies from the shadow's own current state. The
+            # shadow is always findable this way regardless of ending: the
+            # native-match ending never touches it, and the fallback ending
+            # only ever deletes original_transaction_id, never the shadow.
+            shadow = await ynab_client.find_transaction_by_import_id(
+                self._http_client,
+                self._config.ynab.personal_access_token,
+                budget_id,
+                p.ynab_tx["account_id"],
+                import_id,
+            )
+            if shadow is None:
+                # Reported as a duplicate but the shadow can't be found -
+                # the same rare "local state reset" case _backfill_
+                # duplicates handles for ordinary creates. Not re-derived
+                # further here - low-stakes, since the shadow is still
+                # fully protected by YNAB's own import_id dedup either way.
+                continue
+            if shadow.get("matched_transaction_id"):
+                await _finish_native_match(p, shadow)
+            else:
+                await _finish_fallback(p, shadow)
 
         return tracked_count
 

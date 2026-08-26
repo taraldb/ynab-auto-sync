@@ -430,7 +430,7 @@ export default function Dashboard() {
 
       <div className="flex items-center justify-between text-xs text-slate-600">
         <span className="flex items-center gap-3">
-          <span>{status.version}</span>
+          <span>{status.version} — built {formatDateTime(status.build_timestamp === "unknown" ? null : status.build_timestamp)}</span>
           <span>{error ?? ""}</span>
         </span>
         {connectionState === "open" ? (

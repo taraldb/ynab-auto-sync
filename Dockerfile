@@ -25,7 +25,9 @@ FROM python:3.12-slim AS runtime
 # is what a local `docker build` with no --build-arg gets, and what the
 # GUI's footer falls back to displaying.
 ARG APP_VERSION=dev
-ENV APP_VERSION=${APP_VERSION}
+ARG BUILD_TIMESTAMP=unknown
+ENV APP_VERSION=${APP_VERSION} \
+    BUILD_TIMESTAMP=${BUILD_TIMESTAMP}
 
 # Unraid runs Docker containers as nobody:users (uid 99, gid 100) by default
 # - confirmed against Unraid's own docs/forums, not assumed. Used numerically

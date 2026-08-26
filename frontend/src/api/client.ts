@@ -28,6 +28,7 @@ export interface StatusResponse {
   cron_expression: string;
   next_fire_at: string;
   version: string;
+  build_timestamp: string;
 }
 
 export interface DeletedTransaction {

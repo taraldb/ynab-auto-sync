@@ -18,6 +18,7 @@ router = APIRouter()
 # else this module treats as a constant. "dev" is what a non-Docker/local
 # run gets, since there's no build step to stamp a version into.
 _APP_VERSION = os.environ.get("APP_VERSION", "dev")
+_BUILD_TIMESTAMP = os.environ.get("BUILD_TIMESTAMP", "unknown")
 
 
 def build_status_payload(config: AppConfig, db: StateDB) -> dict[str, Any]:
@@ -56,6 +57,7 @@ def build_status_payload(config: AppConfig, db: StateDB) -> dict[str, Any]:
         "cron_expression": config.sync.cron_expression,
         "next_fire_at": next_fire_at.isoformat(),
         "version": _APP_VERSION,
+        "build_timestamp": _BUILD_TIMESTAMP,
     }
 
 

@@ -2978,6 +2978,9 @@ async def test_run_cycle_fuzzy_matches_pending_to_booked_across_different_tracki
         return_value=httpx.Response(200, json={"data": {"transactions": []}})
     )
 
+    # Use a date 2 days ago so it's within the 5-day window (avoids date-rot)
+    past_date = (datetime.now(UTC).date() - timedelta(days=2)).isoformat()
+
     call_count = {"n": 0}
 
     def transactions_side_effect(request):
@@ -2990,7 +2993,7 @@ async def test_run_cycle_fuzzy_matches_pending_to_booked_across_different_tracki
                         {
                             "nonUniqueId": "111111111",
                             "accountKey": "acct-1",
-                            "date": "2026-08-20",
+                            "date": past_date,
                             "amount": -79,
                             "description": "MERCHANT ONE, LOC-A",
                             "bookingStatus": "PENDING",
@@ -3010,7 +3013,7 @@ async def test_run_cycle_fuzzy_matches_pending_to_booked_across_different_tracki
                         "creditCardIdentifiers": {"nonUniqueId": "222222222"},
                         "nonUniqueId": "unused-when-cc-identifiers-present",
                         "accountKey": "acct-1",
-                        "date": "2026-08-20",
+                        "date": past_date,
                         "amount": -79.1,
                         "description": "MERCHANT ONE, LOC-A, NOR",
                         "bookingStatus": "BOOKED",
@@ -3087,6 +3090,10 @@ async def test_run_cycle_fuzzy_transition_retry_safe(tmp_path: Path):
     respx.get(_unimported_url("budget-1", "ynab-acct-1")).mock(
         return_value=httpx.Response(200, json={"data": {"transactions": []}})
     )
+
+    # Use a date 2 days ago so it's within the 5-day window (avoids date-rot)
+    past_date = (datetime.now(UTC).date() - timedelta(days=2)).isoformat()
+
     respx.get(sb1_client.TRANSACTIONS_URL).mock(
         return_value=httpx.Response(
             200,
@@ -3095,7 +3102,7 @@ async def test_run_cycle_fuzzy_transition_retry_safe(tmp_path: Path):
                     {
                         "creditCardIdentifiers": {"nonUniqueId": "222222222"},
                         "accountKey": "acct-1",
-                        "date": "2026-08-20",
+                        "date": past_date,
                         "amount": -79.1,
                         "description": "MERCHANT ONE, LOC-A, NOR",
                         "bookingStatus": "BOOKED",
@@ -3550,6 +3557,10 @@ async def test_run_cycle_pending_manual_match_row_later_fuzzy_resolves_when_book
 
     _mock_creditcard_account()
 
+    # Use relative dates within the 5-day window (avoids date-rot)
+    pending_date = (datetime.now(UTC).date() - timedelta(days=2)).isoformat()
+    manual_date = (datetime.now(UTC).date() - timedelta(days=3)).isoformat()
+
     tx_call_count = {"n": 0}
 
     def transactions_side_effect(request):
@@ -3562,7 +3573,7 @@ async def test_run_cycle_pending_manual_match_row_later_fuzzy_resolves_when_book
                         {
                             "nonUniqueId": "444444444",
                             "accountKey": "acct-1",
-                            "date": "2026-08-20",
+                            "date": pending_date,
                             "amount": -218,
                             "description": "MERCHANT ONE, LOC-A",
                             "bookingStatus": "PENDING",
@@ -3577,7 +3588,7 @@ async def test_run_cycle_pending_manual_match_row_later_fuzzy_resolves_when_book
                     {
                         "creditCardIdentifiers": {"nonUniqueId": "555555555"},
                         "accountKey": "acct-1",
-                        "date": "2026-08-20",
+                        "date": pending_date,
                         "amount": -218.3,
                         "description": "MERCHANT ONE, LOC-A, NOR",
                         "bookingStatus": "BOOKED",
@@ -3600,7 +3611,7 @@ async def test_run_cycle_pending_manual_match_row_later_fuzzy_resolves_when_book
                         "transactions": [
                             {
                                 "id": "manual-7",
-                                "date": "2026-08-19",
+                                "date": manual_date,
                                 "amount": -218300,
                                 "payee_id": "payee-manual-7",
                                 "payee_name": "Merchant One",

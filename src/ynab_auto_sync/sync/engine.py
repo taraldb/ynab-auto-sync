@@ -1579,8 +1579,18 @@ class SyncEngine:
             payee_id = p.ynab_tx.get("payee_id")
             if payee_id:
                 await self._db.upsert_payee_mapping(budget_id, p.raw_payee_name, payee_id)
+            # "updated", not "created": both callers of _finish_native_match
+            # only reach here after confirming shadow["matched_transaction_id"]
+            # is truthy (checked at each call site below, never assumed) - the
+            # transaction actually visible to the user is the pre-existing
+            # original, which just got a real import_id anchored onto it via
+            # the hidden shadow; nothing new appears in their register. Logging
+            # this as "created" (as it did until 2026-08-26) miscategorized it
+            # in the GUI's audit log, confirmed against 3 real production rows
+            # (audit_events ids 95-97) where the raw YNAB create response's
+            # matched_transaction_id was mutually set on both sides.
             await self._db.insert_audit_event(
-                event_type="created",
+                event_type="updated",
                 source=p.provider_type,
                 account_key=p.provider_account_id,
                 tracking_key=p.tracking_key,

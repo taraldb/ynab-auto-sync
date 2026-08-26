@@ -51,6 +51,15 @@ jobs:
             echo "value=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
           fi
 
+      # The build time shown in the GUI's footer. Computed here (not left to
+      # the Dockerfile's own default) because the Dockerfile's
+      # `ARG BUILD_TIMESTAMP=unknown` is only ever a fallback for a local,
+      # no-build-arg `docker build` - this step is what actually supplies a
+      # real value for every image this workflow publishes.
+      - name: Determine build timestamp
+        id: build_timestamp
+        run: echo "value=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+
       - name: Build and push
         uses: docker/build-push-action@v6
         with:
@@ -61,5 +70,6 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
             APP_VERSION=${{ steps.version.outputs.value }}
+            BUILD_TIMESTAMP=${{ steps.build_timestamp.outputs.value }}
           cache-from: type=gha
           cache-to: type=gha,mode=max

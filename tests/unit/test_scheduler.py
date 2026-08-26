@@ -645,11 +645,23 @@ async def test_set_paused_writes_db_and_publishes_state(tmp_path: Path):
 
     assert db.read_paused() is True
     assert ("state:paused", "ON") in sink.published
+    # Also republishes full run_metadata via publish_status - this is what
+    # the GUI websocket frontend actually listens to for run_metadata.paused
+    # (it deliberately ignores "state_value", an MQTT/HA-shaped message).
+    # Without this, toggling pause from the GUI had no visible live effect.
+    assert any(
+        event == "status" and data.get("paused") is True
+        for event, data in sink.published
+    )
 
     await scheduler.set_paused(False)
 
     assert db.read_paused() is False
     assert ("state:paused", "OFF") in sink.published
+    assert any(
+        event == "status" and data.get("paused") is False
+        for event, data in sink.published
+    )
 
 
 async def test_run_uses_null_sink_end_to_end(tmp_path: Path):

@@ -2741,6 +2741,15 @@ async def test_run_cycle_matches_unambiguous_manual_transaction(tmp_path: Path):
     assert tracked["ynab_transaction_id"] == "manual-1"
     assert tracked["import_id"] == import_id
     assert tracked["booking_status"] == "BOOKED"
+
+    # Audit-logged as "updated", not "created" - nothing new appeared in the
+    # user's register, the pre-existing manual transaction just got a real
+    # import_id anchored onto it via the hidden shadow. Confirmed against
+    # real production data (2026-08-26) that "created" miscategorized this.
+    events, _total = db.list_audit_events()
+    matched_event = next(e for e in events if "natively linked" in e["detail"])
+    assert matched_event["event_type"] == "updated"
+
     # Payee preference learned from the matched candidate's own payee_id,
     # so a future "Telia" transaction with no manual match resolves to the
     # same payee (invariant 12).

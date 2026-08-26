@@ -91,9 +91,20 @@ class Scheduler:
         handling and the GUI's POST /api/pause route so the two can never
         drift apart (same "factor out to avoid drift" reasoning as
         cron.next_fire_at() being one shared implementation) - both the DB
-        write and the MQTT/HA state republish happen here exactly once."""
+        write and the MQTT/HA state republish happen here exactly once.
+
+        Also republishes the full run_metadata via publish_status: the
+        websocket frontend's message handler only ever updates
+        run_metadata.paused in response to a "status" message, never
+        "state_value" (that one's shape - {"value": "ON"/"OFF"} - and its
+        MQTT-string-boolean encoding are HA-specific, and the frontend
+        deliberately ignores it). Without this, toggling pause from the GUI
+        had no visible effect on any connected client - including the tab
+        that clicked it - until the next full sync cycle happened to call
+        publish_status on its own."""
         await self._db.set_paused(paused)
         await self._sink.publish_state_value("paused", "ON" if paused else "OFF")
+        await self._sink.publish_status(self._db.read_run_metadata())
 
     async def run(self) -> None:
         async with self._sink:

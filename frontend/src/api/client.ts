@@ -89,6 +89,7 @@ export interface TransformerInfo {
   name: string;
   default_ynab_budget_id: string | null;
   default_ynab_budget_alias: string | null;
+  default_ynab_account_id: string | null;
 }
 
 export class ApiError extends Error {
@@ -152,16 +153,26 @@ export async function readd(trackingKey: string): Promise<ReaddResponse> {
   return handleJson<ReaddResponse>(res);
 }
 
+type ImportTarget =
+  | { kind: "mapped"; accountKey: string }
+  | { kind: "direct"; ynabBudgetId: string; ynabAccountId: string }
+  | undefined;
+
 export async function importFile(
   file: File,
   dryRun: boolean,
-  accountKey?: string,
+  target?: ImportTarget,
 ): Promise<ImportResponse> {
   const form = new FormData();
   form.append("file", file);
   form.append("dry_run", dryRun ? "true" : "false");
-  if (accountKey) {
-    form.append("account_key", accountKey);
+  if (target) {
+    if (target.kind === "mapped") {
+      form.append("account_key", target.accountKey);
+    } else if (target.kind === "direct") {
+      form.append("ynab_budget_id", target.ynabBudgetId);
+      form.append("ynab_account_id", target.ynabAccountId);
+    }
   }
   const res = await fetch("/api/import", {
     method: "POST",
@@ -175,14 +186,17 @@ export async function listTransformers(): Promise<TransformerInfo[]> {
   return handleJson<TransformerInfo[]>(res);
 }
 
-export async function updateTransformerDefaultBudget(
+export async function updateTransformerDefaults(
   name: string,
-  budgetId: string | null,
+  defaults: { ynabBudgetId: string; ynabAccountId: string } | null,
 ): Promise<TransformerInfo> {
   const res = await fetch(`/api/transformers/${encodeURIComponent(name)}`, {
     method: "PATCH",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ default_ynab_budget_id: budgetId }),
+    body: JSON.stringify({
+      default_ynab_budget_id: defaults?.ynabBudgetId ?? null,
+      default_ynab_account_id: defaults?.ynabAccountId ?? null,
+    }),
   });
   return handleJson<TransformerInfo>(res);
 }

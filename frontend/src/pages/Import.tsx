@@ -109,12 +109,25 @@ export default function Import() {
     resetForNewFile(f);
   }
 
+  function parseAccountValue(val: string): any {
+    if (!val) return undefined;
+    if (val.startsWith("mapped:")) {
+      return { kind: "mapped", accountKey: val.slice(7) };
+    }
+    if (val.startsWith("direct:")) {
+      const [, budgetId, accountId] = val.split(":");
+      return { kind: "direct", ynabBudgetId: budgetId, ynabAccountId: accountId };
+    }
+    return undefined;
+  }
+
   async function handlePreview() {
     if (!file) return;
     setPhase("previewing");
     setErrorDetail(null);
     try {
-      const res = await importFile(file, true, accountKey.trim() || undefined);
+      const target = parseAccountValue(accountKey);
+      const res = await importFile(file, true, target);
       setPreview(res);
       setPhase("previewed");
     } catch (e) {
@@ -140,11 +153,8 @@ export default function Import() {
     setPhase("confirming");
     setErrorDetail(null);
     try {
-      const res = await importFile(
-        file,
-        false,
-        accountKey.trim() || undefined,
-      );
+      const target = parseAccountValue(accountKey);
+      const res = await importFile(file, false, target);
       setFinal(res);
       setPhase("committed");
     } catch (e) {
@@ -282,14 +292,28 @@ export default function Import() {
             className="w-64 rounded-lg border border-slate-700 bg-slate-900/60 px-3 py-2 text-sm text-slate-200 focus:border-emerald-500 focus:outline-none focus:ring-1 focus:ring-emerald-500 disabled:cursor-not-allowed disabled:opacity-50"
           >
             <option value="">Auto-detect from file format</option>
-            {(accountFilterAlias
-              ? accounts.filter((a) => a.ynab_budget === accountFilterAlias)
-              : accounts
-            ).map((a) => (
-              <option key={a.key} value={a.key}>
-                {a.display_name || a.key}
-              </option>
-            ))}
+            <optgroup label="Mapped accounts">
+              {(accountFilterAlias
+                ? accounts.filter((a) => a.ynab_budget === accountFilterAlias)
+                : accounts
+              ).map((a) => (
+                <option key={a.key} value={`mapped:${a.key}`}>
+                  {a.display_name || a.key}
+                </option>
+              ))}
+            </optgroup>
+            <optgroup label="All YNAB accounts">
+              {(accountFilterAlias
+                ? budgets.filter((b) => b.alias === accountFilterAlias)
+                : budgets
+              ).flatMap((b) =>
+                b.accounts.map((a) => (
+                  <option key={a.id} value={`direct:${b.budget_id}:${a.id}`}>
+                    {a.name} — {b.alias}
+                  </option>
+                )),
+              )}
+            </optgroup>
           </select>
           {accountsError && (
             <p className="text-xs text-amber-400">

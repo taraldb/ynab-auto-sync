@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import {
   ApiError,
-  updateTransformerDefaultBudget,
+  updateTransformerDefaults,
   type TransformerInfo,
   type YnabBudget,
 } from "../api/client";
@@ -32,10 +32,12 @@ function TransformerRow({
     setError(null);
     setSaved(false);
     try {
-      const updated = await updateTransformerDefaultBudget(
-        transformer.name,
-        value,
-      );
+      let defaults = null;
+      if (value) {
+        const [budgetId, accountId] = value.split("|");
+        defaults = { ynabBudgetId: budgetId, ynabAccountId: accountId };
+      }
+      const updated = await updateTransformerDefaults(transformer.name, defaults);
       onUpdate(updated);
       setSaved(true);
       window.setTimeout(() => setSaved(false), 1500);
@@ -52,6 +54,11 @@ function TransformerRow({
     }
   }
 
+  const currentValue =
+    transformer.default_ynab_budget_id && transformer.default_ynab_account_id
+      ? `${transformer.default_ynab_budget_id}|${transformer.default_ynab_account_id}`
+      : "";
+
   return (
     <div className="flex items-center justify-between gap-3 py-2.5">
       <div className="min-w-0">
@@ -65,16 +72,20 @@ function TransformerRow({
           <span className="text-xs font-medium text-emerald-400">Saved</span>
         )}
         <select
-          value={transformer.default_ynab_budget_id ?? ""}
+          value={currentValue}
           onChange={handleChange}
           disabled={saving}
-          className="w-48 rounded-lg border border-slate-700 bg-slate-900/60 px-3 py-1.5 text-sm text-slate-200 focus:border-emerald-500 focus:outline-none focus:ring-1 focus:ring-emerald-500 disabled:cursor-not-allowed disabled:opacity-50"
+          className="w-64 rounded-lg border border-slate-700 bg-slate-900/60 px-3 py-1.5 text-sm text-slate-200 focus:border-emerald-500 focus:outline-none focus:ring-1 focus:ring-emerald-500 disabled:cursor-not-allowed disabled:opacity-50"
         >
           <option value="">No default</option>
           {budgets.map((b) => (
-            <option key={b.budget_id} value={b.budget_id}>
-              {b.alias}
-            </option>
+            <optgroup key={b.budget_id} label={b.alias}>
+              {b.accounts.map((a) => (
+                <option key={a.id} value={`${b.budget_id}|${a.id}`}>
+                  {a.name}
+                </option>
+              ))}
+            </optgroup>
           ))}
         </select>
       </div>

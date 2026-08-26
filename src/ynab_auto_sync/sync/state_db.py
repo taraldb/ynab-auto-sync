@@ -72,6 +72,7 @@ CREATE TABLE IF NOT EXISTS payee_mappings (
 CREATE TABLE IF NOT EXISTS transformer_default_budgets (
     transformer_name TEXT PRIMARY KEY,
     ynab_budget_id TEXT NOT NULL,
+    ynab_account_id TEXT,
     updated_at TEXT NOT NULL
 );
 
@@ -141,6 +142,10 @@ _RUN_METADATA_MIGRATED_COLUMNS = (
     ("fetched_last_run", "INTEGER NOT NULL DEFAULT 0"),
     ("log_level", "TEXT"),
     ("last_payee_reconcile_at", "TEXT"),
+)
+
+_TRANSFORMER_DEFAULT_BUDGETS_MIGRATED_COLUMNS = (
+    ("ynab_account_id", "TEXT"),
 )
 
 
@@ -245,6 +250,15 @@ class StateDB:
             if name not in tracked_columns:
                 self._conn.execute(
                     f"ALTER TABLE tracked_transactions ADD COLUMN {name} {sql_type}"
+                )
+
+        transformer_columns = {
+            row["name"] for row in self._conn.execute("PRAGMA table_info(transformer_default_budgets)")
+        }
+        for name, sql_type in _TRANSFORMER_DEFAULT_BUDGETS_MIGRATED_COLUMNS:
+            if name not in transformer_columns:
+                self._conn.execute(
+                    f"ALTER TABLE transformer_default_budgets ADD COLUMN {name} {sql_type}"
                 )
 
     def read_account_states(self) -> dict[str, dict[str, Any]]:
@@ -1021,27 +1035,38 @@ class StateDB:
     #
     # Per-transformer default YNAB budget setting, settable via the GUI.
 
-    def list_transformer_default_budgets(self) -> dict[str, str]:
-        """transformer_name -> ynab_budget_id for every transformer that has a
-        configured default. Missing key means no default set."""
+    def list_transformer_default_budgets(self) -> dict[str, dict[str, str | None]]:
+        """transformer_name -> {ynab_budget_id, ynab_account_id} for every
+        transformer that has a configured default. Missing key means no default
+        set. Both can be None (though budget is normally set when account is)."""
         rows = self._conn.execute(
-            "SELECT transformer_name, ynab_budget_id FROM transformer_default_budgets"
+            "SELECT transformer_name, ynab_budget_id, ynab_account_id FROM transformer_default_budgets"
         ).fetchall()
-        return {row["transformer_name"]: row["ynab_budget_id"] for row in rows}
+        return {
+            row["transformer_name"]: {
+                "ynab_budget_id": row["ynab_budget_id"],
+                "ynab_account_id": row["ynab_account_id"],
+            }
+            for row in rows
+        }
 
     async def set_transformer_default_budget(
-        self, transformer_name: str, ynab_budget_id: str
+        self,
+        transformer_name: str,
+        ynab_budget_id: str,
+        ynab_account_id: str | None = None,
     ) -> None:
         async with self._lock:
             self._conn.execute(
                 """
-                INSERT INTO transformer_default_budgets (transformer_name, ynab_budget_id, updated_at)
-                VALUES (?, ?, ?)
+                INSERT INTO transformer_default_budgets (transformer_name, ynab_budget_id, ynab_account_id, updated_at)
+                VALUES (?, ?, ?, ?)
                 ON CONFLICT(transformer_name) DO UPDATE SET
                     ynab_budget_id = excluded.ynab_budget_id,
+                    ynab_account_id = excluded.ynab_account_id,
                     updated_at = excluded.updated_at
                 """,
-                (transformer_name, ynab_budget_id, datetime.now(UTC).isoformat()),
+                (transformer_name, ynab_budget_id, ynab_account_id, datetime.now(UTC).isoformat()),
             )
             self._conn.commit()
 

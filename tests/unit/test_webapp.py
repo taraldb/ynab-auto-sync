@@ -519,7 +519,12 @@ def test_list_transformers_reports_no_default_initially(tmp_path: Path):
 
     assert response.status_code == 200
     body = response.json()
-    assert {"name": "Norwegian Bank", "default_ynab_budget_id": None, "default_ynab_budget_alias": None} in body
+    assert {
+        "name": "Norwegian Bank",
+        "default_ynab_budget_id": None,
+        "default_ynab_budget_alias": None,
+        "default_ynab_account_id": None,
+    } in body
 
 
 def test_update_transformer_default_budget_round_trips(tmp_path: Path):
@@ -534,6 +539,7 @@ def test_update_transformer_default_budget_round_trips(tmp_path: Path):
         "name": "Norwegian Bank",
         "default_ynab_budget_id": "budget-1",
         "default_ynab_budget_alias": "personal",
+        "default_ynab_account_id": None,
     }
 
     list_response = client.get("/api/transformers")
@@ -541,6 +547,7 @@ def test_update_transformer_default_budget_round_trips(tmp_path: Path):
         "name": "Norwegian Bank",
         "default_ynab_budget_id": "budget-1",
         "default_ynab_budget_alias": "personal",
+        "default_ynab_account_id": None,
     } in list_response.json()
 
     clear_response = client.patch(

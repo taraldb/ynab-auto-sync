@@ -1050,14 +1050,18 @@ async def test_list_transformer_default_budgets_initially_empty(tmp_path: Path):
 async def test_set_and_list_transformer_default_budget(tmp_path: Path):
     db = StateDB(tmp_path / "state.db")
     await db.set_transformer_default_budget("Norwegian Bank", "budget-1")
-    assert db.list_transformer_default_budgets() == {"Norwegian Bank": "budget-1"}
+    assert db.list_transformer_default_budgets() == {
+        "Norwegian Bank": {"ynab_budget_id": "budget-1", "ynab_account_id": None}
+    }
 
 
 async def test_set_transformer_default_budget_upserts(tmp_path: Path):
     db = StateDB(tmp_path / "state.db")
     await db.set_transformer_default_budget("Norwegian Bank", "budget-1")
     await db.set_transformer_default_budget("Norwegian Bank", "budget-2")
-    assert db.list_transformer_default_budgets() == {"Norwegian Bank": "budget-2"}
+    assert db.list_transformer_default_budgets() == {
+        "Norwegian Bank": {"ynab_budget_id": "budget-2", "ynab_account_id": None}
+    }
 
 
 async def test_clear_transformer_default_budget(tmp_path: Path):

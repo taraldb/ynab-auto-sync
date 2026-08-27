@@ -1233,6 +1233,91 @@ class SyncEngine:
         classified = await self.fetch_and_classify(on_progress=on_progress)
         return await self.submit(classified, on_progress=on_progress)
 
+    async def _track_native_match(
+        self,
+        budget_id: str,
+        *,
+        tracking_key: str,
+        import_id: str,
+        matched_transaction_id: str,
+        shadow_id: str,
+        booking_status: str,
+        amount: Decimal,
+        payee_name: str | None,
+        memo: str | None,
+        transaction_date: str,
+        ynab_account_id: str,
+        cleared: str,
+        provider_type: str,
+        account_key: str,
+        detail_noun: str,
+        learn_payee: tuple[str, str] | None = None,
+    ) -> None:
+        """Shared by _record_created (an ordinary create whose response
+        happens to carry matched_transaction_id) and _record_matched's
+        _finish_native_match (the deliberate manual-transaction-matching
+        feature's own candidate search) - both call this whenever YNAB's
+        native transaction-matching fires on a submitted create. Extracted
+        after a real bug (2026-08-27): the two call sites had each grown
+        their own copy of this "track the visible original, not the hidden
+        shadow" logic, and _record_created's copy was added weeks after
+        _record_matched's, in the meantime letting an ordinary create with
+        a coincidental exact-amount match silently mistrack the wrong id
+        (see CLAUDE.md's "Resolved: an ordinary create's native
+        transaction-match tracked the invisible shadow"). One shared
+        implementation removes the risk of that drift recurring a third
+        time.
+
+        matched_transaction_id is tracked, not shadow_id - the shadow
+        becomes permanently excluded from the plain account transaction
+        list once a native match fires, confirmed live. Logged as
+        event_type="updated", not "created": nothing new appears in the
+        user's register, an existing transaction just got a real import_id
+        anchored onto it via the hidden shadow (confirmed against real
+        production audit_events rows that matched_transaction_id was
+        genuinely mutual on both sides before this label was chosen).
+
+        learn_payee, when given, is (raw_payee_name, payee_id) for a
+        candidate whose payee_id was already known before the create (only
+        _record_matched's manual-match search has one) - _record_created
+        has no such candidate and always passes None.
+        """
+        await self._db.upsert_tracked(
+            tracking_key,
+            import_id=import_id,
+            ynab_transaction_id=matched_transaction_id,
+            ynab_budget_id=budget_id,
+            account_key=account_key,
+            booking_status=booking_status,
+            amount=amount,
+            payee_name=payee_name,
+            memo=memo,
+            transaction_date=transaction_date,
+            ynab_account_id=ynab_account_id,
+            cleared=cleared,
+        )
+        if learn_payee is not None:
+            raw_payee_name, payee_id = learn_payee
+            await self._db.upsert_payee_mapping(budget_id, raw_payee_name, payee_id)
+        await self._db.insert_audit_event(
+            event_type="updated",
+            source=provider_type,
+            account_key=account_key,
+            tracking_key=tracking_key,
+            import_id=import_id,
+            ynab_transaction_id=matched_transaction_id,
+            ynab_budget_id=budget_id,
+            ynab_account_id=ynab_account_id,
+            payee_name=payee_name,
+            memo=memo,
+            transaction_date=transaction_date,
+            amount=amount,
+            detail=(
+                f"natively linked to pre-existing {detail_noun} {matched_transaction_id} "
+                f"(import_id anchored on hidden transaction {shadow_id})"
+            ),
+        )
+
     async def _record_created(
         self,
         budget_id: str,
@@ -1247,12 +1332,59 @@ class SyncEngine:
         response["transaction_ids"]'s length - confirmed live that a
         transfer-creating submission lists the same id in that array
         twice).
+
+        A non-transfer create can also come back with YNAB's own
+        undocumented native transaction-matching already fired against it
+        (created["matched_transaction_id"] truthy) - not just for the
+        deliberate manual-transaction-matching feature's own candidate
+        search (_record_matched), since this is a property of the create
+        endpoint itself, not of which code path called it. When that
+        happens, the row is tracked against the pre-existing, visible
+        matched_transaction_id instead of the just-created shadow (which
+        becomes permanently excluded from the plain account transaction
+        list - see _record_matched's docstring), and logged as "updated"
+        rather than "created" for the same reason _finish_native_match is:
+        nothing new appears in the user's register, an existing transaction
+        just got a real import_id anchored onto it via the hidden shadow.
         """
         by_import_id = {p.ynab_tx["import_id"]: p for p in pending_creates}
         tracked_count = 0
         for created in response.get("transactions", []):
             p = by_import_id.get(created.get("import_id"))
             if p is None:
+                continue
+            # YNAB's create endpoint can silently fire its own undocumented
+            # native transaction-matching on ANY create with an exact-amount
+            # coincidental match against a pre-existing transaction - not
+            # only the deliberate manual-transaction-matching feature's own
+            # candidate search (_record_matched, which shares the tracking
+            # logic below via _track_native_match - see that method's
+            # docstring for the full incident writeup). Gated on
+            # transfer_secondary is None - a transfer primary leg's own
+            # linked-transfer mechanism (transfer_transaction_id) is
+            # unrelated and must stay untouched by this check.
+            native_match_id = (
+                created.get("matched_transaction_id") if p.transfer_secondary is None else None
+            )
+            if native_match_id:
+                await self._track_native_match(
+                    budget_id,
+                    tracking_key=p.tracking_key,
+                    import_id=p.ynab_tx["import_id"],
+                    matched_transaction_id=native_match_id,
+                    shadow_id=created["id"],
+                    booking_status=p.booking_status,
+                    amount=from_milliunits(p.ynab_tx["amount"]),
+                    payee_name=p.ynab_tx.get("payee_name") or created.get("payee_name"),
+                    memo=p.ynab_tx["memo"],
+                    transaction_date=p.ynab_tx["date"],
+                    ynab_account_id=p.ynab_tx["account_id"],
+                    cleared=p.ynab_tx["cleared"],
+                    provider_type=p.provider_type,
+                    account_key=p.provider_account_id,
+                    detail_noun="transaction",
+                )
+                tracked_count += 1
                 continue
             # Confirmed live (2026-08-25, production): a create submitted
             # with a cached payee_id that no longer resolves to a real YNAB
@@ -1562,12 +1694,19 @@ class SyncEngine:
                 )
 
         async def _finish_native_match(p: _PendingManualMatch, shadow: dict[str, Any]) -> None:
-            await self._db.upsert_tracked(
-                p.tracking_key,
+            # Both callers of _finish_native_match only reach here after
+            # confirming shadow["matched_transaction_id"] is truthy (checked
+            # at each call site below, never assumed). See
+            # _track_native_match's own docstring for why "updated", not
+            # "created", and why matched_transaction_id (not the shadow) is
+            # what gets tracked.
+            payee_id = p.ynab_tx.get("payee_id")
+            await self._track_native_match(
+                budget_id,
+                tracking_key=p.tracking_key,
                 import_id=p.ynab_tx["import_id"],
-                ynab_transaction_id=p.original_transaction_id,
-                ynab_budget_id=budget_id,
-                account_key=p.provider_account_id,
+                matched_transaction_id=p.original_transaction_id,
+                shadow_id=shadow["id"],
                 booking_status=p.booking_status,
                 amount=from_milliunits(p.ynab_tx["amount"]),
                 payee_name=shadow.get("payee_name"),
@@ -1575,38 +1714,10 @@ class SyncEngine:
                 transaction_date=p.ynab_tx["date"],
                 ynab_account_id=p.ynab_tx["account_id"],
                 cleared=p.ynab_tx["cleared"],
-            )
-            payee_id = p.ynab_tx.get("payee_id")
-            if payee_id:
-                await self._db.upsert_payee_mapping(budget_id, p.raw_payee_name, payee_id)
-            # "updated", not "created": both callers of _finish_native_match
-            # only reach here after confirming shadow["matched_transaction_id"]
-            # is truthy (checked at each call site below, never assumed) - the
-            # transaction actually visible to the user is the pre-existing
-            # original, which just got a real import_id anchored onto it via
-            # the hidden shadow; nothing new appears in their register. Logging
-            # this as "created" (as it did until 2026-08-26) miscategorized it
-            # in the GUI's audit log, confirmed against 3 real production rows
-            # (audit_events ids 95-97) where the raw YNAB create response's
-            # matched_transaction_id was mutually set on both sides.
-            await self._db.insert_audit_event(
-                event_type="updated",
-                source=p.provider_type,
+                provider_type=p.provider_type,
                 account_key=p.provider_account_id,
-                tracking_key=p.tracking_key,
-                import_id=p.ynab_tx["import_id"],
-                ynab_transaction_id=p.original_transaction_id,
-                ynab_budget_id=budget_id,
-                ynab_account_id=p.ynab_tx["account_id"],
-                payee_name=shadow.get("payee_name"),
-                memo=p.ynab_tx["memo"],
-                transaction_date=p.ynab_tx["date"],
-                amount=from_milliunits(p.ynab_tx["amount"]),
-                detail=(
-                    f"natively linked to pre-existing manual transaction "
-                    f"{p.original_transaction_id} (import_id anchored on hidden "
-                    f"transaction {shadow['id']})"
-                ),
+                detail_noun="manual transaction",
+                learn_payee=(p.raw_payee_name, payee_id) if payee_id else None,
             )
 
         async def _finish_fallback(p: _PendingManualMatch, shadow: dict[str, Any]) -> None:

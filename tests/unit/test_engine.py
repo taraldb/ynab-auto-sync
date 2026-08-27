@@ -146,6 +146,102 @@ async def test_run_cycle_creates_new_booked_transaction(tmp_path: Path):
 
 
 @respx.mock
+async def test_run_cycle_ordinary_create_natively_matched_tracks_original_not_shadow(
+    tmp_path: Path,
+):
+    """Regression test for a real production incident (2026-08-27): YNAB's
+    undocumented native transaction-matching (see
+    test_run_cycle_matches_unambiguous_manual_transaction above) can fire on
+    an ORDINARY create too - not just the deliberate manual-transaction-
+    matching feature's own candidate search - since it's a property of the
+    create endpoint itself. Neither manual_match_window_days nor
+    pending_import_enabled is set here; this is a plain create that just
+    happens to coincidentally exact-amount-match a pre-existing transaction.
+    Before the fix, _record_created() tracked the just-created shadow's id
+    unconditionally, so a later pending->booked cleared/amount correction
+    would PATCH a transaction permanently excluded from the plain account
+    transaction list - having zero visible effect on what the user actually
+    sees in YNAB. The fix must track the pre-existing, visible
+    matched_transaction_id instead, and log it as "updated", mirroring
+    _finish_native_match's already-correct behavior for the manual-match
+    feature's own code path.
+    """
+    config = make_config()
+    token_store = make_token_store(tmp_path)
+    db = make_db(tmp_path)
+    await seed_mappings(db, config)
+
+    respx.get(sb1_client.TRANSACTIONS_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "transactions": [
+                    {
+                        "id": "tx-booked-1",
+                        "nonUniqueId": "tx-booked-1",
+                        "accountKey": "acct-1",
+                        "date": "2026-08-20",
+                        "amount": -50,
+                        "description": "Coffee",
+                        "bookingStatus": "BOOKED",
+                    }
+                ]
+            },
+        )
+    )
+    import_id = derive_import_id("acct-1:tx-booked-1")
+    respx.post(f"{ynab_client.BASE_URL}/{ynab_client.RESOURCE_PATH}/budget-1/transactions").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "data": {
+                    "transaction_ids": ["ynab-tx-shadow", "manual-original-1"],
+                    "duplicate_import_ids": [],
+                    "transactions": [
+                        {
+                            "id": "ynab-tx-shadow",
+                            "import_id": import_id,
+                            "amount": -50000,
+                            "payee_name": "Coffee",
+                            "matched_transaction_id": "manual-original-1",
+                        },
+                        {
+                            # YNAB's native matching echoes the still-live
+                            # original back in the same response too -
+                            # same quirk the manual-match feature's own
+                            # tests already exercise.
+                            "id": "manual-original-1",
+                            "import_id": None,
+                            "amount": -50000,
+                            "matched_transaction_id": "ynab-tx-shadow",
+                            "approved": False,
+                        },
+                    ],
+                }
+            },
+        )
+    )
+
+    async with httpx.AsyncClient() as http_client:
+        engine = make_engine(config, http_client, token_store, db)
+        result, _ = await engine.run_cycle()
+
+    assert result.created == 1
+
+    tracked = db.get_tracked("acct-1:tx-booked-1")
+    assert tracked is not None
+    # The VISIBLE original's id, not the shadow's.
+    assert tracked["ynab_transaction_id"] == "manual-original-1"
+    assert tracked["import_id"] == import_id
+    assert tracked["booking_status"] == "BOOKED"
+
+    events, _total = db.list_audit_events()
+    matched_event = next(e for e in events if "natively linked" in (e["detail"] or ""))
+    assert matched_event["event_type"] == "updated"
+    assert matched_event["ynab_transaction_id"] == "manual-original-1"
+
+
+@respx.mock
 async def test_run_cycle_unaffected_by_raising_progress_callback(tmp_path: Path):
     # Direct regression test for the "a progress-broadcast bug must never
     # affect a real sync cycle" invariant (see engine.py's _report()): an

@@ -226,7 +226,8 @@ async def test_run_cycle_ordinary_create_natively_matched_tracks_original_not_sh
         engine = make_engine(config, http_client, token_store, db)
         result, _ = await engine.run_cycle()
 
-    assert result.created == 1
+    assert result.updated == 1
+    assert result.created == 0
 
     tracked = db.get_tracked("acct-1:tx-booked-1")
     assert tracked is not None
@@ -876,6 +877,128 @@ async def test_run_cycle_pending_update_target_deleted_with_manual_replacement_r
 
 
 @respx.mock
+async def test_run_cycle_pending_update_target_deleted_with_native_match_recovery(
+    tmp_path: Path,
+):
+    """When a pending-update's YNAB target is deleted, recovery looks for
+    a manual replacement. If found and the create for that replacement
+    triggers YNAB's native matching (matched_transaction_id set), the
+    matched original is tracked (not the shadow), and correctly counted
+    toward updated, not created. This exercises the fixed created/updated
+    split in _recover_missing_pending_update()."""
+    config = make_config()
+    token_store = make_token_store(tmp_path)
+    db = make_db(tmp_path)
+    await seed_mappings(db, config)
+    await db.upsert_tracked(
+        "acct-1:tx-transition",
+        import_id=derive_import_id("acct-1:tx-transition"),
+        ynab_transaction_id="ynab-transition",
+        ynab_budget_id="budget-1",
+        account_key="acct-1",
+        booking_status="PENDING",
+        amount=from_milliunits(-130000),
+        payee_name="Merchant One",
+        transaction_date="2026-08-20",
+        ynab_account_id="ynab-acct-1",
+    )
+
+    respx.get(sb1_client.TRANSACTIONS_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "transactions": [
+                    {
+                        "id": "tx-transition",
+                        "nonUniqueId": "tx-transition",
+                        "accountKey": "acct-1",
+                        "date": "2026-08-20",
+                        "amount": -142.5,
+                        "bookingStatus": "BOOKED",
+                    }
+                ]
+            },
+        )
+    )
+    respx.get(f"{ynab_client.BASE_URL}/{ynab_client.RESOURCE_PATH}/budget-1/transactions").mock(
+        return_value=httpx.Response(
+            200,
+            json={"data": {"transactions": [{"id": "ynab-transition", "deleted": True}]}},
+        )
+    )
+    respx.get(_unimported_url("budget-1", "ynab-acct-1")).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "data": {
+                    "transactions": [
+                        {
+                            "id": "manual-99",
+                            "date": "2026-08-20",
+                            "amount": -142500,
+                            "payee_name": "Merchant One",
+                            "category_id": "cat-1",
+                            "memo": None,
+                            "cleared": "cleared",
+                            "approved": True,
+                            "flag_color": None,
+                            "import_id": None,
+                            "deleted": False,
+                            "subtransactions": [],
+                        }
+                    ]
+                }
+            },
+        )
+    )
+    # Native matching fires on this recovery create - the shadow has
+    # matched_transaction_id set, and the original is echoed back.
+    def _create_side_effect(request):
+        submitted = json.loads(request.content)["transactions"][0]
+        return httpx.Response(
+            200,
+            json={
+                "data": {
+                    "transaction_ids": ["ynab-shadow-1", "manual-99"],
+                    "duplicate_import_ids": [],
+                    "transactions": [
+                        {
+                            "id": "ynab-shadow-1",
+                            "amount": -142500,
+                            "import_id": submitted["import_id"],
+                            "matched_transaction_id": "manual-99",
+                        },
+                        {
+                            "id": "manual-99",
+                            "import_id": None,
+                            "amount": -142500,
+                            "matched_transaction_id": "ynab-shadow-1",
+                            "approved": False,
+                        },
+                    ],
+                }
+            },
+        )
+
+    respx.post(
+        f"{ynab_client.BASE_URL}/{ynab_client.RESOURCE_PATH}/budget-1/transactions"
+    ).mock(side_effect=_create_side_effect)
+
+    async with httpx.AsyncClient() as http_client:
+        engine = make_engine(config, http_client, token_store, db)
+        result, _ = await engine.run_cycle()
+
+    # Native-matched recovery should count toward updated, not created
+    assert result.updated == 1
+    assert result.created == 0
+    # Tracked row should point at the visible matched original, not the shadow
+    tracked = db.get_tracked("acct-1:tx-transition")
+    assert tracked["ynab_transaction_id"] == "manual-99"
+    assert tracked["booking_status"] == "BOOKED"
+    assert tracked["amount_milliunits"] == -142500
+
+
+@respx.mock
 async def test_run_cycle_pending_update_patch_unexpectedly_400s_recovers(tmp_path: Path):
     """The bulk pre-check reports the target as alive, but the individual
     PATCH itself still gets a 400 (e.g. deleted in the split second
@@ -1421,6 +1544,79 @@ async def test_readd_deleted_transaction_recreates_with_fresh_import_id(tmp_path
     assert tracked["booking_status"] == "PENDING"  # restored from cleared="uncleared"
     assert tracked["ynab_transaction_id"] == "ynab-readded-1"
     assert tracked["import_id"] == expected_new_import_id
+    assert tracked["readd_count"] == 1
+
+
+@respx.mock
+async def test_readd_deleted_transaction_with_native_matching(tmp_path: Path):
+    """When readd_deleted_transaction() creates a re-add, if YNAB's native
+    transaction-matching fires (exact-amount match against another live
+    transaction), the code must track the visible matched original's id
+    (not the invisible shadow) - same pattern _record_created() already
+    handles. This test exercises the fixed readd path that looks up by
+    import_id instead of positionally indexing transaction_ids[0]."""
+    config = make_config()
+    token_store = make_token_store(tmp_path)
+    db = make_db(tmp_path)
+    await seed_mappings(db, config)
+    old_import_id = derive_import_id("acct-1:tx-deleted:readd:0")
+    await db.upsert_tracked(
+        "acct-1:tx-deleted",
+        import_id=old_import_id,
+        ynab_transaction_id="ynab-old-deleted",
+        ynab_budget_id="budget-1",
+        account_key="acct-1",
+        booking_status="DELETED",
+        amount=from_milliunits(-13000),
+        payee_name="Merchant A",
+        memo="Note",
+        transaction_date="2026-08-20",
+        ynab_account_id="ynab-acct-1",
+        cleared="uncleared",
+    )
+    expected_new_import_id = derive_import_id("acct-1:tx-deleted:readd:1")
+
+    # Native matching fires: shadow has matched_transaction_id set pointing
+    # at another pre-existing transaction, and that original is echoed back.
+    respx.post(
+        f"{ynab_client.BASE_URL}/{ynab_client.RESOURCE_PATH}/budget-1/transactions"
+    ).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "data": {
+                    "transaction_ids": ["ynab-shadow", "ynab-other-existing"],
+                    "transactions": [
+                        {
+                            "id": "ynab-shadow",
+                            "import_id": expected_new_import_id,
+                            "amount": -13000,
+                            "matched_transaction_id": "ynab-other-existing",
+                        },
+                        {
+                            "id": "ynab-other-existing",
+                            "import_id": None,
+                            "amount": -13000,
+                            "matched_transaction_id": "ynab-shadow",
+                            "approved": False,
+                        },
+                    ],
+                }
+            },
+        )
+    )
+
+    async with httpx.AsyncClient() as http_client:
+        engine = make_engine(config, http_client, token_store, db)
+        new_id = await engine.readd_deleted_transaction("acct-1:tx-deleted")
+
+    # Must return the matched original's id, not the shadow's
+    assert new_id == "ynab-other-existing"
+    # Tracked row must point at the visible matched original
+    tracked = db.get_tracked("acct-1:tx-deleted")
+    assert tracked["ynab_transaction_id"] == "ynab-other-existing"
+    assert tracked["import_id"] == expected_new_import_id
+    assert tracked["booking_status"] == "PENDING"  # restored from cleared="uncleared"
     assert tracked["readd_count"] == 1
 
 
@@ -2829,7 +3025,8 @@ async def test_run_cycle_matches_unambiguous_manual_transaction(tmp_path: Path):
         engine = make_engine(config, http_client, token_store, db)
         result, _ = await engine.run_cycle()
 
-    assert result.created == 1
+    assert result.updated == 1
+    assert result.created == 0
 
     tracked = db.get_tracked("acct-1:tx-mm-1")
     assert tracked is not None
@@ -3633,7 +3830,8 @@ async def test_run_cycle_tolerant_manual_match_replaces_with_pending_transaction
         engine = make_engine(config, http_client, token_store, db)
         result, _ = await engine.run_cycle()
 
-    assert result.created == 1
+    assert result.updated == 1
+    assert result.created == 0
     tracked = db.get_tracked("acct-1:333333333")
     assert tracked is not None
     # The VISIBLE original's id, not the shadow's - see _record_matched().

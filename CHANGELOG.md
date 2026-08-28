@@ -2,6 +2,20 @@
 
 Chronological record of notable changes and the reasoning behind them — not a full diff log. See `CLAUDE.md` for the current architecture and standing rules; this file is for *why* and *when*, kept as an incident/decision log the way a similar sibling project's changelog proved genuinely useful for exactly that purpose.
 
+## Native-match miscounting found and fixed in three code paths (2026-08-28)
+
+**Context**: YNAB's `create_transactions` endpoint has an undocumented feature — an exact-amount-match against a pre-existing transaction in the same account triggers YNAB's own native transaction-matching, echoing the still-live original back in the create response with `matched_transaction_id` set on both sides. When this fires, the code must track the visible matched original (not the invisible shadow that becomes permanently excluded from the plain account transaction list), and count it as an "update" (in `event_type="updated"`) rather than a "created" transaction, since nothing new appears in the user's YNAB register.
+
+**Root cause across three paths**: each of three places that call `create_transactions` (`_record_created()`, `_record_matched()`'s recovery path via `_recover_missing_pending_update()`, and `readd_deleted_transaction()`) grew its own copy of "handle the create response," but only one of them was audited when this native-matching behavior was first discovered. The other two silently accumulated the same bug: `_record_created()` initially had no check for `matched_transaction_id` at all; `_recover_missing_pending_update()` had one but collapsed the created/updated distinction from `_record_matched()`'s tuple into a single "created" count; `readd_deleted_transaction()` never checked `matched_transaction_id` and indexed `response["transaction_ids"][0]` positionally, risking tracking the wrong id when YNAB's native matching echoed back a different transaction in the response.
+
+**Fix for `_record_created()`** (lines 1395-1416): When a non-transfer create's response has `matched_transaction_id` set, delegate to a shared helper `_track_native_match()` (lines 1298-1361, itself extracted in the prior session's fix) which tracks the visible matched original and logs `event_type="updated"`. This part was already fixed in the prior session, but two other paths were missed.
+
+**Fix for `_recover_missing_pending_update()`** (lines 1108-1257): Changed the return type from `tuple[int, int]` (created, resolved_deleted) to `tuple[int, int, int]` (created, updated, resolved_deleted), so the recovered created/updated split from `_record_matched()` is no longer collapsed. The caller (`submit()`'s `_recover()` closure, lines 915-945) now unpacks all three values and correctly adds created to `total_created` and updated to `total_updated`.
+
+**Fix for `readd_deleted_transaction()`** (lines 2280-2310): Replaced positional indexing of `response["transaction_ids"][0]` with an import_id-based lookup in the full transaction list (`response.get("transactions", [])`), the same defensive pattern `_record_created()` and `_record_matched()` already use. When native matching fires, this correctly returns the matched original's id, not the shadow's.
+
+**Tests added**: Two new regression tests confirm native-matching is handled correctly in the two paths that lacked test coverage for it (`test_run_cycle_pending_update_target_deleted_with_native_match_recovery` and `test_readd_deleted_transaction_with_native_matching`), catching this pattern if it spreads elsewhere in the future.
+
 ## Initial build — core sync engine
 
 SpareBank1 OAuth2+BankID authentication, transaction fetch, transform to YNAB's shape, bulk create with `import_id`-based deduplication, MQTT/Home Assistant status and control, Docker image + GitHub Actions CI to `ghcr.io`.

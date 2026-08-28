@@ -840,6 +840,7 @@ class SyncEngine:
         account_last_synced = classified.account_last_synced
 
         total_created = 0
+        total_updated = 0
         total_duplicates = 0
         total_resolved_deleted = 0
         for budget_id, pending_creates in creates_by_budget.items():
@@ -857,16 +858,18 @@ class SyncEngine:
             # Counting from response["transaction_ids"] is NOT reliable here:
             # confirmed live that a transfer-creating submission returns that
             # list with the same id listed TWICE. _record_created's return
-            # value (rows actually written to tracked_transactions - the
-            # primary plus, for a matched transfer, its secondary) is the
-            # authoritative count instead.
-            total_created += await self._record_created(budget_id, pending_creates, response)
+            # values (rows actually written to tracked_transactions - the
+            # primary plus, for a matched transfer, its secondary) are the
+            # authoritative counts instead, split between genuinely-created
+            # and natively-matched (updated) transactions.
+            created, updated = await self._record_created(budget_id, pending_creates, response)
+            total_created += created
+            total_updated += updated
             total_duplicates += len(response.get("duplicate_import_ids", []))
             total_resolved_deleted += await self._backfill_duplicates(
                 budget_id, pending_creates, response.get("duplicate_import_ids", [])
             )
 
-        total_updated = 0
         for budget_id in {*updates_by_budget, *classified.fuzzy_updates_by_budget}:
             pending_updates = updates_by_budget.get(budget_id, [])
             pending_fuzzy = classified.fuzzy_updates_by_budget.get(budget_id, [])
@@ -919,17 +922,18 @@ class SyncEngine:
                 new_tracking_key: str | None = None,
                 _budget_id: str = budget_id,
             ) -> None:
-                # Mirrors the two other places these same outcomes are
-                # counted: a match found here creates a real YNAB
-                # transaction, same as matches_by_budget's own
-                # total_created accounting below; no match found is the
-                # exact same "resolved as deleted, nothing created or
-                # updated" event _backfill_duplicates already counts via
-                # total_resolved_deleted, not total_updated - these are
-                # NOT ordinary updates, so they must not share that
-                # counter just because they started life as one.
-                nonlocal total_created, total_resolved_deleted
-                created, resolved_deleted = await self._recover_missing_pending_update(
+                # A match found here can be either an ordinary create
+                # (fallback ending: delete-then-recreate) or a native match
+                # (original stays visible, only gets an import_id anchored
+                # via a hidden shadow) - the split mirrors _record_matched()'s
+                # own created/updated distinction. No match found is the exact
+                # same "resolved as deleted, nothing created or updated" event
+                # _backfill_duplicates already counts via total_resolved_deleted,
+                # not total_updated - these are NOT ordinary updates, so they
+                # must not share that counter just because they started life
+                # as one.
+                nonlocal total_created, total_updated, total_resolved_deleted
+                created, updated, resolved_deleted = await self._recover_missing_pending_update(
                     _budget_id,
                     tracking_key=tracking_key,
                     ynab_transaction_id=ynab_transaction_id,
@@ -939,6 +943,7 @@ class SyncEngine:
                     new_tracking_key=new_tracking_key,
                 )
                 total_created += created
+                total_updated += updated
                 total_resolved_deleted += resolved_deleted
 
             for p in pending_updates:
@@ -1049,7 +1054,9 @@ class SyncEngine:
                 budget_id,
                 [p.ynab_tx for p in pending_matches],
             )
-            total_created += await self._record_matched(budget_id, pending_matches, response)
+            created, updated = await self._record_matched(budget_id, pending_matches, response)
+            total_created += created
+            total_updated += updated
 
         # Only reached once every create/update call above has succeeded -
         # anything raised earlier leaves account_last_synced with None
@@ -1110,7 +1117,7 @@ class SyncEngine:
         provider_type: str,
         account_key: str,
         new_tracking_key: str | None = None,
-    ) -> tuple[int, int]:
+    ) -> tuple[int, int, int]:
         """A pending->booked correction's target transaction no longer
         exists in YNAB - deleted directly in the YNAB app, e.g. because
         the user found the uncleared preauth placeholder confusing and
@@ -1135,15 +1142,13 @@ class SyncEngine:
         placeholder's, same "rekey, don't just update in place" reasoning
         StateDB.rekey_pending_to_booked already documents.
 
-        Returns (created, resolved_deleted) - exactly one of the two is 1
-        and the other 0, mirroring how the SAME two outcomes are counted
-        everywhere else in submit(): a match found here creates a real
-        YNAB transaction via _record_matched(), same as matches_by_budget's
-        own total_created accounting; no match found marks the row
-        DELETED, the identical "resolved, but nothing created or
-        updated" event _backfill_duplicates already counts as
-        total_resolved_deleted. Both are 0 only in the (logged) error
-        case where there's no local tracked row left to recover from.
+        Returns (created, updated, resolved_deleted) - when a match is
+        found, created and updated mirror the exact same distinction
+        _record_matched() makes (create-then-delete fallback vs.
+        native-match ending); when no match is found, only resolved_deleted
+        is 1 and the others are 0. Both created and updated are 0 when no
+        match is found. All are 0 only in the (logged) error case where
+        there's no local tracked row left to recover from.
         """
         resolved_key = new_tracking_key or tracking_key
         tracked = self._db.get_tracked(tracking_key)
@@ -1213,7 +1218,7 @@ class SyncEngine:
                     "transaction no longer exists in YNAB"
                 ),
             )
-            return 0, 1
+            return 0, 0, 1
 
         match = matches[0]
         replacement_tx: dict[str, Any] = {
@@ -1249,8 +1254,8 @@ class SyncEngine:
             budget_id,
             [pending_match.ynab_tx],
         )
-        created = await self._record_matched(budget_id, [pending_match], response)
-        return created, 0
+        created, updated = await self._record_matched(budget_id, [pending_match], response)
+        return created, updated, 0
 
     async def run_cycle(
         self, on_progress: ProgressCallback | None = None
@@ -1352,15 +1357,17 @@ class SyncEngine:
         budget_id: str,
         pending_creates: list[_PendingCreate],
         response: dict[str, Any],
-    ) -> int:
+    ) -> tuple[int, int]:
         """Writes a tracked_transactions row for each transaction YNAB
         confirms it created, plus - for any matched transfer's primary leg
         (see _match_transfers) - a second row for its auto-created
-        secondary leg. Returns the total number of rows written, which is
-        the authoritative "created" count for CycleResult (NOT
-        response["transaction_ids"]'s length - confirmed live that a
-        transfer-creating submission lists the same id in that array
-        twice).
+        secondary leg. Returns a tuple of (created_count, updated_count):
+        - created_count: genuinely new transactions in YNAB (not a native match)
+        - updated_count: transactions where YNAB's native matching fired
+        The sum is the authoritative count of rows written to
+        tracked_transactions (NOT response["transaction_ids"]'s length -
+        confirmed live that a transfer-creating submission lists the same
+        id in that array twice).
 
         A non-transfer create can also come back with YNAB's own
         undocumented native transaction-matching already fired against it
@@ -1375,9 +1382,12 @@ class SyncEngine:
         rather than "created" for the same reason _finish_native_match is:
         nothing new appears in the user's register, an existing transaction
         just got a real import_id anchored onto it via the hidden shadow.
+        Counted toward updated_count instead of created_count so status
+        messages reflect the true nature of the outcome.
         """
         by_import_id = {p.ynab_tx["import_id"]: p for p in pending_creates}
-        tracked_count = 0
+        created_count = 0
+        updated_count = 0
         for created in response.get("transactions", []):
             p = by_import_id.get(created.get("import_id"))
             if p is None:
@@ -1413,7 +1423,7 @@ class SyncEngine:
                     account_key=p.provider_account_id,
                     detail_noun="transaction",
                 )
-                tracked_count += 1
+                updated_count += 1
                 continue
             # Confirmed live (2026-08-25, production): a create submitted
             # with a cached payee_id that no longer resolves to a real YNAB
@@ -1465,7 +1475,7 @@ class SyncEngine:
                 amount=from_milliunits(p.ynab_tx["amount"]),
                 detail="transfer primary leg" if p.transfer_secondary is not None else None,
             )
-            tracked_count += 1
+            created_count += 1
             if stale_payee_id:
                 stale_id = p.ynab_tx["payee_id"]
                 logger.warning(
@@ -1513,8 +1523,8 @@ class SyncEngine:
                     budget_id, p.payee_name, created["payee_id"]
                 )
             if p.transfer_secondary is not None:
-                tracked_count += await self._record_transfer_secondary(budget_id, p, created)
-        return tracked_count
+                created_count += await self._record_transfer_secondary(budget_id, p, created)
+        return created_count, updated_count
 
     async def _record_transfer_secondary(
         self, budget_id: str, primary: _PendingCreate, created_primary: dict[str, Any]
@@ -1628,7 +1638,7 @@ class SyncEngine:
         budget_id: str,
         pending_matches: list[_PendingManualMatch],
         response: dict[str, Any],
-    ) -> int:
+    ) -> tuple[int, int]:
         """Finishes a "matched_manual" outcome (see _classify()). Two
         possible endings, decided per-row by whether YNAB's native
         transaction-matching actually fired on the just-created shadow
@@ -1672,9 +1682,9 @@ class SyncEngine:
         its own submitted import_id instead, same pattern _record_created
         already uses.
 
-        Returns the number of shadow transactions created (== new
-        transactions in YNAB, one per matched row regardless of which
-        ending above applies), for submit()'s total_created.
+        Returns a tuple of (created_count, updated_count): counts of shadow
+        transactions that resulted in new transactions vs those where
+        native matching left only the original visible.
 
         Retry-safe: submit() may be called again with the same
         ClassifiedCycle after a prior partial failure (see its docstring).
@@ -1688,7 +1698,8 @@ class SyncEngine:
         succeeded, confirmed live, not an error).
         """
         by_import_id = {p.ynab_tx["import_id"]: p for p in pending_matches}
-        tracked_count = 0
+        created_count = 0
+        updated_count = 0
 
         async def _delete_original(p: _PendingManualMatch, new_ynab_transaction_id: str) -> None:
             try:
@@ -1790,9 +1801,10 @@ class SyncEngine:
                 continue  # YNAB's native matching echoing back the original - not ours
             if created.get("matched_transaction_id"):
                 await _finish_native_match(p, created)
+                updated_count += 1
             else:
                 await _finish_fallback(p, created)
-            tracked_count += 1
+                created_count += 1
 
         for import_id in response.get("duplicate_import_ids", []):
             p = by_import_id.get(import_id)
@@ -1833,10 +1845,12 @@ class SyncEngine:
                 continue
             if shadow.get("matched_transaction_id"):
                 await _finish_native_match(p, shadow)
+                updated_count += 1
             else:
                 await _finish_fallback(p, shadow)
+                created_count += 1
 
-        return tracked_count
+        return created_count, updated_count
 
     async def _match_transfers(
         self, creates_by_budget: dict[str, list[_PendingCreate]]
@@ -2261,11 +2275,29 @@ class SyncEngine:
             tracked["ynab_budget_id"],
             [new_tx],
         )
-        transaction_ids = response.get("transaction_ids", [])
-        if not transaction_ids:
+        # Find the created row by import_id rather than indexing
+        # response["transaction_ids"][0] positionally - YNAB's native
+        # transaction-matching can echo back another transaction in the
+        # same response (see CLAUDE.md's "Resolved: an ordinary create's
+        # native transaction-match tracked the invisible shadow"), so the
+        # first id might be the matched original, not our shadow. Always
+        # look up our own submitted import_id instead.
+        created = None
+        for tx in response.get("transactions", []):
+            if tx.get("import_id") == new_import_id:
+                created = tx
+                break
+        if created is None:
             raise RuntimeError(f"YNAB did not report the re-add as created: {response!r}")
 
-        new_ynab_transaction_id = transaction_ids[0]
+        # If native matching fired (created["matched_transaction_id"] is
+        # set), track the visible matched original's id instead of the
+        # shadow's - the shadow becomes permanently excluded from the plain
+        # account transaction list (confirmed live). Otherwise track the
+        # shadow itself from the fallback path.
+        new_ynab_transaction_id = (
+            created.get("matched_transaction_id") or created["id"]
+        )
         await self._db.mark_readded(
             tracking_key,
             new_ynab_transaction_id=new_ynab_transaction_id,
@@ -2393,10 +2425,14 @@ class SyncEngine:
             ynab_budget_id,
             [p.ynab_tx for p in pending_creates],
         )
-        created = await self._record_created(ynab_budget_id, pending_creates, response)
+        created, updated = await self._record_created(ynab_budget_id, pending_creates, response)
         resolved_deleted = await self._backfill_duplicates(
             ynab_budget_id, pending_creates, response.get("duplicate_import_ids", [])
         )
+        # File import counts both created and updated (native matches) as
+        # successful new visible transactions from the user's perspective,
+        # since they don't separate audit log events like submit() does -
+        # just one created/resolved_deleted summary per import.
         return FileImportResult(
-            rows=row_results, created=created, resolved_deleted=resolved_deleted, committed=True
+            rows=row_results, created=created + updated, resolved_deleted=resolved_deleted, committed=True
         )

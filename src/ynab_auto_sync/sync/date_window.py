@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, timedelta
 from typing import Literal
 
 from workalendar.europe import Norway
@@ -28,3 +28,14 @@ def days_between(d1: date, d2: date, unit: MatchWindowUnit) -> int:
     if unit == "calendar_days":
         return abs((d2 - d1).days)
     return _NORWAY_CALENDAR.get_working_days_delta(d1, d2)
+
+
+def since_date_bound(ref: date, lookback_days: int) -> date:
+    """Earliest date worth fetching for a since_date-bounded YNAB GET,
+    anchored to a REAL reference date - never wall-clock "now". A tracked
+    row can sit for a long time (e.g. a still-PENDING transaction awaiting
+    its eventual booked correction) well past `lookback_days` from today,
+    so every caller anchors to its own known transaction/tracked-row date
+    instead of "now minus lookback".
+    """
+    return ref - timedelta(days=lookback_days)

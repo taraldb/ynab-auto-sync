@@ -18,7 +18,7 @@ from ynab_auto_sync.providers.base import (
     TransactionProvider,
 )
 from ynab_auto_sync.sync import transfers
-from ynab_auto_sync.sync.date_window import days_between
+from ynab_auto_sync.sync.date_window import days_between, since_date_bound
 from ynab_auto_sync.sync.file_import import dedup as file_dedup
 from ynab_auto_sync.sync.file_import.base import ImportedTransactionRow
 from ynab_auto_sync.sync.import_ids import derive_import_id, prefix_of
@@ -135,6 +135,7 @@ class _PendingUpdate:
     tracking_key: str
     ynab_transaction_id: str
     new_amount: Decimal
+    transaction_date: date
     # The budget the already-tracked transaction lives in, which is not
     # necessarily the mapping's current budget (a mapping can be re-pointed
     # after a transaction was already imported).
@@ -167,6 +168,7 @@ class _PendingFuzzyUpdate:
     new_tracking_key: str
     ynab_transaction_id: str
     new_amount: Decimal
+    transaction_date: date
     ynab_budget_id: str
     provider_type: str
     account_key: str
@@ -449,6 +451,7 @@ class SyncEngine:
                         new_tracking_key=ntx.tracking_key,
                         ynab_transaction_id=fuzzy_match.candidate.ynab_transaction_id,
                         new_amount=ntx.amount,
+                        transaction_date=fuzzy_match.candidate.date,
                         ynab_budget_id=fuzzy_match.candidate.ynab_budget_id,
                         provider_type=provider_type,
                         account_key=ntx.provider_account_id,
@@ -572,10 +575,18 @@ class SyncEngine:
             tracked["booking_status"] == BookingStatus.PENDING
             and ntx.booking_status == BookingStatus.BOOKED
         ):
+            # Use the tracked row's original date if available, otherwise fall back
+            # to the current ntx.date (can happen in tests with incomplete fixtures).
+            tracked_date = (
+                date.fromisoformat(tracked["transaction_date"])
+                if tracked["transaction_date"]
+                else ntx.date
+            )
             return "transitioned", _PendingUpdate(
                 tracking_key=ntx.tracking_key,
                 ynab_transaction_id=tracked["ynab_transaction_id"],
                 new_amount=ntx.amount,
+                transaction_date=tracked_date,
                 # Update where the transaction actually lives, which may
                 # not be the mapping's current budget.
                 ynab_budget_id=tracked["ynab_budget_id"],
@@ -615,8 +626,10 @@ class SyncEngine:
         # (see ynab_client.list_unimported_transactions), populated lazily -
         # only the first time an account is touched this cycle, and never at
         # all when manual_match_window_days is 0 (the default) - so the
-        # disabled/no-manual-entries case costs zero extra API calls.
-        manual_candidates_cache: dict[str, list[dict[str, Any]]] = {}
+        # disabled/no-manual-entries case costs zero extra API calls. Stored as
+        # (since_date, results) tuples to support cache-widening on refetch
+        # when a later ntx.date needs to reach further back.
+        manual_candidates_cache: dict[str, tuple[date, list[dict[str, Any]]]] = {}
         # Per-provider-account (NOT ynab_account_id - tracked_transactions.
         # account_key is the provider's own id) cache of this account's
         # still-PENDING tracked rows, populated lazily and only when
@@ -625,7 +638,7 @@ class SyncEngine:
         pending_candidates_cache: dict[str, list[PendingCandidate]] = {}
 
         async def _get_manual_candidates(
-            ynab_account_id: str, ynab_budget_id: str
+            ynab_account_id: str, ynab_budget_id: str, ntx_date: date
         ) -> list[dict[str, Any]]:
             # Fetched whenever EITHER toggle might need it - manual_match_
             # window_days for a BOOKED ntx's exact match below, pending_
@@ -637,16 +650,19 @@ class SyncEngine:
                 self._config.sync.pending_import_enabled
             ):
                 return []
-            if ynab_account_id not in manual_candidates_cache:
-                manual_candidates_cache[ynab_account_id] = (
-                    await ynab_client.list_unimported_transactions(
-                        self._http_client,
-                        self._config.ynab.personal_access_token,
-                        ynab_budget_id,
-                        ynab_account_id,
-                    )
+            needed_since = since_date_bound(ntx_date, self._config.sync.initial_backfill_days)
+            cached = manual_candidates_cache.get(ynab_account_id)
+            if cached is None or cached[0] > needed_since:
+                candidates = await ynab_client.list_unimported_transactions(
+                    self._http_client,
+                    self._config.ynab.personal_access_token,
+                    ynab_budget_id,
+                    ynab_account_id,
+                    since_date=needed_since,
                 )
-            return manual_candidates_cache[ynab_account_id]
+                manual_candidates_cache[ynab_account_id] = (needed_since, candidates)
+                return candidates
+            return cached[1]
 
         def _get_pending_candidates(provider_account_id: str) -> list[PendingCandidate]:
             if not self._config.sync.pending_import_enabled:
@@ -761,7 +777,7 @@ class SyncEngine:
                     continue
 
                 manual_candidates = await _get_manual_candidates(
-                    mapping["ynab_account_id"], mapping["ynab_budget_id"]
+                    mapping["ynab_account_id"], mapping["ynab_budget_id"], ntx.date
                 )
                 pending_candidates = _get_pending_candidates(ntx.provider_account_id)
                 outcome, pending = self._classify(
@@ -875,10 +891,21 @@ class SyncEngine:
             # unchanged on every backoff retry). Confirmed live is exactly
             # 2 states either flavor of update ever needs an existence
             # check against.
+            all_dates = [p.transaction_date for p in pending_updates] + [
+                p.transaction_date for p in pending_fuzzy
+            ]
+            since_date = (
+                since_date_bound(min(all_dates), self._config.sync.initial_backfill_days)
+                if all_dates
+                else None
+            )
             live_by_id = {
                 t["id"]: t
                 for t in await ynab_client.list_transactions_including_deleted(
-                    self._http_client, self._config.ynab.personal_access_token, budget_id
+                    self._http_client,
+                    self._config.ynab.personal_access_token,
+                    budget_id,
+                    since_date=since_date,
                 )
             }
 
@@ -1129,16 +1156,18 @@ class SyncEngine:
             )
             return 0, 0
 
+        window_days = self._config.sync.pending_import_date_window_days
+        unit = self._config.sync.match_window_unit
+        target_amount_milliunits = to_milliunits(new_amount)
+        tracked_date = date.fromisoformat(tracked["transaction_date"])
+        since_date = since_date_bound(tracked_date, self._config.sync.initial_backfill_days)
         candidates = await ynab_client.list_unimported_transactions(
             self._http_client,
             self._config.ynab.personal_access_token,
             budget_id,
             tracked["ynab_account_id"],
+            since_date=since_date,
         )
-        window_days = self._config.sync.pending_import_date_window_days
-        unit = self._config.sync.match_window_unit
-        target_amount_milliunits = to_milliunits(new_amount)
-        tracked_date = date.fromisoformat(tracked["transaction_date"])
         matches = [
             c
             for c in candidates
@@ -1783,12 +1812,17 @@ class SyncEngine:
             # shadow is always findable this way regardless of ending: the
             # native-match ending never touches it, and the fallback ending
             # only ever deletes original_transaction_id, never the shadow.
+            since_date = since_date_bound(
+                date.fromisoformat(p.ynab_tx["date"]),
+                self._config.sync.initial_backfill_days,
+            )
             shadow = await ynab_client.find_transaction_by_import_id(
                 self._http_client,
                 self._config.ynab.personal_access_token,
                 budget_id,
                 p.ynab_tx["account_id"],
                 import_id,
+                since_date=since_date,
             )
             if shadow is None:
                 # Reported as a duplicate but the shadow can't be found -
@@ -2079,12 +2113,17 @@ class SyncEngine:
                     detail="already tracked (retry within same cycle)",
                 )
                 continue  # already tracked (e.g. a retry within the same cycle)
+            since_date = since_date_bound(
+                date.fromisoformat(p.ynab_tx["date"]),
+                self._config.sync.initial_backfill_days,
+            )
             existing = await ynab_client.find_transaction_by_import_id(
                 self._http_client,
                 self._config.ynab.personal_access_token,
                 budget_id,
                 p.ynab_tx["account_id"],
                 import_id,
+                since_date=since_date,
             )
             if existing is not None:
                 await self._db.upsert_tracked(
@@ -2119,7 +2158,11 @@ class SyncEngine:
                 continue
 
             deleted_tx = await ynab_client.find_transaction_including_deleted(
-                self._http_client, self._config.ynab.personal_access_token, budget_id, import_id
+                self._http_client,
+                self._config.ynab.personal_access_token,
+                budget_id,
+                import_id,
+                since_date=since_date,
             )
             if deleted_tx is not None and deleted_tx.get("deleted"):
                 logger.info(

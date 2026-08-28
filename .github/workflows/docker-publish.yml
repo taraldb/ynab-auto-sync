@@ -73,3 +73,13 @@ jobs:
             BUILD_TIMESTAMP=${{ steps.build_timestamp.outputs.value }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  trigger-watchtower-update:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger Watchtower update
+        run: |
+          curl -sf -X POST \
+            -H "Authorization: Bearer ${{ secrets.WATCHTOWER_HTTP_API_TOKEN }}" \
+            "https://watchtower.bergee.net/v1/update"

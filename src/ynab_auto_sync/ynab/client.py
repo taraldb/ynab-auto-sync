@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from typing import Any
 
 import httpx
@@ -124,6 +124,7 @@ async def list_unimported_transactions(
     personal_access_token: str,
     budget_id: str,
     account_id: str,
+    since_date: date | None = None,
 ) -> list[dict[str, Any]]:
     """List an account's transactions that were never imported by any
     source - no import_id, not deleted. These are the "a human typed this
@@ -136,10 +137,15 @@ async def list_unimported_transactions(
     find_transaction_by_import_id already relies on (there is no
     import_id-filtered query param - confirmed absent from the OpenAPI spec
     - so this is a client-side filter, same as that function's own scan).
+    `since_date`, when given, is passed to YNAB to limit the fetch scope.
     """
+    params: dict[str, Any] = {}
+    if since_date is not None:
+        params["since_date"] = since_date.isoformat()
     response = await http_client.get(
         f"{BASE_URL}/{RESOURCE_PATH}/{budget_id}/accounts/{account_id}/transactions",
         headers=_headers(personal_access_token),
+        params=params if params else None,
     )
     response.raise_for_status()
     return [
@@ -302,6 +308,7 @@ async def find_transaction_by_import_id(
     budget_id: str,
     account_id: str,
     import_id: str,
+    since_date: date | None = None,
 ) -> dict[str, Any] | None:
     """Look up a transaction by its import_id within one account.
 
@@ -316,11 +323,17 @@ async def find_transaction_by_import_id(
     the code needs to recover an existing YNAB transaction's id - a rare
     path, so the extra list-and-scan cost here is fine.
 
+    `since_date`, when given, is passed to YNAB to limit the fetch scope.
+
     Returns None if no transaction with that import_id is found.
     """
+    params: dict[str, Any] = {}
+    if since_date is not None:
+        params["since_date"] = since_date.isoformat()
     response = await http_client.get(
         f"{BASE_URL}/{RESOURCE_PATH}/{budget_id}/accounts/{account_id}/transactions",
         headers=_headers(personal_access_token),
+        params=params if params else None,
     )
     response.raise_for_status()
     for transaction in response.json()["data"]["transactions"]:
@@ -334,6 +347,7 @@ async def list_transactions_including_deleted(
     http_client: httpx.AsyncClient,
     personal_access_token: str,
     budget_id: str,
+    since_date: date | None = None,
 ) -> list[dict[str, Any]]:
     """The full budget-wide transaction history, including deleted ones -
     each row carries a `deleted` boolean field.
@@ -352,12 +366,16 @@ async def list_transactions_including_deleted(
     Budget-wide rather than account-scoped, and heavier than
     list_unimported_transactions/find_transaction_by_import_id - don't
     call this routinely, only when deleted-transaction visibility is
-    actually needed.
+    actually needed. `since_date`, when given, is passed to YNAB to limit
+    the fetch scope.
     """
+    params: dict[str, Any] = {"last_knowledge_of_server": 0}
+    if since_date is not None:
+        params["since_date"] = since_date.isoformat()
     response = await http_client.get(
         f"{BASE_URL}/{RESOURCE_PATH}/{budget_id}/transactions",
         headers=_headers(personal_access_token),
-        params={"last_knowledge_of_server": 0},
+        params=params,
     )
     response.raise_for_status()
     return response.json()["data"]["transactions"]
@@ -368,6 +386,7 @@ async def find_transaction_including_deleted(
     personal_access_token: str,
     budget_id: str,
     import_id: str,
+    since_date: date | None = None,
 ) -> dict[str, Any] | None:
     """Search the full budget transaction history - including deleted
     transactions - for one with the given import_id.
@@ -380,10 +399,11 @@ async def find_transaction_including_deleted(
 
     Only call this as a second-line check after that cheaper lookup fails,
     not routinely - see list_transactions_including_deleted (the retried
-    GET this wraps) for why.
+    GET this wraps) for why. `since_date`, when given, is passed to YNAB
+    to limit the fetch scope.
     """
     transactions = await list_transactions_including_deleted(
-        http_client, personal_access_token, budget_id
+        http_client, personal_access_token, budget_id, since_date=since_date
     )
     for transaction in transactions:
         if transaction.get("import_id") == import_id:

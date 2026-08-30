@@ -61,6 +61,7 @@ export interface ImportRow {
   amount_milliunits: number;
   payee_name: string;
   memo: string | null;
+  cleared: string;
   status: ImportRowStatus;
 }
 

@@ -2260,7 +2260,7 @@ async def test_run_cycle_does_not_link_coincidental_same_amount_pair(tmp_path: P
     assert result.created == 2
 
 
-def make_row(row_index: int, day: int, amount_milliunits: int, payee: str, memo=None):
+def make_row(row_index: int, day: int, amount_milliunits: int, payee: str, memo=None, cleared="cleared"):
     from datetime import date as date_cls
 
     return ImportedTransactionRow(
@@ -2268,6 +2268,7 @@ def make_row(row_index: int, day: int, amount_milliunits: int, payee: str, memo=
         amount=from_milliunits(amount_milliunits),
         payee_name=payee,
         memo=memo,
+        cleared=cleared,
         row_index=row_index,
     )
 

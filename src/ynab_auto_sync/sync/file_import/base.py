@@ -15,6 +15,7 @@ class ImportedTransactionRow:
     amount: Decimal
     payee_name: str
     memo: str | None
+    cleared: str  # "cleared" or "uncleared", matching YNAB's booking_status convention
     row_index: int  # 1-based, including the header row, for error reporting
 
 

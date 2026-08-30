@@ -213,6 +213,7 @@ async def import_file(
                 "amount_milliunits": row.amount_milliunits,
                 "payee_name": row.payee_name,
                 "memo": row.memo,
+                "cleared": row.cleared,
                 "status": row.status,
             }
             for row in result.rows

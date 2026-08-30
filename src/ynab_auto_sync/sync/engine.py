@@ -254,6 +254,7 @@ class FileImportRowResult:
     amount_milliunits: int
     payee_name: str
     memo: str | None
+    cleared: str  # "cleared" or "uncleared"
     status: str  # "new", "duplicate", or "error"
 
 
@@ -2329,9 +2330,10 @@ class SyncEngine:
         here they're sync.file_import.dedup's CONTENT hash, because a bank
         export has no bank-assigned row id to key off at all (invariant 7).
 
-        File-imported transactions are always treated as already-settled
-        (BOOKED/cleared) - a bank export only ever contains historical,
-        booked transactions, never pending ones.
+        File-imported transactions may be uncleared (reserved/pending) or
+        cleared/booked - the transformer determines which based on the source
+        data (e.g. Norwegian bank exports tag reserved transactions with
+        "Reservert" in the Type column).
         """
         row_results: list[FileImportRowResult] = []
         pending_creates: list[_PendingCreate] = []
@@ -2349,6 +2351,13 @@ class SyncEngine:
             )
             tracking_key = file_dedup.get_tracking_key(ynab_account_id, dedup_key)
 
+            # Convert the cleared string to a BookingStatus enum.
+            booking_status = (
+                BookingStatus.PENDING
+                if row.cleared == "uncleared"
+                else BookingStatus.BOOKED
+            )
+
             ntx = NormalizedTransaction(
                 tracking_key=tracking_key,
                 import_id=file_dedup.derive_import_id(tracking_key),
@@ -2357,7 +2366,7 @@ class SyncEngine:
                 amount=row.amount,
                 payee_name=row.payee_name,
                 memo=row.memo,
-                booking_status=BookingStatus.BOOKED,
+                booking_status=booking_status,
             )
             # manual_candidates deliberately omitted (defaults to None) - a
             # bulk historical file import is not the scenario manual-
@@ -2372,10 +2381,11 @@ class SyncEngine:
                 ynab_account_id=ynab_account_id,
                 ynab_budget_id=ynab_budget_id,
             )
-            # A file row can only ever be "new" or already-tracked: it is
-            # always BOOKED, so _classify's pending->booked transition can't
-            # apply. Anything already tracked is reported as a duplicate and
-            # never resubmitted.
+            # A file row can only ever be "new" or already-tracked - it might
+            # be PENDING or BOOKED depending on the source data, but
+            # _classify's pending->booked transition can't apply since the
+            # row already has its final booking status. Anything already
+            # tracked is reported as a duplicate and never resubmitted.
             if outcome == "new":
                 pending_creates.append(pending)
             else:
@@ -2387,6 +2397,7 @@ class SyncEngine:
                     amount_milliunits=to_milliunits(row.amount),
                     payee_name=row.payee_name,
                     memo=row.memo,
+                    cleared=row.cleared,
                     status="new" if outcome == "new" else "duplicate",
                 )
             )

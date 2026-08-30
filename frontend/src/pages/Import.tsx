@@ -434,11 +434,14 @@ export default function Import() {
                   <th className="px-4 py-2.5 text-right font-medium">
                     Amount
                   </th>
+                  <th className="px-4 py-2.5 font-medium">Cleared</th>
                   <th className="px-4 py-2.5 font-medium">Status</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-800 bg-slate-900/40">
-                {preview.rows.map((row) => (
+                {preview.rows
+                  .sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime())
+                  .map((row) => (
                   <tr key={row.row_index}>
                     <td className="px-4 py-2.5 text-slate-500">
                       {row.row_index}
@@ -461,6 +464,11 @@ export default function Import() {
                     >
                       {formatNok(row.amount_milliunits)}
                     </td>
+                    <td className="px-4 py-2.5 text-slate-400">
+                      <span className="text-xs">
+                        {row.cleared === "cleared" ? "✓ Cleared" : "⧖ Uncleared"}
+                      </span>
+                    </td>
                     <td className="px-4 py-2.5">
                       <span
                         className={`rounded-full px-2.5 py-0.5 text-xs font-medium ${STATUS_BADGE[row.status]}`}
@@ -474,7 +482,7 @@ export default function Import() {
                   <tr>
                     <td
                       className="px-4 py-6 text-center text-slate-500"
-                      colSpan={6}
+                      colSpan={7}
                     >
                       No rows found in this file.
                     </td>

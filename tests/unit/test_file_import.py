@@ -41,10 +41,12 @@ def make_row(
     text="SOME STORE",
     amount=-100.0,
     merchant_category="GROCERY STORES/SUPERMARKETS",
+    transaction_type=None,
 ):
     row = [None] * 11
     row[0] = date_val
     row[1] = text
+    row[2] = transaction_type
     row[6] = amount
     row[8] = merchant_category
     return tuple(row)
@@ -87,6 +89,7 @@ def test_transform_produces_expected_row_values():
             amount=from_milliunits(-119900),
             payee_name="PAYPAL JAGEX LTD",  # sanitized: '*' separator replaced with a space
             memo=None,  # memo is no longer populated from Merchant Category
+            cleared="cleared",
             row_index=2,
         )
     ]
@@ -103,6 +106,7 @@ def test_transform_handles_positive_amount_and_missing_merchant_category():
 
     assert result[0].amount == from_milliunits(20099920)
     assert result[0].memo is None
+    assert result[0].cleared == "cleared"
 
 
 def test_transform_row_index_accounts_for_header_row():
@@ -113,6 +117,32 @@ def test_transform_row_index_accounts_for_header_row():
     ]
     result = NorwegianBankTransformer().transform(rows)
     assert [r.row_index for r in result] == [2, 3, 4]
+
+
+def test_transform_detects_uncleared_transactions():
+    # Transactions with "Reservert" in the Type column (column 2) are uncleared.
+    row = make_row(
+        datetime(2025, 11, 20, tzinfo=UTC),
+        text="VISA CHARGE",
+        amount=-500.0,
+        transaction_type="Reservert",
+    )
+    result = NorwegianBankTransformer().transform([row])
+
+    assert result[0].cleared == "uncleared"
+
+
+def test_transform_detects_cleared_transactions():
+    # Transactions without "Reservert" in the Type column are cleared.
+    row = make_row(
+        datetime(2025, 11, 20, tzinfo=UTC),
+        text="STORE PURCHASE",
+        amount=-150.0,
+        transaction_type="Normal",
+    )
+    result = NorwegianBankTransformer().transform([row])
+
+    assert result[0].cleared == "cleared"
 
 
 def test_transform_serial_date_fallback():

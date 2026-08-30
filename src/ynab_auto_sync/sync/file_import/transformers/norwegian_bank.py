@@ -33,6 +33,7 @@ HEADERS = (
 
 COL_TRANSACTION_DATE = 0
 COL_TEXT = 1
+COL_TYPE = 2
 COL_AMOUNT = 6
 COL_MERCHANT_CATEGORY = 8
 
@@ -100,11 +101,17 @@ class NorwegianBankTransformer(TransformerBase):
         cleaned_payee = clean_bank_text(str(text))
         payee_name = (cleaned_payee or str(text))[:YNAB_PAYEE_NAME_MAX_LEN]
 
+        # Detect uncleared transactions: when the Type column contains "Reservert"
+        # (reserved/held), the transaction is uncleared. Otherwise, it's cleared.
+        transaction_type = str(row[COL_TYPE]) if len(row) > COL_TYPE and row[COL_TYPE] else ""
+        cleared = "uncleared" if "Reservert" in transaction_type else "cleared"
+
         return ImportedTransactionRow(
             date=tx_date,
             amount=amount,
             payee_name=payee_name,
             memo=None,
+            cleared=cleared,
             row_index=row_index,
         )
 

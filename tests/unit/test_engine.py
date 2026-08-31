@@ -1063,6 +1063,35 @@ async def test_run_cycle_pending_update_patch_unexpectedly_400s_recovers(tmp_pat
     assert tracked["booking_status"] == "DELETED"
 
 
+async def test_recover_missing_pending_update_returns_three_tuple_when_no_local_row(
+    tmp_path: Path,
+):
+    """The defensive `tracked is None` branch (pending-update target gone
+    from YNAB AND no local tracked row left to recover from) must return a
+    3-tuple like every other exit - submit()'s _recover() unpacks three
+    values, so a 2-tuple here raises ValueError and aborts the whole cycle,
+    which then wedges on backoff retry (regression: 1aaa4f9 widened the
+    return type and missed this branch).
+    """
+    config = make_config()
+    token_store = make_token_store(tmp_path)
+    db = make_db(tmp_path)
+    await seed_mappings(db, config)
+
+    async with httpx.AsyncClient() as http_client:
+        engine = make_engine(config, http_client, token_store, db)
+        result = await engine._recover_missing_pending_update(
+            "budget-1",
+            tracking_key="acct-1:no-such-row",
+            ynab_transaction_id="ynab-gone",
+            new_amount=from_milliunits(-12345),
+            provider_type="sparebank1",
+            account_key="acct-1",
+        )
+
+    assert result == (0, 0, 0)
+
+
 @respx.mock
 async def test_run_cycle_groups_creates_by_resolved_budget(tmp_path: Path):
     accounts = [
@@ -2926,6 +2955,58 @@ def _unimported_url(budget_id: str, ynab_account_id: str) -> str:
 
 
 @respx.mock
+async def test_manual_candidate_fetch_since_date_uses_dedup_lookback_not_backfill(
+    tmp_path: Path,
+):
+    """The `since_date` bounding dedup-resilience YNAB lookups must derive
+    from sync.dedup_lookback_days, NOT sync.initial_backfill_days - the
+    latter is a first-run-only backfill horizon that is legitimately set
+    very low on some deployments (prod: 5), which silently shrank these
+    lookups and caused real duplicates.
+    """
+    config = make_config()
+    config.sync.manual_match_window_days = 3
+    config.sync.initial_backfill_days = 5  # deliberately tiny, like prod
+    config.sync.dedup_lookback_days = 90
+    token_store = make_token_store(tmp_path)
+    db = make_db(tmp_path)
+    await seed_mappings(db, config)
+
+    # Recent enough to be inside the (tiny) fetch window; the assertion is
+    # about the since_date arithmetic, not the fetch cutoff.
+    ntx_date = datetime.now(UTC).date() - timedelta(days=2)
+    respx.get(sb1_client.TRANSACTIONS_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "transactions": [
+                    {
+                        "id": "tx-a",
+                        "nonUniqueId": "tx-a",
+                        "accountKey": "acct-1",
+                        "date": ntx_date.isoformat(),
+                        "amount": -50.0,
+                        "description": "SOME SHOP",
+                        "bookingStatus": "BOOKED",
+                    }
+                ]
+            },
+        )
+    )
+    unimported = respx.get(_unimported_url("budget-1", "ynab-acct-1")).mock(
+        return_value=httpx.Response(200, json={"data": {"transactions": []}})
+    )
+    create_route("budget-1", transaction_ids=["ynab-a"])
+
+    async with httpx.AsyncClient() as http_client:
+        engine = make_engine(config, http_client, token_store, db)
+        await engine.run_cycle()
+
+    sent_since = unimported.calls.last.request.url.params["since_date"]
+    assert sent_since == (ntx_date - timedelta(days=90)).isoformat()
+
+
+@respx.mock
 async def test_run_cycle_matches_unambiguous_manual_transaction(tmp_path: Path):
     """Exact-amount manual match: YNAB's own native transaction-matching
     fires (matched_transaction_id set on the newly-created shadow),
@@ -4148,6 +4229,15 @@ async def test_run_cycle_pending_manual_match_row_later_fuzzy_resolves_when_book
     match placeholder) convergence actually works end-to-end: both kinds of
     PENDING placeholder are found by the exact same list_pending_candidates
     query and resolved by the exact same fuzzy matcher.
+
+    Regression for a real production duplicate (Felleskort, 2026-08-31):
+    the hand-typed YNAB entry's payee is the user's OWN custom name
+    ("Parkering") which does not resemble the bank's later BOOKED
+    description ("EasyPark AS, ...") at all. _record_matched() must persist
+    the bank's own description (ntx.payee_name) on the placeholder row, NOT
+    YNAB's resolved payee - otherwise cycle 2's find_pending_match() payee
+    filter fails and the booked charge is created fresh (a duplicate of the
+    user's entry).
     """
     config = make_config()
     config.sync.pending_import_enabled = True
@@ -4176,7 +4266,7 @@ async def test_run_cycle_pending_manual_match_row_later_fuzzy_resolves_when_book
                             "accountKey": "acct-1",
                             "date": pending_date,
                             "amount": -218,
-                            "description": "MERCHANT ONE, LOC-A",
+                            "description": "EASYPARK AS, OSLO",
                             "bookingStatus": "PENDING",
                         }
                     ]
@@ -4191,7 +4281,7 @@ async def test_run_cycle_pending_manual_match_row_later_fuzzy_resolves_when_book
                         "accountKey": "acct-1",
                         "date": pending_date,
                         "amount": -218.3,
-                        "description": "MERCHANT ONE, LOC-A, NOR",
+                        "description": "EasyPark AS, easypark.no, NOR",
                         "bookingStatus": "BOOKED",
                     }
                 ]
@@ -4215,7 +4305,7 @@ async def test_run_cycle_pending_manual_match_row_later_fuzzy_resolves_when_book
                                 "date": manual_date,
                                 "amount": -218300,
                                 "payee_id": "payee-manual-7",
-                                "payee_name": "Merchant One",
+                                "payee_name": "Parkering",
                                 "category_id": "cat-1",
                                 "memo": None,
                                 "cleared": "cleared",
@@ -4240,7 +4330,7 @@ async def test_run_cycle_pending_manual_match_row_later_fuzzy_resolves_when_book
             200,
             json={
                 "data": {
-                    "transaction_ids": ["ynab-replacement-7"],
+                    "transaction_ids": ["ynab-replacement-7", "manual-7"],
                     "duplicate_import_ids": [],
                     "transactions": [
                         {
@@ -4248,51 +4338,64 @@ async def test_run_cycle_pending_manual_match_row_later_fuzzy_resolves_when_book
                             "import_id": import_id,
                             "amount": -218000,
                             # YNAB resolves the submitted payee_id and echoes
-                            # its name back - the tracked row's payee_name
-                            # comes from THIS, not the request payload (see
-                            # _record_matched). Needed for cycle 2's fuzzy
-                            # payee-similarity check to have anything to
-                            # compare against.
-                            "payee_name": "MERCHANT ONE, LOC-A",
-                        }
+                            # the user's OWN custom payee back ("Parkering").
+                            # The tracked row must NOT take its payee_name
+                            # from here (see _record_matched) - cycle 2's
+                            # fuzzy payee filter needs the bank description.
+                            "payee_name": "Parkering",
+                            "matched_transaction_id": "manual-7",
+                        },
+                        {
+                            "id": "manual-7",
+                            "import_id": None,
+                            "amount": -218300,
+                            "payee_name": "Parkering",
+                            "matched_transaction_id": "ynab-replacement-7",
+                            "approved": False,
+                        },
                     ],
                 }
             },
         )
     )
-    respx.delete(
-        f"{ynab_client.BASE_URL}/{ynab_client.RESOURCE_PATH}/budget-1/transactions/manual-7"
-    ).mock(
-        return_value=httpx.Response(
-            200, json={"data": {"transaction": {"id": "manual-7", "deleted": True}}}
-        )
-    )
     respx.get(f"{ynab_client.BASE_URL}/{ynab_client.RESOURCE_PATH}/budget-1/transactions").mock(
         return_value=httpx.Response(
             200,
-            json={"data": {"transactions": [{"id": "ynab-replacement-7", "deleted": False}]}},
+            json={"data": {"transactions": [{"id": "manual-7", "deleted": False}]}},
         )
     )
     respx.patch(f"{ynab_client.BASE_URL}/{ynab_client.RESOURCE_PATH}/budget-1/transactions").mock(
         return_value=httpx.Response(
-            200, json={"data": {"transaction_ids": ["ynab-replacement-7"]}}
+            200, json={"data": {"transaction_ids": ["manual-7"]}}
         )
     )
 
     async with httpx.AsyncClient() as http_client:
         engine = make_engine(config, http_client, token_store, db)
-        first_result, _ = await engine.run_cycle()
+        await engine.run_cycle()
+
+        # Cycle 1: YNAB native matching fired - the user's entry stays
+        # visible, nothing new created, the placeholder row is anchored on
+        # it.
+        placeholder = db.get_tracked("acct-1:444444444")
+        assert placeholder is not None
+        assert placeholder["booking_status"] == "PENDING"
+        assert placeholder["ynab_transaction_id"] == "manual-7"
+        # The load-bearing assertion: the BANK's own description, not
+        # "Parkering" (the user's custom payee YNAB echoes back).
+        assert placeholder["payee_name"] == "EASYPARK AS, OSLO"
+
         second_result, _ = await engine.run_cycle()
 
-    assert first_result.created == 1
-    assert second_result.updated == 1
+    # Cycle 2: the booked charge (new tracking key) fuzzy-resolves the
+    # placeholder instead of creating a duplicate.
     assert second_result.created == 0
-
+    assert second_result.updated == 1
     assert db.get_tracked("acct-1:444444444") is None
     tracked = db.get_tracked("acct-1:555555555")
     assert tracked is not None
     assert tracked["booking_status"] == "BOOKED"
-    assert tracked["ynab_transaction_id"] == "ynab-replacement-7"
+    assert tracked["ynab_transaction_id"] == "manual-7"
     assert tracked["amount_milliunits"] == -218300
 
 

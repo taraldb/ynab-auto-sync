@@ -67,6 +67,19 @@ class SyncConfig(BaseModel):
     timezone: str = "Europe/Oslo"
     lookback_overlap_hours: int = 72
     initial_backfill_days: int = 30
+    # The `since_date` floor for every dedup-RESILIENCE YNAB lookup (recover
+    # an existing transaction by import_id after local-state loss, pre-check
+    # a pending->booked update target's existence, fetch manual-match
+    # candidates) - see sync/date_window.since_date_bound and its call sites
+    # in sync/engine.py. Deliberately its OWN knob, not reused from
+    # initial_backfill_days (which is a first-run-only backfill horizon and
+    # is legitimately set very low on some deployments to cap the first
+    # sync's volume) - overloading the two silently shrank these lookups and
+    # caused real duplicates. Must comfortably exceed every match window
+    # (pending_import_date_window_days, manual_match_window_days,
+    # transfer_match_window_days) in calendar terms - the validator enforces
+    # a floor.
+    dedup_lookback_days: int = 90
     # How long a BOOKED tracked_transactions row survives before it's
     # eligible for pruning (see state_db.prune_booked_transactions). Must
     # stay past the fetch horizon (initial_backfill_days +
@@ -265,6 +278,22 @@ class AppConfig(BaseModel):
                 f"({fetch_horizon_days}) - pruning inside the still-reachable fetch "
                 "horizon would let a normal cycle's overlap window resurrect a pruned "
                 "transaction as a false 'new' one"
+            )
+
+        widest_match_window = max(
+            self.sync.pending_import_date_window_days,
+            self.sync.manual_match_window_days,
+            self.sync.transfer_match_window_days,
+        )
+        dedup_floor = widest_match_window + math.ceil(self.sync.lookback_overlap_hours / 24)
+        if self.sync.dedup_lookback_days < dedup_floor:
+            errors.append(
+                f"sync.dedup_lookback_days ({self.sync.dedup_lookback_days}) must be >= "
+                f"max(pending_import_date_window_days, manual_match_window_days, "
+                f"transfer_match_window_days) + ceil(lookback_overlap_hours / 24) "
+                f"({dedup_floor}) - a dedup-resilience lookup bounded tighter than a "
+                "match window can miss the very transaction it needs to find and create "
+                "a duplicate"
             )
 
         if errors:

@@ -39,6 +39,12 @@ sync:
   lookback_overlap_hours: 72
   # Only used the first time an account has no last_synced_at cursor yet.
   initial_backfill_days: 30
+  # The since_date floor for dedup-resilience YNAB lookups (recover a
+  # transaction by import_id, pre-check a pending->booked update target,
+  # fetch manual-match candidates). Its own knob, NOT reused from
+  # initial_backfill_days - keep it well above every match window below.
+  # (enforced at config-load time)
+  dedup_lookback_days: 90
   # How long a booked, tracked transaction is kept in local state before
   # it's eligible for pruning. Must stay past initial_backfill_days +
   # lookback_overlap_hours (enforced at config-load time).

@@ -651,7 +651,7 @@ class SyncEngine:
                 self._config.sync.pending_import_enabled
             ):
                 return []
-            needed_since = since_date_bound(ntx_date, self._config.sync.initial_backfill_days)
+            needed_since = since_date_bound(ntx_date, self._config.sync.dedup_lookback_days)
             cached = manual_candidates_cache.get(ynab_account_id)
             if cached is None or cached[0] > needed_since:
                 candidates = await ynab_client.list_unimported_transactions(
@@ -899,7 +899,7 @@ class SyncEngine:
                 p.transaction_date for p in pending_fuzzy
             ]
             since_date = (
-                since_date_bound(min(all_dates), self._config.sync.initial_backfill_days)
+                since_date_bound(min(all_dates), self._config.sync.dedup_lookback_days)
                 if all_dates
                 else None
             )
@@ -1160,13 +1160,18 @@ class SyncEngine:
                 ynab_transaction_id,
                 tracking_key,
             )
-            return 0, 0
+            # 3-tuple: this function is (created, updated, resolved_deleted)
+            # everywhere else, and submit()'s _recover() unpacks three
+            # values - a 2-tuple here raises ValueError and aborts the whole
+            # cycle (which then wedges on backoff retry, the exact failure
+            # 1aaa4f9 existed to fix).
+            return 0, 0, 0
 
         window_days = self._config.sync.pending_import_date_window_days
         unit = self._config.sync.match_window_unit
         target_amount_milliunits = to_milliunits(new_amount)
         tracked_date = date.fromisoformat(tracked["transaction_date"])
-        since_date = since_date_bound(tracked_date, self._config.sync.initial_backfill_days)
+        since_date = since_date_bound(tracked_date, self._config.sync.dedup_lookback_days)
         candidates = await ynab_client.list_unimported_transactions(
             self._http_client,
             self._config.ynab.personal_access_token,
@@ -1750,7 +1755,15 @@ class SyncEngine:
                 shadow_id=shadow["id"],
                 booking_status=p.booking_status,
                 amount=from_milliunits(p.ynab_tx["amount"]),
-                payee_name=shadow.get("payee_name"),
+                # The bank's OWN description (ntx.payee_name), not YNAB's
+                # resolved payee - which for a manual match is the user's
+                # short custom name ("Parkering") and bears no resemblance
+                # to the raw BOOKED description ("EasyPark AS, ...") this
+                # row's later pending->booked fuzzy correlation
+                # (find_pending_match's payee filter) has to match against.
+                # Storing the user's payee here was the root cause of a real
+                # production duplicate (Felleskort, 2026-08-31).
+                payee_name=p.raw_payee_name,
                 memo=p.ynab_tx["memo"],
                 transaction_date=p.ynab_tx["date"],
                 ynab_account_id=p.ynab_tx["account_id"],
@@ -1770,7 +1783,9 @@ class SyncEngine:
                 account_key=p.provider_account_id,
                 booking_status=p.booking_status,
                 amount=from_milliunits(p.ynab_tx["amount"]),
-                payee_name=shadow.get("payee_name"),
+                # The bank's own description, not YNAB's resolved payee -
+                # see the same-reasoned comment in _finish_native_match.
+                payee_name=p.raw_payee_name,
                 memo=p.ynab_tx["memo"],
                 transaction_date=p.ynab_tx["date"],
                 ynab_account_id=p.ynab_tx["account_id"],
@@ -1785,7 +1800,7 @@ class SyncEngine:
                 ynab_transaction_id=shadow["id"],
                 ynab_budget_id=budget_id,
                 ynab_account_id=p.ynab_tx["account_id"],
-                payee_name=shadow.get("payee_name"),
+                payee_name=p.raw_payee_name,
                 memo=p.ynab_tx["memo"],
                 transaction_date=p.ynab_tx["date"],
                 amount=from_milliunits(p.ynab_tx["amount"]),
@@ -1827,7 +1842,7 @@ class SyncEngine:
             # only ever deletes original_transaction_id, never the shadow.
             since_date = since_date_bound(
                 date.fromisoformat(p.ynab_tx["date"]),
-                self._config.sync.initial_backfill_days,
+                self._config.sync.dedup_lookback_days,
             )
             shadow = await ynab_client.find_transaction_by_import_id(
                 self._http_client,
@@ -2130,7 +2145,7 @@ class SyncEngine:
                 continue  # already tracked (e.g. a retry within the same cycle)
             since_date = since_date_bound(
                 date.fromisoformat(p.ynab_tx["date"]),
-                self._config.sync.initial_backfill_days,
+                self._config.sync.dedup_lookback_days,
             )
             existing = await ynab_client.find_transaction_by_import_id(
                 self._http_client,

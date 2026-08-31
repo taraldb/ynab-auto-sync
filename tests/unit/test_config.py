@@ -47,6 +47,7 @@ def test_load_config_parses_valid_yaml(tmp_path: Path):
     assert config.sync.cron_expression == "0 6,8,10,12,16,20 * * *"
     assert config.sync.timezone == "Europe/Oslo"
     assert config.sync.retention_days == 270
+    assert config.sync.dedup_lookback_days == 90
     assert config.gui.enabled is True
     assert config.gui.port == 8080
     assert config.mqtt.port == 1883
@@ -375,3 +376,40 @@ mqtt:
         load_config(config_path)
 
     assert "retention_days" in str(exc_info.value)
+
+
+def test_load_config_dedup_lookback_below_match_window_floor_raises(tmp_path: Path):
+    """dedup_lookback_days bounds every dedup-resilience YNAB lookup - if it
+    is tighter than a match window, a lookup can miss the very transaction
+    it needs to find and create a duplicate. Reproduces the shape of the
+    real prod misconfig where initial_backfill_days (5) was overloaded as
+    this bound.
+    """
+    yaml_text = """
+providers:
+  sparebank1:
+    type: sparebank1
+    client_id: "cid"
+    client_secret: "secret"
+    redirect_uri: "http://localhost:8765/callback"
+
+ynab:
+  personal_access_token: "pat"
+  budgets:
+    personal: "budget-1"
+
+sync:
+  lookback_overlap_hours: 72
+  dedup_lookback_days: 5
+  pending_import_date_window_days: 5
+
+mqtt:
+  host: "mqtt.local"
+"""
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(yaml_text)
+
+    with pytest.raises(ValidationError) as exc_info:
+        load_config(config_path)
+
+    assert "dedup_lookback_days" in str(exc_info.value)

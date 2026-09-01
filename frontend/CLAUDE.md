@@ -12,4 +12,6 @@ A React + Vite + Tailwind SPA (TypeScript) served by the FastAPI backend (`src/y
 
 `src/api/client.ts` holds the typed fetch wrappers; all calls are relative paths since production serves the built static files from the same FastAPI app.
 
+`public/` holds the favicon set (`favicon.ico` + 16/32 PNGs, `apple-touch-icon.png` 180×180, `icon-192.png`/`icon-512.png` for `site.webmanifest`) — Vite copies it verbatim to `dist/` root at build, and `index.html`'s `<head>` links them. All six icon files are load-bearing (legacy `.ico`, modern PNG, iOS home-screen, PWA manifest); don't prune them as "duplicates".
+
 Built with `npm install && npm run build` in `frontend/` (Node 24/npm 11 confirmed working); needs `@types/react`/`@types/react-dom` as devDependencies beyond the originally-specified minimal set — TypeScript's JSX checking requires them, not optional. **Editing frontend source has zero effect until it's rebuilt** — same "no hot reload" gotcha as the Python side, but via a separate build step, not just a process restart (see root CLAUDE.md's Operational gotchas).

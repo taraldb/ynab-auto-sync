@@ -1316,6 +1316,14 @@ class SyncEngine:
         candidate whose payee_id was already known before the create (only
         _record_matched's manual-match search has one) - _record_created
         has no such candidate and always passes None.
+
+        For booking_status="PENDING" with cleared="uncleared" (the opt-in
+        PENDING-import placeholder case), also issues a corrective PATCH
+        setting the matched original back to cleared="uncleared" - YNAB's
+        native matching auto-marks the matched original 'cleared' as a side
+        effect of the match itself (confirmed live 2026-09-04), which would
+        otherwise mark it cleared before the real charge has actually
+        booked. See the PATCH call's own comment below for the full story.
         """
         await self._db.upsert_tracked(
             tracking_key,
@@ -1352,6 +1360,44 @@ class SyncEngine:
                 f"(import_id anchored on hidden transaction {shadow_id})"
             ),
         )
+        if booking_status == "PENDING" and cleared == "uncleared":
+            # YNAB's native transaction-matching (which just fired, above)
+            # auto-marks the matched original 'cleared' as a side effect of
+            # the match itself - confirmed live (2026-09-04, production,
+            # JULA/275kr) by diffing pre- and post-match GETs of the same
+            # transaction id: cleared flipped uncleared -> cleared with no
+            # PATCH of ours anywhere in between. Harmless for an ordinary
+            # BOOKED create (we'd have submitted cleared="cleared" anyway),
+            # but for an opt-in PENDING-import placeholder it prematurely
+            # marks the transaction cleared before the real charge has
+            # actually booked, defeating the point of the later
+            # pending->booked cleared/amount correction (see
+            # "PENDING-transaction import" in CLAUDE.md). Correct it back
+            # here so the visible transaction stays uncleared until that
+            # real booked observation resolves it, exactly like a
+            # self-created (non-matched) PENDING placeholder does.
+            try:
+                await ynab_client.update_transactions(
+                    self._http_client,
+                    self._config.ynab.personal_access_token,
+                    budget_id,
+                    [{"id": matched_transaction_id, "cleared": "uncleared"}],
+                )
+            except httpx.HTTPStatusError as e:
+                if e.response.status_code != 400:
+                    raise
+                # The matched original is somehow already gone by the time
+                # this correction fires - vanishingly rare, and the
+                # correction is cosmetic (the transaction is already
+                # tracked above), so log and move on rather than failing
+                # the whole cycle over it.
+                logger.error(
+                    "Cleared-status correction PATCH for natively-matched "
+                    "transaction %s (%r) got a 400 - transaction may already "
+                    "be gone. Skipping the correction, not the cycle.",
+                    matched_transaction_id,
+                    tracking_key,
+                )
 
     async def _record_created(
         self,

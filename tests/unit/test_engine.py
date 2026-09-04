@@ -3820,12 +3820,22 @@ async def test_run_cycle_tolerant_manual_match_replaces_with_pending_transaction
                             "amount": -218300,
                             "matched_transaction_id": "ynab-replacement-6",
                             "approved": False,
+                            # YNAB auto-marks the matched original 'cleared'
+                            # as a side effect of the match itself
+                            # (confirmed live, JULA/275kr incident) - the
+                            # candidate above was already "cleared" before
+                            # the match, so this reflects that same
+                            # real-world behavior.
+                            "cleared": "cleared",
                         },
                     ],
                 }
             },
         )
     )
+    patch_route = respx.patch(
+        f"{ynab_client.BASE_URL}/{ynab_client.RESOURCE_PATH}/budget-1/transactions"
+    ).mock(return_value=httpx.Response(200, json={"data": {}}))
 
     async with httpx.AsyncClient() as http_client:
         engine = make_engine(config, http_client, token_store, db)
@@ -3846,6 +3856,13 @@ async def test_run_cycle_tolerant_manual_match_replaces_with_pending_transaction
     # pending->booked pipeline (unchanged - see the tests above).
     assert tracked["amount_milliunits"] == -218300
     assert db.get_payee_id("budget-1", "MERCHANT ONE, LOC-A") == "payee-manual-6"
+
+    # Corrective PATCH sent to undo YNAB's own auto-clear of the natively-
+    # matched original, so it stays uncleared until the real charge books
+    # (see _track_native_match's docstring / CLAUDE.md's JULA/275kr writeup).
+    assert patch_route.called
+    patched = json.loads(patch_route.calls.last.request.content)["transactions"]
+    assert patched == [{"id": "manual-6", "cleared": "uncleared"}]
 
 
 @respx.mock

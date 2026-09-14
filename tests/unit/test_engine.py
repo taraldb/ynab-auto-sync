@@ -4314,6 +4314,188 @@ async def test_run_cycle_pending_manual_match_row_later_fuzzy_resolves_when_book
 
 
 @respx.mock
+async def test_run_cycle_native_matched_pending_tracks_bank_payee_not_manual_payee(
+    tmp_path: Path,
+):
+    """Regression test for a real production duplicate (2026-09-11/12,
+    "PRESSVERKET" incident): a manually-typed transaction's payee text
+    ("Resturant") has nothing in common with the bank's own description
+    ("PRESSVERKET, HAUGESUND") for the same real purchase. When the PENDING
+    import natively-matches onto that manual entry, the tracked row's
+    payee_name must stay the bank-derived text (p.raw_payee_name), not
+    shadow.get("payee_name") (which echoes the manual transaction's own
+    payee, "Resturant", since the create was submitted with the candidate's
+    payee_id) - otherwise the later BOOKED fetch's fuzzy pending->booked
+    correlation (find_pending_match, which hard-requires payee plausibility)
+    can never find this row, and falls through to a genuine duplicate
+    create. Chains two cycles, same shape as
+    test_run_cycle_pending_manual_match_row_later_fuzzy_resolves_when_booked,
+    to prove the second cycle resolves rather than duplicates.
+    """
+    config = make_config()
+    config.sync.pending_import_enabled = True
+    config.sync.manual_match_window_days = 3
+    token_store = make_token_store(tmp_path)
+    db = make_db(tmp_path)
+    await seed_mappings(db, config)
+
+    _mock_creditcard_account()
+
+    pending_date = (datetime.now(UTC).date() - timedelta(days=1)).isoformat()
+    manual_date = (datetime.now(UTC).date() - timedelta(days=1)).isoformat()
+
+    tx_call_count = {"n": 0}
+
+    def transactions_side_effect(request):
+        tx_call_count["n"] += 1
+        if tx_call_count["n"] == 1:
+            return httpx.Response(
+                200,
+                json={
+                    "transactions": [
+                        {
+                            "nonUniqueId": "581856118",
+                            "accountKey": "acct-1",
+                            "date": pending_date,
+                            "amount": -386,
+                            "description": "PRESSVERKET, HAUGESUND",
+                            "bookingStatus": "PENDING",
+                        }
+                    ]
+                },
+            )
+        return httpx.Response(
+            200,
+            json={
+                "transactions": [
+                    {
+                        "creditCardIdentifiers": {"nonUniqueId": "714099861"},
+                        "accountKey": "acct-1",
+                        "date": pending_date,
+                        "amount": -386.0,
+                        "description": "PRESSVERKET, Haugesund, NOR",
+                        "bookingStatus": "BOOKED",
+                    }
+                ]
+            },
+        )
+
+    respx.get(sb1_client.TRANSACTIONS_URL).mock(side_effect=transactions_side_effect)
+
+    # Hand-typed by the user - the payee bears no resemblance at all to the
+    # bank's own merchant description, unlike every other manual-match test
+    # in this file (which all use plausibly-similar text and so never
+    # exercised this bug).
+    respx.get(_unimported_url("budget-1", "ynab-acct-1")).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "data": {
+                    "transactions": [
+                        {
+                            "id": "manual-resturant",
+                            "date": manual_date,
+                            "amount": -386000,
+                            "payee_id": "payee-resturant",
+                            "payee_name": "Resturant",
+                            "category_id": "cat-1",
+                            "memo": None,
+                            "cleared": "cleared",
+                            "approved": True,
+                            "flag_color": None,
+                            "import_id": None,
+                            "deleted": False,
+                            "subtransactions": [],
+                        }
+                    ]
+                }
+            },
+        )
+    )
+
+    import_id = derive_import_id("acct-1:581856118")
+    respx.post(f"{ynab_client.BASE_URL}/{ynab_client.RESOURCE_PATH}/budget-1/transactions").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "data": {
+                    "transaction_ids": ["manual-resturant", "shadow-resturant"],
+                    "duplicate_import_ids": [],
+                    "transactions": [
+                        {
+                            "id": "manual-resturant",
+                            "import_id": None,
+                            "payee_name": "Resturant",
+                            "amount": -386000,
+                            "matched_transaction_id": "shadow-resturant",
+                            "approved": False,
+                            "cleared": "cleared",
+                        },
+                        {
+                            "id": "shadow-resturant",
+                            "import_id": import_id,
+                            # Echoes the submitted payee_id's real name - the
+                            # matched manual transaction's own payee, NOT the
+                            # bank's description. This is the exact field
+                            # that must NOT end up as tracked_transactions.
+                            # payee_name.
+                            "payee_name": "Resturant",
+                            "amount": -386000,
+                            "matched_transaction_id": "manual-resturant",
+                        },
+                    ],
+                }
+            },
+        )
+    )
+    respx.patch(f"{ynab_client.BASE_URL}/{ynab_client.RESOURCE_PATH}/budget-1/transactions").mock(
+        return_value=httpx.Response(200, json={"data": {"transaction_ids": ["manual-resturant"]}})
+    )
+    # submit()'s pending->booked update path bulk pre-checks every target's
+    # current existence in YNAB before PATCHing - the tracked row's id
+    # (the visible original) must show up here as still alive.
+    respx.get(f"{ynab_client.BASE_URL}/{ynab_client.RESOURCE_PATH}/budget-1/transactions").mock(
+        return_value=httpx.Response(
+            200,
+            json={"data": {"transactions": [{"id": "manual-resturant", "deleted": False}]}},
+        )
+    )
+
+    async with httpx.AsyncClient() as http_client:
+        engine = make_engine(config, http_client, token_store, db)
+        first_result, _ = await engine.run_cycle()
+
+    assert first_result.updated == 1
+    assert first_result.created == 0
+
+    tracked = db.get_tracked("acct-1:581856118")
+    assert tracked is not None
+    assert tracked["ynab_transaction_id"] == "manual-resturant"
+    assert tracked["booking_status"] == "PENDING"
+    # The bug: this used to be "Resturant" (shadow.get("payee_name")),
+    # breaking the fuzzy matcher below. Must be the bank's own text.
+    assert tracked["payee_name"] == "PRESSVERKET, HAUGESUND"
+
+    # Second cycle: the real transaction BOOKED, with the bank's own
+    # (different-from-PENDING-observation, but plausibly-similar) payee
+    # text. Before the fix, find_pending_match's hard payee-plausibility
+    # filter would reject "Resturant" vs "PRESSVERKET, Haugesund, NOR" and
+    # this would create a genuine duplicate instead of resolving.
+    async with httpx.AsyncClient() as http_client:
+        engine = make_engine(config, http_client, token_store, db)
+        second_result, _ = await engine.run_cycle()
+
+    assert second_result.created == 0
+    assert second_result.updated == 1
+
+    assert db.get_tracked("acct-1:581856118") is None
+    tracked = db.get_tracked("acct-1:714099861")
+    assert tracked is not None
+    assert tracked["booking_status"] == "BOOKED"
+    assert tracked["ynab_transaction_id"] == "manual-resturant"
+
+
+@respx.mock
 async def test_run_cycle_ambiguous_fuzzy_match_falls_through_to_new_create(tmp_path: Path):
     config = make_config()
     config.sync.pending_import_enabled = True

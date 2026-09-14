@@ -1796,7 +1796,19 @@ class SyncEngine:
                 shadow_id=shadow["id"],
                 booking_status=p.booking_status,
                 amount=from_milliunits(p.ynab_tx["amount"]),
-                payee_name=shadow.get("payee_name"),
+                # The bank-derived payee, not shadow.get("payee_name") (the
+                # matched manual transaction's own, arbitrary user-typed
+                # text) - this row's payee_name is what a later PENDING->
+                # BOOKED fuzzy correlation (pending_match.find_pending_match)
+                # compares the freshly-booked transaction's bank description
+                # against. Using the manual entry's text here breaks that
+                # comparison and causes a real duplicate create once the
+                # transaction books - see CLAUDE.md's "Resolved: PENDING-
+                # import native-match tracked the manual entry's payee..."
+                # for the production incident this fixes. The visible YNAB
+                # transaction (original_transaction_id) is untouched and
+                # still correctly shows the user's own payee regardless.
+                payee_name=p.raw_payee_name,
                 memo=p.ynab_tx["memo"],
                 transaction_date=p.ynab_tx["date"],
                 ynab_account_id=p.ynab_tx["account_id"],
@@ -1816,7 +1828,16 @@ class SyncEngine:
                 account_key=p.provider_account_id,
                 booking_status=p.booking_status,
                 amount=from_milliunits(p.ynab_tx["amount"]),
-                payee_name=shadow.get("payee_name"),
+                # See _finish_native_match's identical fix above: bank-
+                # derived payee, not the matched manual transaction's own
+                # text, so a later PENDING->BOOKED fuzzy correlation can
+                # still compare bank-description-to-bank-description. Here
+                # the shadow IS the sole surviving visible transaction (the
+                # original gets deleted below), so this is a deliberate,
+                # narrow exception to "tracked payee mirrors what's actually
+                # in YNAB" - correctness of the downstream match matters
+                # more than audit-log payee cosmetics for this one field.
+                payee_name=p.raw_payee_name,
                 memo=p.ynab_tx["memo"],
                 transaction_date=p.ynab_tx["date"],
                 ynab_account_id=p.ynab_tx["account_id"],
@@ -1831,7 +1852,7 @@ class SyncEngine:
                 ynab_transaction_id=shadow["id"],
                 ynab_budget_id=budget_id,
                 ynab_account_id=p.ynab_tx["account_id"],
-                payee_name=shadow.get("payee_name"),
+                payee_name=p.raw_payee_name,
                 memo=p.ynab_tx["memo"],
                 transaction_date=p.ynab_tx["date"],
                 amount=from_milliunits(p.ynab_tx["amount"]),
